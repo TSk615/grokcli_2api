@@ -857,19 +857,12 @@
               <input id="reg-domain" />
             </div>
             <div>
-              <label>有效期（可选）</label>
+              <label>有效期（MoeMail）</label>
               <select id="reg-expiry-ms">
-                <option value="">默认（1 小时）</option>
-                <option value="300000">5 分钟</option>
-                <option value="600000">10 分钟</option>
-                <option value="900000">15 分钟</option>
-                <option value="1800000">30 分钟</option>
                 <option value="3600000">1 小时</option>
-                <option value="7200000">2 小时</option>
-                <option value="14400000">4 小时</option>
-                <option value="21600000">6 小时</option>
-                <option value="43200000">12 小时</option>
                 <option value="86400000">24 小时</option>
+                <option value="259200000">3 天</option>
+                <option value="0">永久</option>
               </select>
             </div>
             <div>
@@ -1914,21 +1907,22 @@ function readRegConfig() {
     stagger_ms: $("reg-stagger-ms") ? $("reg-stagger-ms").value.trim() : "400",
   };
 }
+// MoeMail official EXPIRY_OPTIONS only:
+// 1h / 24h / 3d / permanent (0). See beilunyang/moemail app/types/email.ts
+const MOEMAIL_EXPIRY_PRESETS = [3600000, 86400000, 259200000, 0];
+
 function normalizeRegExpiryMs(value) {
-  const allowed = new Set([
-    "", "300000", "600000", "900000", "1800000", "3600000",
-    "7200000", "14400000", "21600000", "43200000", "86400000",
-  ]);
   const raw = value == null ? "" : String(value).trim();
-  if (!raw) return "";
-  if (allowed.has(raw)) return raw;
+  if (raw === "" || raw == null) return "3600000"; // default 1 hour
+  if (raw === "0") return "0";
   const n = Number.parseInt(raw, 10);
-  if (!Number.isFinite(n) || n <= 0) return "";
-  // Map legacy free-form ms values to the nearest preset.
-  const presets = [300000, 600000, 900000, 1800000, 3600000, 7200000, 14400000, 21600000, 43200000, 86400000];
-  let best = presets[0];
+  if (!Number.isFinite(n)) return "3600000";
+  if (MOEMAIL_EXPIRY_PRESETS.includes(n)) return String(n);
+  // Map legacy free-form ms to the nearest official preset (exclude permanent=0).
+  const timed = [3600000, 86400000, 259200000];
+  let best = timed[0];
   let bestDiff = Math.abs(n - best);
-  for (const p of presets) {
+  for (const p of timed) {
     const d = Math.abs(n - p);
     if (d < bestDiff) {
       best = p;
@@ -1967,8 +1961,8 @@ function buildRegBody(config) {
   if (config.base_url) body.base_url = config.base_url;
   if (config.prefix) body.prefix = config.prefix;
   if (config.domain) body.domain = config.domain;
-  const expiryMs = normalizeRegExpiryMs(config.expiry_ms);
-  if (expiryMs) body.expiry_ms = Number.parseInt(expiryMs, 10);
+  // Always send an official MoeMail preset (including permanent=0).
+  body.expiry_ms = Number.parseInt(normalizeRegExpiryMs(config.expiry_ms), 10);
   if (config.api_key) body.api_key = config.api_key;
   if (config.yescaptcha_key) body.yescaptcha_key = config.yescaptcha_key;
   if (config.proxy) body.proxy = config.proxy;

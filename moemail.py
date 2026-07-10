@@ -163,8 +163,19 @@ def moemail_create_mailbox(
         )
 
     base = (base_url or MOEMAIL_BASE_URL).rstrip("/")
+    # MoeMail only accepts official presets: 3600000 / 86400000 / 259200000 / 0.
+    # Do not use `expiry_ms or default` — permanent is 0 and must be preserved.
+    _OFFICIAL = {3_600_000, 86_400_000, 259_200_000, 0}
+    if expiry_ms is None:
+        chosen = int(MOEMAIL_EXPIRY_MS)
+    else:
+        chosen = int(expiry_ms)
+    if chosen not in _OFFICIAL:
+        # snap to nearest timed preset (never invent permanent from bad input)
+        timed = (3_600_000, 86_400_000, 259_200_000)
+        chosen = min(timed, key=lambda p: abs(p - chosen))
     payload: dict[str, Any] = {
-        "expiryTime": int(expiry_ms or MOEMAIL_EXPIRY_MS),
+        "expiryTime": chosen,
         "domain": domain or MOEMAIL_DOMAIN,
     }
     if name:
