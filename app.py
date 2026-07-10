@@ -34,6 +34,7 @@ import anthropic_compat as anth
 import apikeys
 import conversation_affinity
 import token_maintainer
+import web_search_tool
 from admin_routes import router as admin_router
 from auth import AuthError, GrokCredentials, load_credentials, upstream_headers
 from config import (
@@ -303,24 +304,22 @@ def build_upstream_body(req: ChatCompletionRequest, model: str) -> dict[str, Any
         "stream": True if FORCE_UPSTREAM_STREAM else bool(req.stream),
     }
 
-    tools = _normalize_tools(req.tools)
+    tools, wants_search = web_search_tool.normalize_tools_for_search(req.tools, req.model or "")
     tool_choice = _normalize_tool_choice(req.tool_choice)
     # If client asks for grok-search model, auto-inject web_search tool
     if req.model and req.model.strip().lower() in ("grok-search", "web-search"):
-        search_tool = {
-            "type": "web_search_preview",
-            "parameters": {"type": "object", "properties": {}},
-        }
         if not tools:
-            tools = [search_tool]
+            tools = [web_search_tool._build_search_function_tool()]
         elif not any(
-            (t.get("type") or "").lower() in ("web_search_preview", "web_search")
+            (t.get("type") or "").lower() == "function" and
+            (t.get("function") or {}).get("name") == "web_search"
             for t in tools
             if isinstance(t, dict)
         ):
-            tools = tools + [search_tool]
+            tools = tools + [web_search_tool._build_search_function_tool()]
         if tool_choice is None:
-            tool_choice = {"type": "web_search_preview"}
+            tool_choice = "auto"
+        wants_search = True
 
     optional = {
         "temperature": req.temperature,
@@ -343,6 +342,8 @@ def build_upstream_body(req: ChatCompletionRequest, model: str) -> dict[str, Any
     for k, v in optional.items():
         if v is not None:
             body[k] = v
+    if wants_search:
+        body["wants_server_search"] = True
     return body
 
 
@@ -676,7 +677,39 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
 
+    wants_search = bool(body.get("wants_server_search"))
+    if "wants_server_search" in body:
+        del body["wants_server_search"]
+
     if req.stream:
+        if wants_search:
+            return StreamingResponse(
+                _stream_search_agent(
+                    url=url,
+                    body=body,
+                    chain=chain,
+                    chat_id=chat_id,
+                    model=model,
+                    created=created,
+                    client_disconnected=request.is_disconnected,
+                    conversation_fp=conv_fp,
+                    original_messages=[_message_to_upstream(m) for m in req.messages],
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                    "X-Grok2API-Accounts": str(len(chain)),
+                    "X-Grok2API-Affinity": "1" if prefer_account else "0",
+                    "X-Grok2API-Search": "1",
+                    **(
+                        {"X-Grok2API-Conversation-Fp": conv_fp}
+                        if conv_fp
+                        else {}
+                    ),
+                },
+            )
         return StreamingResponse(
             _stream_proxy_with_failover(
                 url=url,
@@ -701,6 +734,19 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                     else {}
                 ),
             },
+        )
+
+    if wants_search:
+        return await _non_stream_search_agent(
+            url=url,
+            body=body,
+            chain=chain,
+            chat_id=chat_id,
+            model=model,
+            created=created,
+            conversation_fp=conv_fp,
+            prefer_account=prefer_account,
+            original_messages=[_message_to_upstream(m) for m in req.messages],
         )
 
     last_error: str | None = None
@@ -1101,6 +1147,241 @@ async def _collect_completion(
         usage,
         tool_calls,
     )
+
+
+async def _non_stream_search_agent(
+    *,
+    url: str,
+    body: dict[str, Any],
+    chain: list[GrokCredentials],
+    chat_id: str,
+    model: str,
+    created: int,
+    conversation_fp: str | None,
+    prefer_account: bool,
+    original_messages: list[dict[str, Any]],
+) -> JSONResponse:
+    """Non-stream OpenAI search: run assistant, execute search, run final."""
+    first_tried = chain[0].auth_key if chain else None
+    assistant_message: dict[str, Any] | None = None
+    tool_calls: list[dict[str, Any]] = []
+
+    # Round 1: get tool_calls
+    for creds in chain:
+        headers = upstream_headers(creds.token, model)
+        round_body = {**body, "messages": original_messages}
+        try:
+            content, reasoning, finish, usage, tcs = await _collect_completion(
+                url=url, headers=headers, body=round_body
+            )
+            account_pool.report_success(creds.auth_key)
+            if conversation_fp:
+                if prefer_account and prefer_account != creds.auth_key:
+                    conversation_affinity.rebind_on_failover(
+                        conversation_fp, first_tried, creds.auth_key
+                    )
+                else:
+                    conversation_affinity.bind_affinity(conversation_fp, creds.auth_key)
+            if tcs:
+                tool_calls = tcs
+                assistant_message = {
+                    "role": "assistant",
+                    "content": content or None,
+                    "tool_calls": tcs,
+                }
+                if reasoning:
+                    assistant_message["reasoning_content"] = reasoning
+                break
+            # No tool calls needed; return directly
+            message = {"role": "assistant", "content": content or ""}
+            if reasoning:
+                message["reasoning_content"] = reasoning
+            result: dict[str, Any] = {
+                "id": chat_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "message": message, "finish_reason": finish or "stop"}],
+            }
+            if usage:
+                result["usage"] = usage
+            result["x_grok2api_account"] = creds.email or creds.auth_key
+            result["x_grok2api_affinity"] = bool(prefer_account)
+            if conversation_fp:
+                result["x_grok2api_conversation_fp"] = conversation_fp
+            return JSONResponse(content=result)
+        except Exception:
+            continue
+
+    if not assistant_message or not tool_calls:
+        return openai_error("Search agent failed to get tool_calls", status=502)
+
+    search_results = await web_search_tool.execute_search_tool_calls(tool_calls)
+    if not search_results:
+        return openai_error("Search execution failed", status=502)
+
+    # Round 2: feed results back
+    messages = original_messages
+    for tc in tool_calls:
+        tcid = tc.get("id") or ""
+        result_text = search_results.get(tcid) or "未找到搜索结果"
+        messages = web_search_tool.openai_messages_with_tool_result(
+            messages, assistant_message, tcid, result_text
+        )
+
+    final_body = {**body, "messages": messages}
+    last_error = "All accounts failed in search final step"
+    last_status = 502
+    for creds in chain:
+        headers = upstream_headers(creds.token, model)
+        try:
+            content, reasoning, finish, usage, _ = await _collect_completion(
+                url=url, headers=headers, body=final_body
+            )
+            account_pool.report_success(creds.auth_key)
+            message = {"role": "assistant", "content": content or ""}
+            if reasoning:
+                message["reasoning_content"] = reasoning
+            result = {
+                "id": chat_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "message": message, "finish_reason": finish or "stop"}],
+            }
+            if usage:
+                result["usage"] = usage
+            result["x_grok2api_account"] = creds.email or creds.auth_key
+            result["x_grok2api_affinity"] = bool(prefer_account)
+            if conversation_fp:
+                result["x_grok2api_conversation_fp"] = conversation_fp
+            return JSONResponse(content=result)
+        except httpx.HTTPStatusError as e:
+            code = e.response.status_code if e.response is not None else 502
+            last_error = e.response.text[:500] if e.response is not None else str(e)
+            last_status = code
+            if not _retryable_status(code):
+                break
+            continue
+        except Exception as e:
+            last_error = str(e)
+            last_status = 502
+            continue
+
+    return openai_error(last_error, status=last_status)
+
+
+async def _stream_search_agent(
+    *,
+    url: str,
+    body: dict[str, Any],
+    chain: list[GrokCredentials],
+    chat_id: str,
+    model: str,
+    created: int,
+    client_disconnected,
+    conversation_fp: str | None,
+    original_messages: list[dict[str, Any]],
+) -> AsyncIterator[str]:
+    """Stream OpenAI search: emit reasoning/content from first call, run search, then stream final."""
+    yield _sse_chunk(chat_id=chat_id, model=model, created=created, role="assistant", content="")
+
+    first_tried = chain[0].auth_key if chain else None
+    assistant_message: dict[str, Any] | None = None
+    tool_calls: list[dict[str, Any]] = []
+    used_creds: GrokCredentials | None = None
+
+    for creds in chain:
+        headers = upstream_headers(creds.token, model)
+        round_body = {**body, "messages": original_messages}
+        try:
+            content, reasoning, finish, usage, tcs = await _collect_completion(
+                url=url, headers=headers, body=round_body
+            )
+            account_pool.report_success(creds.auth_key)
+            used_creds = creds
+            if conversation_fp:
+                if prefer_account and prefer_account != creds.auth_key:
+                    conversation_affinity.rebind_on_failover(
+                        conversation_fp, first_tried, creds.auth_key
+                    )
+                else:
+                    conversation_affinity.bind_affinity(conversation_fp, creds.auth_key)
+            if tcs:
+                tool_calls = tcs
+                assistant_message = {"role": "assistant", "content": content or None, "tool_calls": tcs}
+                if reasoning:
+                    assistant_message["reasoning_content"] = reasoning
+            else:
+                if content:
+                    yield _sse_chunk(chat_id=chat_id, model=model, created=created, content=content)
+                if reasoning:
+                    yield _sse_chunk(chat_id=chat_id, model=model, created=created, reasoning=reasoning)
+                yield _sse_chunk(chat_id=chat_id, model=model, created=created, finish_reason=finish or "stop")
+                yield "data: [DONE]\n\n"
+            break
+        except Exception:
+            continue
+
+    if not assistant_message or not tool_calls:
+        yield f"data: {json.dumps({'id': chat_id, 'object': 'error', 'error': {'message': 'Search agent failed to get tool_calls', 'type': 'upstream_error'}}, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+
+    # Emit tool_calls delta and finish=tool_calls before executing search
+    for tc in tool_calls:
+        yield _sse_chunk(chat_id=chat_id, model=model, created=created, tool_calls=[tc])
+    yield _sse_chunk(chat_id=chat_id, model=model, created=created, finish_reason="tool_calls")
+
+    search_results = await web_search_tool.execute_search_tool_calls(tool_calls)
+
+    messages = original_messages
+    for tc in tool_calls:
+        tcid = tc.get("id") or ""
+        result_text = search_results.get(tcid) or "未找到搜索结果"
+        messages = web_search_tool.openai_messages_with_tool_result(
+            messages, assistant_message, tcid, result_text
+        )
+
+    final_body = {**body, "messages": messages}
+    for idx, creds in enumerate(chain):
+        headers = upstream_headers(creds.token, model)
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT, connect=30.0)) as client:
+                async with client.stream("POST", url, headers=headers, json=final_body) as resp:
+                    if resp.status_code >= 400:
+                        err_text = (await resp.aread()).decode("utf-8", errors="replace")[:500]
+                        if _retryable_status(resp.status_code) and idx < len(chain) - 1:
+                            continue
+                        yield f"data: {json.dumps({'id': chat_id, 'object': 'error', 'error': {'message': f'Upstream {resp.status_code}: {err_text}', 'type': 'upstream_error'}}, ensure_ascii=False)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+                    async for line in resp.aiter_lines():
+                        if await client_disconnected():
+                            return
+                        parsed = _parse_sse_line(line)
+                        if parsed is None or parsed == "[DONE]":
+                            continue
+                        c, r, tc_delta = _extract_delta_parts(parsed)
+                        if c:
+                            yield _sse_chunk(chat_id=chat_id, model=model, created=created, content=c)
+                        if r:
+                            yield _sse_chunk(chat_id=chat_id, model=model, created=created, reasoning=r)
+                        choices = parsed.get("choices") or []
+                        if choices:
+                            fr = choices[0].get("finish_reason")
+                            if fr:
+                                yield _sse_chunk(chat_id=chat_id, model=model, created=created, finish_reason=fr)
+            yield "data: [DONE]\n\n"
+            return
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            if idx < len(chain) - 1:
+                continue
+            yield f"data: {json.dumps({'id': chat_id, 'object': 'error', 'error': {'message': 'Search final step failed', 'type': 'upstream_error'}}, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
 
 
 # ── Anthropic Messages API ──────────────────────────────────────────────────

@@ -395,35 +395,84 @@ def build_openai_chat_body(
     model: str,
     *,
     force_stream: bool = False,
-) -> dict[str, Any]:
-    """Build OpenAI-compatible chat.completions body for upstream."""
+) -> tuple[dict[str, Any], bool]:
+    """Build OpenAI-compatible chat.completions body for upstream.
+
+    Returns (body, wants_server_search). Server search is triggered when
+    grok-search model or web_search tools are requested.
+    """
     messages = anthropic_messages_to_openai(req.messages, system=req.system)
+    is_search_model = (req.model or "").strip().lower() in ("grok-search", "web-search")
+
+    tools = anthropic_tools_to_openai(req.tools)
+    wants_search = is_search_model or _has_web_search_tool(req.tools)
+
+    if is_search_model:
+        if not tools:
+            tools = [_build_search_function_tool_for_anthropic()]
+        elif not any(
+            (t.get("function") or {}).get("name") == "web_search"
+            for t in tools
+            if isinstance(t, dict)
+        ):
+            tools = tools + [_build_search_function_tool_for_anthropic()]
+
     body: dict[str, Any] = {
         "model": model,
         "messages": messages,
         "stream": True if force_stream else bool(req.stream),
         "max_tokens": req.max_tokens,
     }
-    tools = anthropic_tools_to_openai(req.tools)
     if tools:
         body["tools"] = tools
     tc = anthropic_tool_choice_to_openai(req.tool_choice)
     if tc is not None:
         body["tool_choice"] = tc
+    elif is_search_model:
+        body["tool_choice"] = "auto"
     if req.temperature is not None:
         body["temperature"] = req.temperature
     if req.top_p is not None:
         body["top_p"] = req.top_p
     if req.stop_sequences:
         body["stop"] = req.stop_sequences
-    # metadata.user_id → OpenAI user (affinity)
     if isinstance(req.metadata, dict) and req.metadata.get("user_id"):
         body["user"] = str(req.metadata["user_id"])
-    # Anthropic thinking → OpenAI reasoning_effort
     effort = _anthropic_thinking_to_reasoning_effort(req.thinking)
     if effort:
         body["reasoning_effort"] = effort
-    return body
+    return body, wants_search
+
+
+def _has_web_search_tool(tools: list[Any] | None) -> bool:
+    if not tools:
+        return False
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        ttype = (t.get("type") or "").lower()
+        if ttype in ("web_search_preview", "web_search", "live_search"):
+            return True
+        if ttype == "function" and (t.get("function") or {}).get("name") in (
+            "web_search", "search", "live_search", "google_search",
+        ):
+            return True
+    return False
+
+
+def _build_search_function_tool_for_anthropic() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web for current information.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "Search query"}},
+                "required": ["query"],
+            },
+        },
+    }
 
 
 # ── response mapping ────────────────────────────────────────────────────────
