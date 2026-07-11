@@ -27,8 +27,9 @@ from config import (
     PROBE_MODELS,
     UPSTREAM_BASE,
 )
+from maintenance_gate import maintenance_slot
 
-_PROBE_TIMEOUT = 45.0
+_PROBE_TIMEOUT = 30.0
 
 # Background worker state
 _stop = threading.Event()
@@ -499,20 +500,59 @@ def _interval() -> float:
 
 
 def run_once(*, source: str = "background") -> dict[str, Any]:
-    """Probe every live account with PROBE_MODELS (error check cycle)."""
-    result = probe_account_models(
-        None, list(PROBE_MODELS) or [DEFAULT_MODEL], auto_disable=True, source=source
-    )
+    """Probe a batch of live accounts with PROBE_MODELS (error check cycle)."""
+    # Background cycles defer quickly if token refresh holds the slot so they
+    # never stampede together. Manual admin "probe all" waits longer.
+    wait_timeout = 5.0 if source == "background" else None
+    with maintenance_slot(
+        f"model_health:{source}",
+        blocking=True,
+        timeout=wait_timeout,
+    ) as got:
+        if not got:
+            result = {
+                "ok": True,
+                "deferred_busy": True,
+                "error": "maintenance slot busy — deferred",
+                "source": source,
+                "probed_at": time.time(),
+                "count": 0,
+                "available_count": 0,
+                "unavailable_count": 0,
+                "auto_action_count": 0,
+                "results": [],
+            }
+            with _lock:
+                _last_run.clear()
+                _last_run.update(result)
+                _last_run["at"] = time.time()
+            if source == "background":
+                print("  [model-health] deferred: maintenance slot busy")
+            return result
+        result = probe_account_models(
+            None,
+            list(PROBE_MODELS) or [DEFAULT_MODEL],
+            auto_disable=True,
+            source=source,
+        )
+    # Drop per-account payloads from last_run so /health and admin status stay small.
+    slim = {
+        k: v
+        for k, v in result.items()
+        if k != "results"
+    }
+    slim["results_sample"] = (result.get("results") or [])[:5]
     with _lock:
         _last_run.clear()
-        _last_run.update(result)
+        _last_run.update(slim)
         _last_run["at"] = time.time()
     bad = [r for r in result.get("results") or [] if not r.get("available")]
-    if bad:
+    if bad or result.get("deferred"):
         print(
             f"  [model-health] cycle: {result.get('available_count')}/"
             f"{result.get('count')} ok; "
-            f"{len(bad)} error(s) — auto_action={result.get('auto_action_count')}"
+            f"{len(bad)} error(s); deferred={result.get('deferred')} "
+            f"— auto_action={result.get('auto_action_count')}"
         )
     return result
 
@@ -580,8 +620,11 @@ def stop_background() -> None:
     _wakeup.set()
 
 
-def status() -> dict[str, Any]:
+def status(*, light: bool = False) -> dict[str, Any]:
     interval = _interval()
+    last = None
+    if not light and _last_run:
+        last = dict(_last_run)
     return {
         "running": bool(_thread and _thread.is_alive()),
         "enabled": os.getenv("GROK2API_MODEL_HEALTH", "1").lower()
@@ -592,5 +635,5 @@ def status() -> dict[str, Any]:
         "probe_batch": MODEL_PROBE_BATCH,
         "probe_models": list(PROBE_MODELS) or [DEFAULT_MODEL],
         "auto_disable": MODEL_HEALTH_AUTO_DISABLE,
-        "last": dict(_last_run) if _last_run else None,
+        "last": last,
     }

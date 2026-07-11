@@ -2,29 +2,40 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / 导入 / 协议注册。
 
-**当前版本：v1.8.7**
+**当前版本：v1.8.10**
 
 - **独立运行**：不依赖本地 Grok CLI，不调用 `grok login` / 浏览器 OAuth
 - **协议注册**：内置 `grok-build-auth`（HTTP 协议，无需 Chromium）
 - **中继友好**：兼容 new-api 操练场 / 测速（剥离不支持参数、reasoning 兼容、SSE keepalive）
 - **运维增强**：账号搜索、多选批量删除 / 续期 / 导出、多线程批量注册
+- **大账号池友好**：Token 自动续期 + 模型健康检查可常开，批处理 / 互斥 / 轻量状态接口
 
 适合 Cherry Studio、NextChat、OpenAI SDK、Anthropic SDK、Claude Code、Cursor、new-api 等工具接入。
 
 ---
 
-## 本次更新（v1.8.7）
+## 本次更新（v1.8.10）
 
 | 方向 | 内容 |
 |------|------|
-| 账号续期 | 行内「续期」+ 多选「续期所选」；`POST /accounts/refresh` 支持 `ids` |
-| 多选导出 | 「导出所选」导出勾选账号；`POST /accounts/export-batch` |
-| 额度统计 | 汇总排除禁用 / 耗尽账号，显示可用额度 |
-| 注册引擎 | `dongguatanglinux/grok-build-auth` HTTP 协议注册（MoeMail + YesCaptcha） |
-| 注册稳定性 | 先打码再收邮箱验证码；`create_account` 错误码识别；CreateSession 回退；多线程批量注册 |
-| 中继兼容 | 剥离 `presence_penalty` / `frequency_penalty` 等上游不支持参数；reasoning 默认走 `reasoning_content`（可选 `<think>`）；SSE keepalive |
-| 管理台 | 账号搜索 / 多选 / 批量删除 / 续期 / 导出；注册数量 / 并发 / 启动间隔 |
-| Docker | 协议依赖镜像（`curl_cffi` / `requests`） |
+| 性能 | 大账号池（400+）下保持 Token 自动续期 / 模型健康检查常开，不阻塞 API |
+| 后台节流 | 默认更保守的 workers/batch；维护任务全局互斥，避免续期与探测同时打满 |
+| 状态接口 | `/health`、`/admin/api/status` 只返回计数摘要，避免每次吐完整账号列表 |
+| 废 token | `invalid_grant` / revoked refresh_token 标记为 `refresh_invalid`，后续周期跳过 |
+| 启动错峰 | Token 维护 / 模型探测启动延迟与批处理可配置，降低冷启动抖动 |
+
+### 相关环境变量（可选）
+
+```bash
+GROK2API_TOKEN_MAINTAIN=1
+GROK2API_MODEL_HEALTH=1
+GROK2API_TOKEN_MAINTAIN_INTERVAL=180
+GROK2API_MODEL_HEALTH_INTERVAL=900
+GROK2API_TOKEN_REFRESH_WORKERS=2
+GROK2API_MODEL_PROBE_WORKERS=2
+GROK2API_TOKEN_REFRESH_BATCH=20
+GROK2API_MODEL_PROBE_BATCH=15
+```
 
 ---
 

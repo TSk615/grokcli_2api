@@ -276,13 +276,16 @@ def _public_api_base(request: Request | None = None) -> str:
 @router.get("/status")
 async def admin_status(request: Request):
     setup = is_setup_needed()
-    account = accounts.account_status()
+    # Counts only on this frequent poll — full account rows live on /accounts.
+    account = accounts.account_status(include_accounts=False)
     key_stats = apikeys.stats()
-    pool = account_pool.pool_summary()
+    # Counts only — full account list belongs on /accounts and /dashboard.
+    pool = account_pool.pool_summary(include_accounts=False)
     creds_ok = False
     creds_email = None
     try:
-        c = load_credentials()
+        # Never OIDC-refresh on a frequent status poll.
+        c = account_pool.acquire(auto_refresh=False)
         creds_ok = True
         creds_email = c.email
     except AuthError:
@@ -334,8 +337,8 @@ async def admin_status(request: Request):
         "keys": key_stats,
         "models_count": len(load_models_from_cache()),
         "settings": get_public_settings(),
-        "token_maintainer": token_maintainer.status(),
-        "model_health": model_health.status(),
+        "token_maintainer": token_maintainer.status(light=True),
+        "model_health": model_health.status(light=True),
         "conversation_affinity": conversation_affinity.status(),
         "registration": reg_status,
     }
@@ -415,8 +418,8 @@ async def dashboard(
         "cli_version": CLI_VERSION,
         "upstream": UPSTREAM_BASE,
         "default_model": DEFAULT_MODEL,
-        "token_maintainer": token_maintainer.status(),
-        "model_health": model_health.status(),
+        "token_maintainer": token_maintainer.status(light=True),
+        "model_health": model_health.status(light=True),
         "conversation_affinity": conversation_affinity.status(),
     }
 
@@ -1126,11 +1129,11 @@ async def maintainer_status(
     request: Request,
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
 ):
-    """Token auto-refresh worker status + current remaining lifetimes."""
+    """Token auto-refresh worker status (no full account dump)."""
     require_admin(request, x_admin_token)
-    st = token_maintainer.status()
-    st["accounts"] = accounts.list_accounts()
-    return st
+    # Full account rows already available via /accounts; keep this route small
+    # so admin polling stays responsive on 400+ pools.
+    return token_maintainer.status()
 
 
 @router.post("/maintainer/run")

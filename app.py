@@ -49,7 +49,7 @@ from config import (
 import config as _config
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.8.9"
+APP_VERSION = "1.8.10"
 
 
 def _on_startup() -> None:
@@ -1013,6 +1013,7 @@ def _normalize_stream_finish_reason(
 
 @app.get("/health")
 async def health():
+    """Bounded readiness probe — never triggers OIDC refresh or full account dump."""
     reg: dict[str, Any] = {"available": False}
     try:
         import grok_build_adapter as _reg
@@ -1021,12 +1022,11 @@ async def health():
     except Exception as e:  # noqa: BLE001
         reg = {"available": False, "error": str(e)}
     try:
-        pool = account_pool.pool_summary()
-        creds = None
-        try:
-            creds = account_pool.acquire()
-        except AuthError:
-            creds = load_credentials()
+        # Counts only; omit the hundreds-of-accounts payload.
+        pool = account_pool.pool_summary(include_accounts=False)
+        # Health must stay a bounded read-only route. Do not make an OIDC
+        # refresh request while resolving the representative account.
+        creds = account_pool.acquire(auto_refresh=False)
         return {
             "status": "ok",
             "version": APP_VERSION,
@@ -1040,8 +1040,9 @@ async def health():
             "accounts_enabled": pool.get("enabled"),
             "accounts_total": pool.get("total"),
             "multi_account": (pool.get("live") or 0) > 1,
-            "token_maintainer": token_maintainer.status(),
-            "model_health": __import__("model_health").status(),
+            # light=True avoids rescanning auth.json for min_remaining on every poll
+            "token_maintainer": token_maintainer.status(light=True),
+            "model_health": __import__("model_health").status(light=True),
             "conversation_affinity": conversation_affinity.status(),
             "registration": reg,
         }

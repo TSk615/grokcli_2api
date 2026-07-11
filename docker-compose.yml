@@ -11,12 +11,23 @@ services:
       GROK2API_HOST: "0.0.0.0"
       GROK2API_PORT: "3000"
       GROK2API_OPEN_BROWSER: "0"
-      # Optional:
+      # Keep maintainers ON; defaults in config.py already throttle large pools.
+      GROK2API_TOKEN_MAINTAIN: "1"
+      GROK2API_MODEL_HEALTH: "1"
+      # Optional tuning for 400+ accounts:
+      # GROK2API_TOKEN_MAINTAIN_INTERVAL: "180"
+      # GROK2API_MODEL_HEALTH_INTERVAL: "900"
+      # GROK2API_TOKEN_REFRESH_WORKERS: "2"
+      # GROK2API_MODEL_PROBE_WORKERS: "2"
+      # GROK2API_TOKEN_REFRESH_BATCH: "20"
+      # GROK2API_MODEL_PROBE_BATCH: "15"
+      # Optional secrets / mail / proxy / public origin:
       # GROK2API_ADMIN_PASSWORD: "change-me"
       # GROK2API_MOEMAIL_API_KEY: ""
-      # GROK2API_MOEMAIL_BASE_URL: "https://moemail.521884.xyz"
-      # GROK2API_MOEMAIL_DOMAIN: "lolicc.online"
+      # GROK2API_MOEMAIL_BASE_URL: "https://moemail.example.com"
+      # GROK2API_MOEMAIL_DOMAIN: "example.com"
       # GROK2API_XAI_PROXY: ""
+      # GROK2API_PUBLIC_BASE_URL: "https://api.example.com"
     volumes:
       - ./data:/app/data
     restart: unless-stopped

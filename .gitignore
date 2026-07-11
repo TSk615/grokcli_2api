@@ -19,3 +19,6 @@ grok-build-auth/**/__pycache__/
 grok-build-auth/cliproxyapi_auth/
 grok-build-auth/.env
 data/register_sso/
+
+# Local deploy overrides (ports, domains, secrets paths)
+docker-compose.override.yml

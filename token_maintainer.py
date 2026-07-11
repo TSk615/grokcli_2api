@@ -13,19 +13,23 @@ import threading
 import time
 from typing import Any
 
+from maintenance_gate import maintenance_slot
+
 _stop = threading.Event()
 _thread: threading.Thread | None = None
 _last_run: dict[str, Any] = {}
 _wakeup = threading.Event()  # force an early cycle from admin UI
 _force_next = False
 _force_lock = threading.Lock()
+_min_remaining_cache: dict[str, Any] = {"at": 0.0, "value": None}
+_MIN_REMAINING_CACHE_TTL = 15.0
 
 
 def _interval() -> float:
     try:
-        return max(60.0, float(os.getenv("GROK2API_TOKEN_MAINTAIN_INTERVAL", "300")))
+        return max(60.0, float(os.getenv("GROK2API_TOKEN_MAINTAIN_INTERVAL", "180")))
     except ValueError:
-        return 300.0
+        return 180.0
 
 
 def _skew() -> float:
@@ -41,25 +45,32 @@ def _startup_delay() -> float:
 
         return max(5.0, float(TOKEN_MAINTAIN_STARTUP_DELAY))
     except Exception:
-        return 30.0
+        return 45.0
 
 
-def _min_remaining_seconds() -> float | None:
+def _min_remaining_seconds(*, force: bool = False) -> float | None:
     """Smallest access-token remaining lifetime across live accounts."""
+    now = time.time()
+    if (
+        not force
+        and _min_remaining_cache.get("at")
+        and now - float(_min_remaining_cache["at"]) < _MIN_REMAINING_CACHE_TTL
+    ):
+        return _min_remaining_cache.get("value")  # type: ignore[return-value]
     try:
         from auth import list_live_credentials
 
-        now = time.time()
         remains: list[float] = []
         for c in list_live_credentials(include_expired=True, auto_refresh=False):
             if c.expires_at is None:
                 continue
             remains.append(float(c.expires_at) - now)
-        if not remains:
-            return None
-        return min(remains)
+        value = min(remains) if remains else None
     except Exception:
-        return None
+        value = None
+    _min_remaining_cache["at"] = now
+    _min_remaining_cache["value"] = value
+    return value
 
 
 def _next_wait_seconds() -> float:
@@ -92,52 +103,81 @@ def run_once(*, force: bool = False) -> dict[str, Any]:
         "refresh": None,
         "force": force,
         "accounts": [],
+        "deferred_busy": False,
     }
-    try:
-        from accounts import list_accounts
-        from oidc_auth import normalize_auth_file_keys, refresh_all_accounts
-
-        result["normalized"] = normalize_auth_file_keys()
-        # force: still only-near-expiry=False, but max_accounts batch applies
-        skew = max(300.0, _skew() * 2)
-        # force: refresh even far-from-expiry, but still batch-capped so one
-        # admin click never rewrites 700 accounts at once on WSL.
+    # Prefer waiting for model probes to finish (tokens are more important),
+    # but never hang forever if a probe cycle is stuck on network.
+    with maintenance_slot("token_maintainer", blocking=True, timeout=180.0) as got:
+        if not got:
+            result["ok"] = True
+            result["deferred_busy"] = True
+            result["error"] = "maintenance slot busy — deferred"
+            _last_run.clear()
+            _last_run.update(result)
+            _last_run["at"] = time.time()
+            print("  [token-maintainer] deferred: maintenance slot busy")
+            return result
         try:
-            from config import TOKEN_REFRESH_BATCH
-        except Exception:
-            TOKEN_REFRESH_BATCH = 40
-        force_batch = min(TOKEN_REFRESH_BATCH * 2, 80) if force else TOKEN_REFRESH_BATCH
-        result["refresh"] = refresh_all_accounts(
-            only_near_expiry=not force,
-            skew_seconds=skew if not force else 365 * 86400.0,
-            max_accounts=force_batch,
-        )
-        # Snapshot current expiry times for admin UI (avoid huge payloads)
-        accounts = list_accounts()
-        snap = []
-        for a in accounts[:200]:
-            snap.append(
-                {
-                    "id": a.get("id"),
-                    "email": a.get("email"),
-                    "expires_at": a.get("expires_at"),
-                    "expired": a.get("expired"),
-                    "has_refresh_token": a.get("has_refresh_token"),
-                    "remaining_sec": (
-                        max(0, int(float(a["expires_at"]) - time.time()))
-                        if a.get("expires_at")
-                        else None
-                    ),
-                }
+            from accounts import list_accounts
+            from oidc_auth import normalize_auth_file_keys, refresh_all_accounts
+
+            result["normalized"] = normalize_auth_file_keys()
+            # force: still only-near-expiry=False, but max_accounts batch applies
+            skew = max(300.0, _skew() * 2)
+            # force: refresh even far-from-expiry, but still batch-capped so one
+            # admin click never rewrites 700 accounts at once on WSL.
+            try:
+                from config import TOKEN_REFRESH_BATCH
+            except Exception:
+                TOKEN_REFRESH_BATCH = 20
+            force_batch = min(TOKEN_REFRESH_BATCH * 2, 40) if force else TOKEN_REFRESH_BATCH
+            refresh = refresh_all_accounts(
+                only_near_expiry=not force,
+                skew_seconds=skew if not force else 365 * 86400.0,
+                max_accounts=force_batch,
             )
-        result["accounts"] = snap
-        result["accounts_total"] = len(accounts)
-        result["min_remaining_sec"] = _min_remaining_seconds()
-    except Exception as e:  # noqa: BLE001
-        result["ok"] = False
-        result["error"] = str(e)[:400]
+            # Keep full result for the direct admin/API caller, but never retain
+            # hundreds of per-account rows in the background status cache —
+            # that alone made /health ~100KB on a 400+ pool.
+            rows = refresh.get("results") if isinstance(refresh, dict) else None
+            slim_refresh = {
+                k: v
+                for k, v in (refresh or {}).items()
+                if k != "results"
+            }
+            if isinstance(rows, list):
+                failed = [r for r in rows if not r.get("ok")]
+                slim_refresh["failed_sample"] = failed[:5]
+                slim_refresh["failed"] = len(failed)
+                slim_refresh["skipped"] = sum(1 for r in rows if r.get("skipped"))
+            result["refresh"] = slim_refresh
+            accounts = list_accounts()
+            result["accounts"] = []  # never embed full account list in status cache
+            result["accounts_total"] = len(accounts)
+            result["min_remaining_sec"] = _min_remaining_seconds(force=True)
+            # Attach full refresh only on the returned object for admin force-run.
+            result_full = dict(result)
+            result_full["refresh"] = refresh
+            result = result_full
+        except Exception as e:  # noqa: BLE001
+            result["ok"] = False
+            result["error"] = str(e)[:400]
+    # Persist a slim snapshot for status()/health, not the full per-account dump.
+    slim_last = {
+        k: v
+        for k, v in result.items()
+        if k not in ("accounts",)
+    }
+    if isinstance(slim_last.get("refresh"), dict) and "results" in slim_last["refresh"]:
+        rows = slim_last["refresh"].get("results") or []
+        slim_last["refresh"] = {
+            k: v for k, v in slim_last["refresh"].items() if k != "results"
+        }
+        slim_last["refresh"]["failed"] = sum(1 for r in rows if not r.get("ok"))
+        slim_last["refresh"]["skipped"] = sum(1 for r in rows if r.get("skipped"))
+        slim_last["refresh"]["failed_sample"] = [r for r in rows if not r.get("ok")][:5]
     _last_run.clear()
-    _last_run.update(result)
+    _last_run.update(slim_last)
     _last_run["at"] = time.time()
     return result
 
@@ -188,23 +228,54 @@ def stop_background() -> None:
     _wakeup.set()
 
 
-def status() -> dict[str, Any]:
-    rem = _min_remaining_seconds()
+def status(*, light: bool = False) -> dict[str, Any]:
+    rem = None if light else _min_remaining_seconds()
     try:
         from config import TOKEN_REFRESH_BATCH, TOKEN_REFRESH_WORKERS
     except Exception:
-        TOKEN_REFRESH_BATCH = 40
-        TOKEN_REFRESH_WORKERS = 4
-    return {
+        TOKEN_REFRESH_BATCH = 20
+        TOKEN_REFRESH_WORKERS = 2
+    out = {
         "running": bool(_thread and _thread.is_alive()),
         "enabled": os.getenv("GROK2API_TOKEN_MAINTAIN", "1").lower()
         not in ("0", "false", "no"),
         "interval_sec": _interval(),
-        "next_wait_sec": _next_wait_seconds(),
         "refresh_skew_sec": _skew(),
         "startup_delay_sec": _startup_delay(),
         "refresh_workers": TOKEN_REFRESH_WORKERS,
         "refresh_batch": TOKEN_REFRESH_BATCH,
-        "min_remaining_sec": rem,
-        "last": dict(_last_run) if _last_run else None,
     }
+    if light:
+        # Keep /health tiny: only last outcome summary, no per-account rows.
+        if _last_run:
+            out["last"] = {
+                "ok": _last_run.get("ok"),
+                "at": _last_run.get("at"),
+                "force": _last_run.get("force"),
+                "deferred_busy": _last_run.get("deferred_busy"),
+                "accounts_total": _last_run.get("accounts_total"),
+                "min_remaining_sec": _last_run.get("min_remaining_sec"),
+                "refresh": {
+                    k: v
+                    for k, v in ((_last_run.get("refresh") or {}).items())
+                    if k
+                    in (
+                        "ok",
+                        "refreshed",
+                        "deferred",
+                        "attempted",
+                        "workers",
+                        "failed",
+                        "skipped",
+                    )
+                }
+                if isinstance(_last_run.get("refresh"), dict)
+                else _last_run.get("refresh"),
+            }
+        else:
+            out["last"] = None
+    else:
+        out["next_wait_sec"] = _next_wait_seconds()
+        out["min_remaining_sec"] = rem
+        out["last"] = dict(_last_run) if _last_run else None
+    return out

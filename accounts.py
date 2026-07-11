@@ -77,29 +77,58 @@ def list_accounts() -> list[dict[str, Any]]:
     return out
 
 
-def account_status() -> dict[str, Any]:
-    accounts = list_accounts()
-    active = [a for a in accounts if not a.get("expired")]
+def account_status(*, include_accounts: bool = True) -> dict[str, Any]:
+    """Account summary for admin UI.
+
+    `include_accounts=False` returns counts only — used by frequent /status polls
+    so a 400+ account list is not re-serialized on every heartbeat.
+    """
+    if include_accounts:
+        all_accounts = list_accounts()
+        active = [a for a in all_accounts if not a.get("expired")]
+        account_count = len(all_accounts)
+        active_count = len(active)
+    else:
+        # Cheap path: count from auth map without building admin row objects.
+        data = read_auth_map()
+        now = time.time()
+        account_count = 0
+        active_count = 0
+        for entry in data.values():
+            if not isinstance(entry, dict):
+                continue
+            token = entry.get("key") or entry.get("access_token") or entry.get("token")
+            if not token:
+                continue
+            account_count += 1
+            exp_f = parse_expires_at(
+                entry.get("expires_at"), token if isinstance(token, str) else None
+            )
+            if exp_f is None or now < exp_f:
+                active_count += 1
+        all_accounts = []
     try:
         from settings_store import get_account_mode
 
         mode = get_account_mode()
     except Exception:
         mode = "round_robin"
-    return {
+    out = {
         "auth_file": str(AUTH_FILE),
         "auth_file_exists": AUTH_FILE.is_file(),
-        "logged_in": bool(active),
-        "account_count": len(accounts),
-        "active_count": len(active),
-        "accounts": accounts,
+        "logged_in": bool(active_count),
+        "account_count": account_count,
+        "active_count": active_count,
         "account_mode": mode,
         "platform": sys.platform,
         "is_linux": sys.platform.startswith("linux"),
         "is_headless": _is_headless(),
         "native_oidc_available": True,
-        "multi_account": len(accounts) > 1,
+        "multi_account": account_count > 1,
     }
+    if include_accounts:
+        out["accounts"] = all_accounts
+    return out
 
 
 def _is_headless() -> bool:

@@ -83,10 +83,15 @@ def is_in_cooldown(meta: dict[str, Any]) -> bool:
 
 
 def list_pool_accounts() -> list[dict[str, Any]]:
-    """Live credentials merged with pool metadata (for admin UI)."""
+    """Live credentials merged with pool metadata (for admin UI).
+
+    Read-only status routes must not synchronously refresh OIDC tokens: a
+    stalled upstream refresh otherwise blocks this single Uvicorn worker and
+    makes every endpoint appear offline.
+    """
     state = get_account_pool_state()
     out: list[dict[str, Any]] = []
-    for creds in list_live_credentials(include_expired=True):
+    for creds in list_live_credentials(include_expired=True, auto_refresh=False):
         meta = _pool_meta(creds.auth_key or "", state)
         out.append(
             {
@@ -181,6 +186,7 @@ def acquire(
     exclude: set[str] | None = None,
     *,
     model: str | None = None,
+    auto_refresh: bool = True,
 ) -> GrokCredentials:
     """
     Select next account according to configured mode.
@@ -195,7 +201,9 @@ def acquire(
 
     _ensure_multi_account_layout()
 
-    all_live = list_live_credentials(include_expired=False, auto_refresh=True)
+    # Read-only callers disable refresh so a stalled OIDC exchange cannot
+    # monopolize Uvicorn's event-loop thread.
+    all_live = list_live_credentials(include_expired=False, auto_refresh=auto_refresh)
     if not all_live:
         raise AuthError(
             "No live accounts in auth store. "
@@ -444,24 +452,59 @@ def save_quota_snapshot(account_id: str, quota_result: dict[str, Any]) -> None:
     save_account_pool_state(state)
 
 
-def pool_summary() -> dict[str, Any]:
-    accounts = list_pool_accounts()
-    live = [a for a in accounts if not a.get("expired")]
-    enabled = [a for a in live if a.get("enabled")]
-    cooling = [a for a in enabled if a.get("in_cooldown")]
-    quota_disabled = [a for a in accounts if a.get("disabled_for_quota")]
-    model_blocked = [
-        a for a in accounts if (a.get("blocked_model_ids") or a.get("blocked_models"))
-    ]
+def pool_summary(*, include_accounts: bool = True) -> dict[str, Any]:
+    """Summarize pool health.
+
+    `include_accounts=False` keeps the payload small for /health and status
+    routes on large multi-account pools (hundreds of entries) and avoids
+    building the full admin account dict list.
+    """
+    if include_accounts:
+        accounts = list_pool_accounts()
+        live = [a for a in accounts if not a.get("expired")]
+        enabled = [a for a in live if a.get("enabled")]
+        cooling = [a for a in enabled if a.get("in_cooldown")]
+        quota_disabled = [a for a in accounts if a.get("disabled_for_quota")]
+        model_blocked = [
+            a for a in accounts if (a.get("blocked_model_ids") or a.get("blocked_models"))
+        ]
+        return {
+            "mode": get_account_mode(),
+            "total": len(accounts),
+            "live": len(live),
+            "enabled": len(enabled),
+            "in_cooldown": len(cooling),
+            "quota_disabled": len(quota_disabled),
+            "model_blocked": len(model_blocked),
+            "accounts": accounts,
+        }
+
+    # Lightweight counts-only path for /health and frequent status polls.
+    state = get_account_pool_state()
+    total = live = enabled = cooling = quota_disabled = model_blocked = 0
+    for creds in list_live_credentials(include_expired=True, auto_refresh=False):
+        total += 1
+        meta = _pool_meta(creds.auth_key or "", state)
+        if meta.get("disabled_for_quota"):
+            quota_disabled += 1
+        if meta.get("blocked_model_ids") or meta.get("blocked_models"):
+            model_blocked += 1
+        if creds.expired:
+            continue
+        live += 1
+        if not meta["enabled"]:
+            continue
+        enabled += 1
+        if is_in_cooldown(meta):
+            cooling += 1
     return {
         "mode": get_account_mode(),
-        "total": len(accounts),
-        "live": len(live),
-        "enabled": len(enabled),
-        "in_cooldown": len(cooling),
-        "quota_disabled": len(quota_disabled),
-        "model_blocked": len(model_blocked),
-        "accounts": accounts,
+        "total": total,
+        "live": live,
+        "enabled": enabled,
+        "in_cooldown": cooling,
+        "quota_disabled": quota_disabled,
+        "model_blocked": model_blocked,
     }
 
 

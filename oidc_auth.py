@@ -286,6 +286,28 @@ def normalize_auth_file_keys() -> dict[str, Any]:
     return {"ok": True, "changed": changed, "total": len(new_map)}
 
 
+class RefreshRevokedError(ValueError):
+    """Refresh token permanently rejected by the IdP (invalid_grant / revoked)."""
+
+
+def _is_permanent_refresh_failure(status_code: int, body: str) -> bool:
+    text = (body or "").lower()
+    if status_code not in (400, 401):
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "invalid_grant",
+            "refresh token has been revoked",
+            "token has been revoked",
+            "revoked",
+            "invalid_token",
+            "refresh token is invalid",
+            "token is invalid",
+        )
+    )
+
+
 def refresh_access_token(
     entry: dict[str, Any],
     *,
@@ -301,6 +323,12 @@ def refresh_access_token(
     rt = entry.get("refresh_token")
     if not rt:
         raise ValueError("no refresh_token on account")
+    # Permanently bad refresh tokens are marked by a previous cycle so we do
+    # not burn OIDC quota every few minutes on the same dead accounts.
+    if entry.get("refresh_invalid"):
+        raise RefreshRevokedError(
+            str(entry.get("refresh_invalid_reason") or "refresh_token marked invalid")
+        )
     client_id = (
         entry.get("oidc_client_id")
         or GROK_CLI_CLIENT_ID
@@ -317,7 +345,10 @@ def refresh_access_token(
         with httpx.Client(timeout=30.0) as c:
             resp = c.post(OIDC_TOKEN_URL, data=form, headers=headers)
     if resp.status_code >= 400:
-        raise ValueError(f"refresh failed {resp.status_code}: {resp.text[:400]}")
+        body = resp.text[:400]
+        if _is_permanent_refresh_failure(resp.status_code, body):
+            raise RefreshRevokedError(f"refresh failed {resp.status_code}: {body}")
+        raise ValueError(f"refresh failed {resp.status_code}: {body}")
     data = resp.json()
     if not isinstance(data, dict) or not data.get("access_token"):
         raise ValueError("invalid refresh response")
@@ -704,6 +735,17 @@ def refresh_all_accounts(
         if not entry.get("refresh_token"):
             results.append({"id": aid, "ok": False, "error": "no refresh_token"})
             continue
+        if entry.get("refresh_invalid"):
+            results.append(
+                {
+                    "id": aid,
+                    "ok": False,
+                    "skipped": True,
+                    "reason": "refresh_invalid",
+                    "error": str(entry.get("refresh_invalid_reason") or "refresh_token marked invalid")[:200],
+                }
+            )
+            continue
         token = entry.get("key")
         exp = parse_expires_at(
             entry.get("expires_at"), token if isinstance(token, str) else None
@@ -745,43 +787,83 @@ def refresh_all_accounts(
         candidates = candidates[:max_accounts]
 
     updates: dict[str, dict[str, Any]] = {}
+    invalid_marks: dict[str, str] = {}
     updates_lock = threading.Lock()
+    # One shared client per worker thread instead of opening a fresh TCP/TLS
+    # session for every account in the batch.
+    _tls = threading.local()
+    _clients: list[httpx.Client] = []
+    _clients_lock = threading.Lock()
+
+    def _thread_client() -> httpx.Client:
+        client = getattr(_tls, "client", None)
+        if client is None or client.is_closed:
+            client = httpx.Client(timeout=30.0)
+            _tls.client = client
+            with _clients_lock:
+                _clients.append(client)
+        return client
 
     def _refresh_one(item: tuple[str, dict[str, Any]]) -> dict[str, Any]:
         aid, entry = item
-        # One short-lived client per worker task is still better than unbounded
-        # fan-out; pool size is already capped by max_workers.
         try:
-            with httpx.Client(timeout=30.0) as client:
-                r = refresh_and_persist(aid, entry, client=client, persist=False)
+            r = refresh_and_persist(
+                aid, entry, client=_thread_client(), persist=False
+            )
+            # Successful refresh clears any previous invalid mark.
+            new_entry = dict(r["entry"])
+            new_entry.pop("refresh_invalid", None)
+            new_entry.pop("refresh_invalid_at", None)
+            new_entry.pop("refresh_invalid_reason", None)
             with updates_lock:
-                updates[r["account_id"]] = r["entry"]
+                updates[r["account_id"]] = new_entry
                 # Drop old key if remounted to a different storage id
                 if r["account_id"] != aid:
                     updates.setdefault("__delete__", {})  # type: ignore[arg-type]
             return {
                 "id": r["account_id"],
                 "ok": True,
-                "email": r["entry"].get("email"),
-                "expires_at": r["entry"].get("expires_at"),
+                "email": new_entry.get("email"),
+                "expires_at": new_entry.get("expires_at"),
+            }
+        except RefreshRevokedError as e:
+            reason = str(e)[:300]
+            with updates_lock:
+                invalid_marks[aid] = reason
+            return {
+                "id": aid,
+                "ok": False,
+                "error": reason,
+                "permanent": True,
+                "reason": "refresh_invalid",
             }
         except Exception as e:  # noqa: BLE001
             return {"id": aid, "ok": False, "error": str(e)[:300]}
 
     workers = max(1, min(int(max_workers or 1), max(1, len(candidates))))
     if candidates:
-        with ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix="tok-refresh-"
-        ) as ex:
-            futs = [ex.submit(_refresh_one, c) for c in candidates]
-            for fut in as_completed(futs):
-                try:
-                    results.append(fut.result())
-                except Exception as e:  # noqa: BLE001
-                    results.append({"id": "?", "ok": False, "error": str(e)[:300]})
+        try:
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="tok-refresh-"
+            ) as ex:
+                futs = [ex.submit(_refresh_one, c) for c in candidates]
+                for fut in as_completed(futs):
+                    try:
+                        results.append(fut.result())
+                    except Exception as e:  # noqa: BLE001
+                        results.append({"id": "?", "ok": False, "error": str(e)[:300]})
+        finally:
+            with _clients_lock:
+                for client in _clients:
+                    try:
+                        if not client.is_closed:
+                            client.close()
+                    except Exception:
+                        pass
+                _clients.clear()
 
-    # Single batched write for all successful refreshes
-    if updates:
+    # Single batched write for successful refreshes + permanent invalid marks.
+    if updates or invalid_marks:
         def _apply(m: dict[str, Any]) -> None:
             for aid, entry in updates.items():
                 if aid == "__delete__" or not isinstance(entry, dict):
@@ -803,6 +885,15 @@ def refresh_all_accounts(
                     if same_user or same_token:
                         del m[k]
                 m[aid] = entry
+            for aid, reason in invalid_marks.items():
+                cur = m.get(aid)
+                if not isinstance(cur, dict):
+                    continue
+                cur = dict(cur)
+                cur["refresh_invalid"] = True
+                cur["refresh_invalid_at"] = time.time()
+                cur["refresh_invalid_reason"] = reason[:300]
+                m[aid] = cur
 
         try:
             mutate_auth_map(_apply)
@@ -814,6 +905,7 @@ def refresh_all_accounts(
                 "refreshed": 0,
                 "deferred": deferred,
                 "attempted": len(candidates),
+                "invalidated": len(invalid_marks),
             }
 
     out = {
@@ -823,6 +915,7 @@ def refresh_all_accounts(
         "deferred": deferred,
         "attempted": len(candidates),
         "workers": workers,
+        "invalidated": sum(1 for r in results if r.get("permanent") or r.get("reason") == "refresh_invalid"),
     }
     if wanted is not None:
         out["selected"] = len(wanted)
