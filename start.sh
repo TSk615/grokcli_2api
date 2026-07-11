@@ -29,6 +29,8 @@ export GROK2API_HOST="${GROK2API_HOST:-127.0.0.1}"
 export GROK2API_PORT="${GROK2API_PORT:-3000}"
 export GROK2API_ACCOUNT_MODE="${GROK2API_ACCOUNT_MODE:-round_robin}"
 export GROK2API_TOKEN_MAINTAIN="${GROK2API_TOKEN_MAINTAIN:-1}"
+# off: reasoning_content only (sub2api / Claude Code); think_tag only for content-only relays
+export GROK2API_REASONING_COMPAT="${GROK2API_REASONING_COMPAT:-off}"
 
 PORT="$GROK2API_PORT"
 echo "Starting grokcli-2api..."

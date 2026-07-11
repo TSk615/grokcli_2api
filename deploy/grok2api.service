@@ -1,4 +1,4 @@
-﻿[Unit]
+[Unit]
 Description=grokcli-2api (OpenAI-compatible Grok proxy, multi-account)
 After=network-online.target
 Wants=network-online.target
@@ -13,6 +13,7 @@ Environment=GROK2API_PORT=3000
 Environment=GROK2API_OPEN_BROWSER=0
 Environment=GROK2API_ACCOUNT_MODE=round_robin
 Environment=GROK2API_TOKEN_MAINTAIN=1
+Environment=GROK2API_REASONING_COMPAT=off
 Environment=GROK2API_DATA_DIR=/var/lib/grok2api/data
 # Environment=GROK2API_ADMIN_PASSWORD=change-me
 ExecStart=/usr/bin/python3 /opt/grokcli-2api/app.py

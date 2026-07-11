@@ -26,6 +26,7 @@ $env:PYTHONPATH = (Join-Path $PSScriptRoot "grok-build-auth") + (
 if (-not $env:GROK2API_OPEN_BROWSER) { $env:GROK2API_OPEN_BROWSER = "1" }
 if (-not $env:GROK2API_HOST) { $env:GROK2API_HOST = "127.0.0.1" }
 if (-not $env:GROK2API_PORT) { $env:GROK2API_PORT = "3000" }
+if (-not $env:GROK2API_REASONING_COMPAT) { $env:GROK2API_REASONING_COMPAT = "off" }
 
 $port = $env:GROK2API_PORT
 Write-Host "Starting grokcli-2api..."

@@ -14,6 +14,9 @@ services:
       # Keep maintainers ON; defaults in config.py already throttle large pools.
       GROK2API_TOKEN_MAINTAIN: "1"
       GROK2API_MODEL_HEALTH: "1"
+      # Keep reasoning in reasoning_content (recommended for sub2api / Claude Code).
+      # Only set think_tag for relays that only read delta.content.
+      GROK2API_REASONING_COMPAT: "off"
       # Optional tuning for 400+ accounts:
       # GROK2API_TOKEN_MAINTAIN_INTERVAL: "180"
       # GROK2API_MODEL_HEALTH_INTERVAL: "900"

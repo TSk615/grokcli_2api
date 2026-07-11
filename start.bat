@@ -39,6 +39,7 @@ set "PYTHONPATH=%CD%\grok-build-auth;%PYTHONPATH%"
 if not defined GROK2API_OPEN_BROWSER set GROK2API_OPEN_BROWSER=1
 if not defined GROK2API_HOST set GROK2API_HOST=127.0.0.1
 if not defined GROK2API_PORT set GROK2API_PORT=3000
+if not defined GROK2API_REASONING_COMPAT set GROK2API_REASONING_COMPAT=off
 
 echo Starting grokcli-2api on http://%GROK2API_HOST%:%GROK2API_PORT% ...
 echo Admin: http://127.0.0.1:%GROK2API_PORT%/admin

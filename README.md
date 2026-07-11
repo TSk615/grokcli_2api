@@ -114,6 +114,7 @@ export GROK2API_PORT=3000
 export GROK2API_OPEN_BROWSER=0
 export GROK2API_ADMIN_PASSWORD='your-strong-password'
 export GROK2API_ACCOUNT_MODE=round_robin
+export GROK2API_REASONING_COMPAT=off   # sub2api/Claude Code 推荐；仅 content 中继才用 think_tag
 
 # 可选：协议注册
 export GROK2API_MOEMAIL_API_KEY='mk_xxx'
