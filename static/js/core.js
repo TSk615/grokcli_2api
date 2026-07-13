@@ -2545,31 +2545,71 @@ function applyRegConfig(cfg) {
   if ($("reg-mail-provider")) {
     $("reg-mail-provider").value = mailProv;
   }
-  // Hydrate per-provider key/domain caches (prefer dedicated fields).
+  // Hydrate per-provider key/domain caches.
+  // Prefer dedicated fields; only fall back to active field for the *current*
+  // provider. Never invent values for other providers.
+  const activeKey = cfg.api_key == null ? "" : String(cfg.api_key);
+  const activeDomain = cfg.domain == null ? "" : String(cfg.domain);
   regMailKeys = {
-    moemail: cfg.moemail_api_key || (mailProv === "moemail" ? (cfg.api_key || "") : "") || "",
-    yyds: cfg.yyds_api_key || (mailProv === "yyds" ? (cfg.api_key || "") : "") || "",
-    gptmail: cfg.gptmail_api_key || (mailProv === "gptmail" ? (cfg.api_key || "") : "") || "",
+    moemail:
+      cfg.moemail_api_key != null && cfg.moemail_api_key !== ""
+        ? String(cfg.moemail_api_key)
+        : (mailProv === "moemail" ? activeKey : (regMailKeys.moemail || "")),
+    yyds:
+      cfg.yyds_api_key != null && cfg.yyds_api_key !== ""
+        ? String(cfg.yyds_api_key)
+        : (mailProv === "yyds" ? activeKey : (regMailKeys.yyds || "")),
+    gptmail:
+      cfg.gptmail_api_key != null && cfg.gptmail_api_key !== ""
+        ? String(cfg.gptmail_api_key)
+        : (mailProv === "gptmail" ? activeKey : (regMailKeys.gptmail || "")),
+  };
+  // Domain: if the dedicated field is present (including empty string from server),
+  // honor it. Empty means cleared — do not restore from cache/localStorage.
+  const pickDomain = (slotKey, isActive) => {
+    if (Object.prototype.hasOwnProperty.call(cfg, slotKey)) {
+      return cfg[slotKey] == null ? "" : String(cfg[slotKey]);
+    }
+    if (isActive && Object.prototype.hasOwnProperty.call(cfg, "domain")) {
+      return activeDomain;
+    }
+    return regMailDomains[slotKey.replace("_domain", "")] || "";
   };
   regMailDomains = {
-    moemail: cfg.moemail_domain || (mailProv === "moemail" ? (cfg.domain || "") : "") || "",
-    yyds: cfg.yyds_domain || (mailProv === "yyds" ? (cfg.domain || "") : "") || "",
-    gptmail: cfg.gptmail_domain || (mailProv === "gptmail" ? (cfg.domain || "") : "") || "",
+    moemail: pickDomain("moemail_domain", mailProv === "moemail"),
+    yyds: pickDomain("yyds_domain", mailProv === "yyds"),
+    gptmail: pickDomain("gptmail_domain", mailProv === "gptmail"),
   };
+  // If server returned empty dedicated slot for active provider, force empty.
+  if (mailProv === "yyds" && Object.prototype.hasOwnProperty.call(cfg, "yyds_domain")) {
+    regMailDomains.yyds = cfg.yyds_domain == null ? "" : String(cfg.yyds_domain);
+  }
+  if (mailProv === "gptmail" && Object.prototype.hasOwnProperty.call(cfg, "gptmail_domain")) {
+    regMailDomains.gptmail = cfg.gptmail_domain == null ? "" : String(cfg.gptmail_domain);
+  }
+  if (mailProv === "moemail" && Object.prototype.hasOwnProperty.call(cfg, "moemail_domain")) {
+    regMailDomains.moemail = cfg.moemail_domain == null ? "" : String(cfg.moemail_domain);
+  }
   regMailProviderPrev = mailProv;
   // Only show/edit base_url for MoeMail.
   if ($("reg-base-url")) {
     $("reg-base-url").value = mailProv === "moemail" ? (cfg.base_url || "") : "";
   }
   if ($("reg-prefix")) $("reg-prefix").value = cfg.prefix || "";
-  if ($("reg-domain")) $("reg-domain").value = regMailDomains[mailProv] || "";
+  if ($("reg-domain")) {
+    $("reg-domain").value = regMailDomains[mailProv] || "";
+    try { $("reg-domain").setAttribute("autocomplete", "off"); } catch (_) {}
+  }
   if ($("reg-expiry-ms")) {
     const exp = normalizeRegExpiryMs(cfg.expiry_ms);
     $("reg-expiry-ms").value = exp;
     // Keep select valid if browser rejected an unexpected value.
     if ($("reg-expiry-ms").value !== exp) $("reg-expiry-ms").value = "3600000";
   }
-  if ($("reg-api-key")) $("reg-api-key").value = regMailKeys[mailProv] || "";
+  if ($("reg-api-key")) {
+    $("reg-api-key").value = regMailKeys[mailProv] || "";
+    try { $("reg-api-key").setAttribute("autocomplete", "off"); } catch (_) {}
+  }
   if ($("reg-captcha-provider")) {
     const provider = String(cfg.captcha_provider || "local").trim().toLowerCase();
     $("reg-captcha-provider").value = provider === "yescaptcha" ? "yescaptcha" : "local";
@@ -2595,18 +2635,40 @@ function cacheRegConfigLocal(cfg) {
 
 async function saveRegConfig() {
   const cfg = readRegConfig();
-  cacheRegConfigLocal(cfg);
+  // Do NOT cache the pre-save form first — if the user cleared domain/key,
+  // caching here would let a later loadRegConfigLocal() restore the old value
+  // before the server response lands.
   try {
     const r = await api("/accounts/register-email/config", {
       method: "PUT",
       body: JSON.stringify(cfg),
     });
     const saved = (r && r.config) || cfg;
+    // Force active provider domain/key from what we just submitted when server
+    // omits empty strings, so UI stays cleared.
+    const mail = String(saved.mail_provider || cfg.mail_provider || "moemail").toLowerCase();
+    if (mail === "yyds") {
+      if (!Object.prototype.hasOwnProperty.call(saved, "yyds_domain")) saved.yyds_domain = cfg.yyds_domain || "";
+      if (!Object.prototype.hasOwnProperty.call(saved, "domain")) saved.domain = cfg.domain || "";
+      if (!Object.prototype.hasOwnProperty.call(saved, "yyds_api_key")) saved.yyds_api_key = cfg.yyds_api_key || "";
+      if (!Object.prototype.hasOwnProperty.call(saved, "api_key")) saved.api_key = cfg.api_key || "";
+    } else if (mail === "gptmail") {
+      if (!Object.prototype.hasOwnProperty.call(saved, "gptmail_domain")) saved.gptmail_domain = cfg.gptmail_domain || "";
+      if (!Object.prototype.hasOwnProperty.call(saved, "domain")) saved.domain = cfg.domain || "";
+      if (!Object.prototype.hasOwnProperty.call(saved, "gptmail_api_key")) saved.gptmail_api_key = cfg.gptmail_api_key || "";
+      if (!Object.prototype.hasOwnProperty.call(saved, "api_key")) saved.api_key = cfg.api_key || "";
+    } else {
+      if (!Object.prototype.hasOwnProperty.call(saved, "moemail_domain")) saved.moemail_domain = cfg.moemail_domain || "";
+      if (!Object.prototype.hasOwnProperty.call(saved, "domain")) saved.domain = cfg.domain || "";
+    }
     applyRegConfig(saved);
     cacheRegConfigLocal(saved);
+    regConfigLoadedAt = Date.now();
     toast(r.message || "注册配置已保存到数据库");
     return saved;
   } catch (e) {
+    // Only cache on failure so a retry still has the typed values.
+    cacheRegConfigLocal(cfg);
     toast((e && e.message) || "保存失败（已写本地缓存）", false);
     throw e;
   }
@@ -2619,10 +2681,11 @@ function loadRegConfigLocal() {
 }
 
 async function loadRegConfig(force) {
-  // Paint local cache first so soft-nav feels instant.
-  if (!force) loadRegConfigLocal();
+  // Prefer server truth. Local cache is only a first-paint fallback when we
+  // have nothing yet — never let it overwrite a just-cleared domain/key.
+  if (!force && !regConfigCache) loadRegConfigLocal();
   const now = Date.now();
-  if (!force && regConfigCache && now - regConfigLoadedAt < 15000 && $("reg-base-url")) {
+  if (!force && regConfigCache && now - regConfigLoadedAt < 15000) {
     applyRegConfig(regConfigCache);
     return regConfigCache;
   }
@@ -2648,7 +2711,8 @@ async function loadRegConfig(force) {
       return s.registration_config;
     }
   } catch (_) {}
-  loadRegConfigLocal();
+  if (regConfigCache) applyRegConfig(regConfigCache);
+  else loadRegConfigLocal();
   return regConfigCache;
 }
 function buildRegBody(config) {

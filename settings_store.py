@@ -1944,10 +1944,42 @@ def apply_registration_config_to_runtime(cfg: dict[str, Any] | None = None) -> N
 def resolve_registration_inputs(
     overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Merge request overrides on top of saved/env registration config."""
+    """Merge request overrides on top of saved/env registration config.
+
+    Empty string is meaningful for the *active* mail domain / key fields:
+    it means the user cleared them. Do not silently fall back to the previous
+    DB value for those active slots, or the admin UI will appear to "restore"
+    a deleted YYDS/GPTMail domain after save/start.
+    """
     base = get_registration_config(include_secrets=True)
     overrides = overrides if isinstance(overrides, dict) else {}
     merged = dict(base)
+
+    # Resolve target provider early so empty active domain/key can clear.
+    try:
+        from moemail import normalize_mail_provider as _nmp
+
+        prov = _nmp(
+            str(
+                overrides.get("mail_provider")
+                or base.get("mail_provider")
+                or "moemail"
+            ),
+            base_url=str(overrides.get("base_url") or base.get("base_url") or ""),
+        )
+    except Exception:
+        prov = str(
+            overrides.get("mail_provider") or base.get("mail_provider") or "moemail"
+        ).strip().lower() or "moemail"
+    active_key_slot = _MAIL_PROVIDER_KEY_FIELDS.get(prov, "moemail_api_key")
+    active_dom_slot = _MAIL_PROVIDER_DOMAIN_FIELDS.get(prov, "moemail_domain")
+    clearable_empty = {
+        "domain",
+        active_dom_slot,
+        "api_key",
+        active_key_slot,
+    }
+
     for key in _REG_CONFIG_KEYS:
         if key not in overrides:
             continue
@@ -1955,13 +1987,44 @@ def resolve_registration_inputs(
         if val is None:
             continue
         if isinstance(val, str) and not val.strip():
+            # Empty inactive fields: ignore (UI did not edit them).
+            # Empty active domain/key: honor clear.
+            if key in clearable_empty:
+                merged[key] = ""
             continue
         if key in _REG_SECRET_KEYS and isinstance(val, str):
             s = val.strip()
             if "…" in s or s == "****" or set(s) <= {"*"}:
                 continue
         merged[key] = val
-    return _normalize_registration_config(merged, merge_env=True)
+
+    # Keep active domain/key mirrored onto the provider-specific slots.
+    if "domain" in overrides:
+        merged[active_dom_slot] = str(overrides.get("domain") or "").strip()
+        merged["domain"] = merged[active_dom_slot]
+    elif active_dom_slot in overrides:
+        merged["domain"] = str(overrides.get(active_dom_slot) or "").strip()
+        merged[active_dom_slot] = merged["domain"]
+
+    if "api_key" in overrides and not (
+        isinstance(overrides.get("api_key"), str)
+        and ("…" in overrides.get("api_key") or overrides.get("api_key") == "****")
+    ):
+        merged[active_key_slot] = str(overrides.get("api_key") or "").strip()
+        merged["api_key"] = merged[active_key_slot]
+    elif active_key_slot in overrides and not (
+        isinstance(overrides.get(active_key_slot), str)
+        and (
+            "…" in str(overrides.get(active_key_slot) or "")
+            or str(overrides.get(active_key_slot) or "") == "****"
+        )
+    ):
+        merged["api_key"] = str(overrides.get(active_key_slot) or "").strip()
+        merged[active_key_slot] = merged["api_key"]
+
+    # merge_env=False: already started from full DB+env base; re-merging env
+    # would revive cleared active keys/domains from process env.
+    return _normalize_registration_config(merged, merge_env=False)
 
 
 # ── pool rotation / cooldown policy ────────────────────────────────────────
