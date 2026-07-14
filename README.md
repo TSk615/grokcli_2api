@@ -2,14 +2,14 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / SSO / JSON 导入导出、协议注册。
 
-**当前版本：v1.9.67** · 上游模型入库 · 续期失败硬删除 · 断联防抖
+**当前版本：v1.9.68** · 断联明细补全 · 上游模型入库 · 续期失败硬删除
 
 [![GHCR](https://img.shields.io/badge/ghcr.io-hm2899%2Fgrokcli--2api-blue)](https://github.com/users/HM2899/packages/container/package/grokcli-2api)
 [![Release](https://img.shields.io/github/v/release/HM2899/grokcli-2api?display_name=tag)](https://github.com/HM2899/grokcli-2api/releases)
 
 | 镜像（全小写） | 说明 |
 |----------------|------|
-| `ghcr.io/hm2899/grokcli-2api:1.9.67` | 当前版本 |
+| `ghcr.io/hm2899/grokcli-2api:1.9.68` | 当前版本 |
 | `ghcr.io/hm2899/grokcli-2api:latest` | 最近 `v*` tag |
 | `ghcr.io/hm2899/grokcli-2api:edge` | `main` 最新 |
 
@@ -139,7 +139,7 @@ ghcr.io/hm2899/grokcli-2api
 **正确示例：**
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.67
+docker pull ghcr.io/hm2899/grokcli-2api:1.9.68
 # 或
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
@@ -178,7 +178,7 @@ services:
       retries: 10
 
   grokcli-2api:
-    image: ghcr.io/hm2899/grokcli-2api:1.9.67
+    image: ghcr.io/hm2899/grokcli-2api:1.9.68
     ports:
       # 只映射应用；不要给 postgres/redis 加 ports
       - "3000:3000"
@@ -416,7 +416,7 @@ gh run list --workflow=docker-publish.yml --limit 3
 成功后拉取（**必须小写**）：
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.67
+docker pull ghcr.io/hm2899/grokcli-2api:1.9.68
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
 
@@ -457,7 +457,11 @@ docker-compose.yml                    # redis + postgres（内网）+ app
 
 ## 版本
 
-- **v1.9.67**（当前）
+- **v1.9.68**（当前）
+  - **断联明细补全**：`/v1/responses` / chat / Anthropic 失败路径写入真实 `error` + `detail.message`（上游 status/body、空 200、代理异常、全号失败），不再落成裸 `request_failed` + `{}`
+  - 失败 usage 行补 `latency_ms`；`_record_usage_safe` 对 `!ok` 强制补 status/message，方便管理台「断联」排查
+  - 继承 v1.9.67：模型列表入库、续期永久失败硬删除、断联防抖
+- **v1.9.67**
   - **模型列表入库**：`GET /v1/models` 只读 PostgreSQL `models` 表；管理台「同步上游模型」从 cli-chat-proxy 拉取并写入数据库（不再读写 `models_cache.json`）
   - 启动时若表为空，自动灌入默认模型 + 本地 extras；`migrate_json_to_pg.py` 仍可一次性导入旧 `models_cache.json`
   - **运行时不再写本地 JSON 镜像**：hybrid 下账号 / Key / 设置只落 PostgreSQL；会话粘性只走 Redis；`data/*.json` 仅迁移与管理台导入导出
@@ -512,7 +516,7 @@ docker-compose.yml                    # redis + postgres（内网）+ app
 - **v1.9.45–1.9.38**：YYDS 域名、任务日志、JSON/SSO 进度、内联 hybrid 等
 - 更早变更见 [GitHub Releases](https://github.com/HM2899/grokcli-2api/releases)
 
-> 镜像 tag 与 `app.py` 中 `APP_VERSION` 一致（当前 **1.9.67**）。  
+> 镜像 tag 与 `app.py` 中 `APP_VERSION` 一致（当前 **1.9.68**）。  
 > 拉取路径固定 **`ghcr.io/hm2899/grokcli-2api`**（全小写）。
 
 ## License

@@ -54,7 +54,7 @@ import config as _config
 import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.9.67"
+APP_VERSION = "1.9.68"
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -1927,6 +1927,13 @@ class RequestTiming:
         self.t_first_token = time.perf_counter()
         self.emit(ok=True, first=kind)
 
+    def latency_ms(self) -> int:
+        """Wall-clock ms since request start (best-effort for usage ledger)."""
+        try:
+            return max(0, int(round((time.perf_counter() - self.t0) * 1000.0)))
+        except Exception:
+            return 0
+
     def emit(self, *, ok: bool = True, first: str | None = None, error: str | None = None) -> None:
         if self.logged or not _ttft_log_enabled():
             return
@@ -2030,11 +2037,27 @@ def _record_usage_safe(
         # (looks like a silent drop). Always stamp a reason + status on !ok.
         err_out = error
         status_out = status_code
+        detail_out = dict(detail) if isinstance(detail, dict) else None
         if not ok:
             if err_out is None or not str(err_out).strip():
-                err_out = "request_failed"
+                # Prefer an explicit detail.message over the opaque default.
+                if isinstance(detail_out, dict):
+                    for key in ("message", "error", "upstream", "reason"):
+                        val = detail_out.get(key)
+                        if val is not None and str(val).strip():
+                            err_out = str(val).strip()[:800]
+                            break
+                if err_out is None or not str(err_out).strip():
+                    err_out = "request_failed"
+            else:
+                err_out = str(err_out).strip()[:800]
             if status_out is None:
                 status_out = 502
+            # Empty detail {} is useless for ops; always keep a compact message.
+            if not detail_out:
+                detail_out = {"message": str(err_out)[:800]}
+            elif "message" not in detail_out:
+                detail_out["message"] = str(err_out)[:800]
         usage_stats.record_usage(
             usage=usage,
             ok=ok,
@@ -2049,7 +2072,7 @@ def _record_usage_safe(
             status_code=status_out,
             latency_ms=latency_ms,
             error=err_out,
-            detail=detail,
+            detail=detail_out,
         )
     except Exception:
         pass
@@ -3624,6 +3647,13 @@ async def chat_completions(
                 model=model,
                 protocol="openai",
                 stream=False,
+                status_code=code,
+                error=f"Upstream {code}: {detail}",
+                detail={
+                    "message": f"Upstream {code}: {detail}",
+                    "upstream_status": code,
+                    "upstream_body": detail,
+                },
             )
             last_error = f"Upstream {code}: {detail}"
             last_status = code
@@ -3651,6 +3681,9 @@ async def chat_completions(
                 model=model,
                 protocol="openai",
                 stream=False,
+                status_code=502,
+                error=f"Proxy error: {e}",
+                detail={"message": f"Proxy error: {e}", "exc_type": type(e).__name__},
             )
             last_error = f"Proxy error: {e}"
             last_status = 502
@@ -3811,6 +3844,14 @@ async def _stream_proxy_with_failover_inner(
                         model=model,
                         protocol="openai",
                         stream=True,
+                        status_code=resp.status_code,
+                        latency_ms=timing.latency_ms() if timing is not None else None,
+                        error=f"Upstream {resp.status_code}: {err_text}",
+                        detail={
+                            "message": f"Upstream {resp.status_code}: {err_text}",
+                            "upstream_status": resp.status_code,
+                            "upstream_body": err_text,
+                        },
                     )
                     last_err = f"Upstream {resp.status_code}: {err_text}"
                     # try next account if retryable and more remain
@@ -4316,6 +4357,10 @@ async def _stream_proxy_with_failover_inner(
                     model=model,
                     protocol="openai",
                     stream=True,
+                    status_code=502,
+                    latency_ms=timing.latency_ms() if timing is not None else None,
+                    error=empty_err,
+                    detail={"message": empty_err, "kind": "empty_upstream"},
                 )
                 last_err = empty_err
                 # Only role-only was sent: safe to failover to next account.
@@ -4455,6 +4500,14 @@ async def _stream_proxy_with_failover_inner(
                     model=model,
                     protocol="openai",
                     stream=True,
+                    status_code=502,
+                    latency_ms=timing.latency_ms() if timing is not None else None,
+                    error=f"Proxy error: {last_err}",
+                    detail={
+                        "message": f"Proxy error: {last_err}",
+                        "exc_type": type(e).__name__,
+                        "stream_started": True,
+                    },
                 )
                 err_payload = {
                     "id": chat_id,
@@ -4474,6 +4527,14 @@ async def _stream_proxy_with_failover_inner(
                 model=model,
                 protocol="openai",
                 stream=True,
+                status_code=502,
+                latency_ms=timing.latency_ms() if timing is not None else None,
+                error=f"Proxy error: {last_err}",
+                detail={
+                    "message": f"Proxy error: {last_err}",
+                    "exc_type": type(e).__name__,
+                    "stream_started": False,
+                },
             )
             if idx < len(chain) - 1:
                 continue
@@ -4928,6 +4989,13 @@ async def anthropic_messages(
                 model=model,
                 protocol="anthropic",
                 stream=False,
+                status_code=code,
+                error=f"Upstream {code}: {detail}",
+                detail={
+                    "message": f"Upstream {code}: {detail}",
+                    "upstream_status": code,
+                    "upstream_body": detail,
+                },
             )
             last_error = f"Upstream {code}: {detail}"
             last_status = code
@@ -4955,6 +5023,9 @@ async def anthropic_messages(
                 model=model,
                 protocol="anthropic",
                 stream=False,
+                status_code=502,
+                error=f"Proxy error: {e}",
+                detail={"message": f"Proxy error: {e}", "exc_type": type(e).__name__},
             )
             last_error = f"Proxy error: {e}"
             last_status = 502
@@ -5212,6 +5283,13 @@ async def openai_responses(
                     model=model,
                     protocol="openai_responses",
                     stream=want_stream,
+                    status_code=code,
+                    error=f"Upstream {code}: {detail}",
+                    detail={
+                        "message": f"Upstream {code}: {detail}",
+                        "upstream_status": code,
+                        "upstream_body": detail,
+                    },
                 )
                 last_error = f"Upstream {code}: {detail}"
                 last_status = code
@@ -5239,6 +5317,9 @@ async def openai_responses(
                     model=model,
                     protocol="openai_responses",
                     stream=want_stream,
+                    status_code=502,
+                    error=f"Proxy error: {e}",
+                    detail={"message": f"Proxy error: {e}", "exc_type": type(e).__name__},
                 )
                 last_error = f"Proxy error: {e}"
                 last_status = 502
@@ -5303,6 +5384,16 @@ async def openai_responses(
                                     model=model,
                                     protocol="openai_responses",
                                     stream=True,
+                                    status_code=resp.status_code,
+                                    latency_ms=timing.latency_ms(),
+                                    error=f"Upstream {resp.status_code}: {err_text}",
+                                    detail={
+                                        "message": (
+                                            f"Upstream {resp.status_code}: {err_text}"
+                                        ),
+                                        "upstream_status": resp.status_code,
+                                        "upstream_body": err_text,
+                                    },
                                 )
                                 last_error = (
                                     f"Upstream {resp.status_code}: {err_text}"
@@ -5573,6 +5664,10 @@ async def openai_responses(
                                     model=model,
                                     protocol="openai_responses",
                                     stream=True,
+                                    status_code=502,
+                                    latency_ms=timing.latency_ms(),
+                                    error=empty_err,
+                                    detail={"message": empty_err, "kind": "empty_upstream"},
                                 )
                                 last_error = empty_err
                                 # No client bytes yet → silent account failover.
@@ -5609,6 +5704,21 @@ async def openai_responses(
                                     error=empty_err,
                                     status_code=502,
                                     model=model,
+                                )
+                                _record_usage_safe(
+                                    ok=False,
+                                    api_key_id=key_id,
+                                    account_id=creds.auth_key,
+                                    model=model,
+                                    protocol="openai_responses",
+                                    stream=True,
+                                    status_code=502,
+                                    latency_ms=timing.latency_ms(),
+                                    error=empty_err,
+                                    detail={
+                                        "message": empty_err,
+                                        "kind": "empty_complete",
+                                    },
                                 )
                                 last_error = empty_err
                                 if (not stream_started) and idx < len(chain) - 1:
@@ -5662,10 +5772,27 @@ async def openai_responses(
                                 pass
                         return
                     except Exception as e:  # noqa: BLE001
+                        fail_msg = f"Proxy error: {e}"
+                        _record_usage_safe(
+                            ok=False,
+                            api_key_id=key_id,
+                            account_id=creds.auth_key,
+                            model=model,
+                            protocol="openai_responses",
+                            stream=True,
+                            status_code=502,
+                            latency_ms=timing.latency_ms(),
+                            error=fail_msg,
+                            detail={
+                                "message": fail_msg,
+                                "exc_type": type(e).__name__,
+                                "stream_started": bool(stream_started),
+                            },
+                        )
                         if stream_started:
                             # Continue monotonic sequence_number after live deltas.
                             try:
-                                for frame in streamer.fail(f"Proxy error: {e}"):
+                                for frame in streamer.fail(fail_msg):
                                     yield frame
                             except Exception:
                                 pass
@@ -5677,7 +5804,7 @@ async def openai_responses(
                             status_code=502,
                             model=model,
                         )
-                        last_error = f"Proxy error: {e}"
+                        last_error = fail_msg
                         if idx < len(chain) - 1:
                             continue
                         try:
@@ -5686,11 +5813,33 @@ async def openai_responses(
                         except Exception:
                             pass
                         return
+                # No account produced a terminal response. Record a chain-level fail
+                # so admin "断联" rows never show bare request_failed + empty detail.
+                final_msg = (
+                    _sanitize_upstream_error_message(last_error or "", 502)
+                    or last_error
+                    or "All accounts failed"
+                )
+                _record_usage_safe(
+                    ok=False,
+                    api_key_id=key_id,
+                    account_id=first_tried,
+                    model=model,
+                    protocol="openai_responses",
+                    stream=True,
+                    status_code=502,
+                    latency_ms=timing.latency_ms(),
+                    error=final_msg,
+                    detail={
+                        "message": final_msg,
+                        "kind": "all_accounts_failed",
+                        "accounts": len(chain),
+                        "last_error": last_error,
+                    },
+                )
                 for frame in oai_resp.failed_responses_sse(
                     response_id=response_id,
-                    message=_sanitize_upstream_error_message(last_error or "", 502)
-                    or last_error
-                    or "All accounts failed",
+                    message=final_msg,
                     model=model,
                 ):
                     yield frame
@@ -5892,6 +6041,14 @@ async def _stream_anthropic_with_failover_inner(
                         model=model,
                         protocol="anthropic",
                         stream=True,
+                        status_code=resp.status_code,
+                        latency_ms=timing.latency_ms() if timing is not None else None,
+                        error=f"Upstream {resp.status_code}: {err_text}",
+                        detail={
+                            "message": f"Upstream {resp.status_code}: {err_text}",
+                            "upstream_status": resp.status_code,
+                            "upstream_body": err_text,
+                        },
                     )
                     last_err = f"Upstream {resp.status_code}: {err_text}"
                     if _retryable_status(resp.status_code) and idx < len(
@@ -6066,6 +6223,10 @@ async def _stream_anthropic_with_failover_inner(
                             model=model,
                             protocol="anthropic",
                             stream=True,
+                            status_code=502,
+                            latency_ms=timing.latency_ms() if timing is not None else None,
+                            error=empty_err,
+                            detail={"message": empty_err, "kind": "empty_upstream"},
                         )
                         last_err = empty_err
                         if (not stream_started) and idx < len(chain) - 1:
@@ -6173,6 +6334,10 @@ async def _stream_anthropic_with_failover_inner(
                             model=model,
                             protocol="anthropic",
                             stream=True,
+                            status_code=502,
+                            latency_ms=timing.latency_ms() if timing is not None else None,
+                            error=body_err,
+                            detail={"message": body_err, "kind": "upstream_body_error"},
                         )
                         last_err = body_err
                         if (not stream_started) and idx < len(chain) - 1:
@@ -6209,6 +6374,10 @@ async def _stream_anthropic_with_failover_inner(
                             model=model,
                             protocol="anthropic",
                             stream=True,
+                            status_code=502,
+                            latency_ms=timing.latency_ms() if timing is not None else None,
+                            error=empty_err,
+                            detail={"message": empty_err, "kind": "non_json_upstream"},
                         )
                         last_err = empty_err
                         if (not stream_started) and idx < len(chain) - 1:
@@ -6277,6 +6446,10 @@ async def _stream_anthropic_with_failover_inner(
                                 model=model,
                                 protocol="anthropic",
                                 stream=True,
+                                status_code=502,
+                                latency_ms=timing.latency_ms() if timing is not None else None,
+                                error=empty_err,
+                                detail={"message": empty_err, "kind": "empty_upstream"},
                             )
                             last_err = empty_err
                             if (not stream_started) and idx < len(chain) - 1:
@@ -6397,6 +6570,14 @@ async def _stream_anthropic_with_failover_inner(
                 model=model,
                 protocol="anthropic",
                 stream=True,
+                status_code=502,
+                latency_ms=timing.latency_ms() if timing is not None else None,
+                error=f"Proxy error: {e}",
+                detail={
+                    "message": f"Proxy error: {e}",
+                    "exc_type": type(e).__name__,
+                    "stream_started": bool(stream_started),
+                },
             )
             # Mid-stream failures cannot safely failover for secondary relays
             if stream_started:
