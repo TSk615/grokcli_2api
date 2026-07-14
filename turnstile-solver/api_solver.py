@@ -1249,10 +1249,17 @@ class TurnstileAPIServer:
 
         task = body.get("task") or {}
         task_type = (task.get("type") or "").strip()
+        # Local Camoufox solver only has one Turnstile path. Accept YesCaptcha /
+        # CapSolver premium aliases (M1/M2) as Proxyless so registration clients
+        # that default premium=True do not fail createTask with
+        # ERROR_TASK_NOT_SUPPORTED before falling back.
         supported = {
             "TurnstileTaskProxyless",
+            "TurnstileTaskProxylessM1",
+            "TurnstileTaskProxylessM2",
             "TurnstileTask",
             "AntiTurnstileTaskProxyLess",
+            "AntiTurnstileTaskProxyless",
             "AntiTurnstileTask",
         }
         if task_type and task_type not in supported:

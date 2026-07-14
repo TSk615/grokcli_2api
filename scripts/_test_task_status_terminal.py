@@ -161,7 +161,9 @@ def main() -> int:
     starts2 = [p for p in payloads2 if p.get("type") == "content_block_start"]
     names2 = [(p.get("content_block") or {}).get("name") for p in starts2]
     print("  starts:", names2)
-    assert "Update" in names2
+    # Empty allow-list still remaps Update → Edit (Claude Code never registers Update).
+    assert "Edit" in names2, names2
+    assert "Update" not in names2, names2
     assert any(p.get("type") == "message_stop" for p in payloads2)
     assert any(p.get("type") == "content_block_stop" for p in payloads2)
     # stop_reason should be tool_use
@@ -291,8 +293,339 @@ def main() -> int:
         assert any("[DONE]" in f for f in fail3)
     print("  incomplete Update empty-path OK")
 
+    print("\n=== Update→Edit remapping (Claude Code) ===")
+    test_update_to_edit_remap_all_paths()
+    print("  Update→Edit remapping OK")
+
+    print("\n=== soft-disconnect body frames ===")
+    test_soft_disconnect_does_not_drop_body_frames()
+    print("  soft-disconnect body frames OK")
+
+    print("\n=== codex reasoning leak ===")
+    test_codex_reasoning_not_leaked_as_output_text()
+    print("  codex reasoning not leaked OK")
+
     print("\nALL PASS")
     return 0
+
+
+
+
+def test_update_to_edit_remap_all_paths():
+    """Claude Code only registers Edit; Grok often invents Update/StrReplace.
+
+    All outbound surfaces (Responses live/terminal, Anthropic, OpenAI chat)
+    must rewrite Update→Edit. Empty allow-list still remaps (sub2api often
+    fails to forward the tools array).
+    """
+    import anthropic_compat as anth
+    import openai_responses as oresp
+
+    # 1) pure remapper
+    assert anth.canonical_outbound_tool_name("Update", allowed_names=None) == "Edit"
+    assert anth.canonical_outbound_tool_name("Update", allowed_names=set()) == "Edit"
+    assert anth.canonical_outbound_tool_name(
+        "Update", allowed_names={"Edit", "Read", "Write", "Bash"}
+    ) == "Edit"
+    assert anth.canonical_outbound_tool_name(
+        "StrReplace", allowed_names={"Edit"}
+    ) == "Edit"
+    assert anth.canonical_outbound_tool_name(
+        "TaskUpdate", allowed_names={"Edit", "TaskUpdate"}
+    ) == "TaskUpdate"
+    # Custom agent that only registered Update keeps it.
+    assert anth.canonical_outbound_tool_name(
+        "Update", allowed_names={"Update"}
+    ) == "Update"
+
+    full_args = (
+        '{"file_path":"/tmp/x.py","old_string":"old","new_string":"new"}'
+    )
+
+    # 2) Responses live streamer mid-stream
+    s = oresp.ResponsesLiveStreamer(
+        response_id="resp_t1",
+        model="grok-4.5",
+        allowed_tool_names={"Edit", "Read", "Write", "Bash"},
+    )
+    s.start()
+    frames = s.on_tool_delta(
+        [
+            {
+                "index": 0,
+                "id": "call_u1",
+                "function": {"name": "Update", "arguments": full_args},
+            }
+        ]
+    )
+    frames += s.complete(usage={"prompt_tokens": 1, "completion_tokens": 1})
+    names = _collect_function_names(frames)
+    assert names, "expected function_call frames"
+    assert all(n == "Edit" for n in names), names
+
+    # 3) Responses terminal-only path (args complete only at close)
+    s2 = oresp.ResponsesLiveStreamer(
+        response_id="resp_t2",
+        model="grok-4.5",
+        allowed_tool_names={"Edit", "Read"},
+    )
+    s2.start()
+    s2.on_tool_delta(
+        [
+            {
+                "index": 0,
+                "id": "call_u2",
+                "function": {
+                    "name": "Update",
+                    "arguments": '{"file_path":"/tmp/x.py","old_string":"a"}',
+                },
+            }
+        ]
+    )
+    assert 0 not in s2._tool_opened
+    # Name is remapped on first merge, even while args are incomplete.
+    assert (s2._tools.get(0) or {}).get("name") == "Edit", s2._tools.get(0)
+    # Defensive: if a hop still held raw "Update" until terminal close, remap there.
+    s2._tools[0]["name"] = "Update"
+    s2._tools[0]["arguments"] = full_args
+    s2._tools[0]["args_emitted"] = False
+    s2._tools[0]["output_index"] = None
+    s2._tool_opened.clear()
+    s2._tool_done.clear()
+    frames2 = s2.complete(usage={"prompt_tokens": 1, "completion_tokens": 1})
+    names2 = _collect_function_names(frames2)
+    assert (s2._tools.get(0) or {}).get("name") == "Edit", s2._tools.get(0)
+    assert names2 and all(n == "Edit" for n in names2), names2
+
+    # 4) empty allow-list still remaps
+    s3 = oresp.ResponsesLiveStreamer(response_id="resp_t3", model="g")
+    s3.start()
+    frames3 = s3.on_tool_delta(
+        [
+            {
+                "index": 0,
+                "id": "call_u3",
+                "function": {"name": "Update", "arguments": full_args},
+            }
+        ]
+    )
+    frames3 += s3.complete(usage={"prompt_tokens": 1, "completion_tokens": 1})
+    names3 = _collect_function_names(frames3)
+    assert names3 and all(n == "Edit" for n in names3), names3
+
+    # 5) Anthropic assembler
+    asm = anth.AnthropicStreamAssembler(
+        message_id="msg_t",
+        model="grok-4.5",
+        tools_requested=True,
+        max_tools=1,
+        allowed_tool_names={"Edit", "Read"},
+    )
+    frames_a = asm.feed(
+        tool_calls=[
+            {
+                "index": 0,
+                "id": "toolu_1",
+                "function": {"name": "Update", "arguments": full_args},
+            }
+        ]
+    )
+    frames_a += asm.finish(finish_reason="tool_calls")
+    anames = _collect_anthropic_tool_names(frames_a)
+    assert anames and all(n == "Edit" for n in anames), anames
+
+    # 6) OpenAI chat outbound builder
+    import sys
+    import importlib
+
+    # Force the container app package, not a stale /tmp/app.py copy.
+    sys.path = [p for p in sys.path if p not in ("/tmp", "") and not str(p).endswith("/tmp")]
+    if "/app" in sys.path:
+        sys.path.remove("/app")
+    sys.path.insert(0, "/app")
+    sys.modules.pop("app", None)
+    application = importlib.import_module("app")
+
+    # Bind allow-list like chat_completions does
+    try:
+        application._allowed_tool_names_ctx.set({"Edit", "Read", "Write", "Bash"})
+    except Exception:
+        pass
+    acc: dict = {}
+    application._ingest_tool_call_deltas(
+        acc,
+        [
+            {
+                "index": 0,
+                "id": "call_chat1",
+                "function": {"name": "Update", "arguments": full_args},
+            }
+        ],
+    )
+    flushed = application._flush_one_tool_call(acc)
+    assert flushed, "expected flushed tool"
+    assert flushed[0]["function"]["name"] == "Edit", flushed[0]
+    # finalize path
+    acc2: dict = {}
+    application._ingest_tool_call_deltas(
+        acc2,
+        [
+            {
+                "index": 0,
+                "id": "call_chat2",
+                "function": {"name": "StrReplace", "arguments": full_args},
+            }
+        ],
+    )
+    fin = application._finalize_tool_calls(acc2)
+    assert fin and fin[0]["function"]["name"] == "Edit", fin
+    print("test_update_to_edit_remap_all_paths OK")
+
+
+
+
+def test_soft_disconnect_does_not_drop_body_frames():
+    """False-positive client_gone must not drop mid-stream tool/text frames.
+
+    Historical bug: soft-disconnect probe latched under backpressure, then
+    Responses/Anthropic paths skipped body yields while still mutating streamer
+    state. Terminal arrived without matching function_call/tool_use → Claude
+    Code hard-cut ("stream interrupted").
+    """
+    import asyncio
+    import app as application
+    import openai_responses as oresp
+    import anthropic_compat as anth
+
+    full_args = (
+        '{"file_path":"/tmp/x.py","old_string":"old","new_string":"new"}'
+    )
+
+    # OpenAI chat: even if client_gone would have been true, merge+flush still
+    # produces Edit tool items (frame emission is now ungated at call sites).
+    application._allowed_tool_names_ctx.set({"Edit", "Read", "Write", "Bash"})
+    acc = {}
+    application._ingest_tool_call_deltas(
+        acc,
+        [
+            {
+                "index": 0,
+                "id": "call_sd1",
+                "function": {"name": "Update", "arguments": full_args},
+            }
+        ],
+    )
+    flushed = application._flush_one_tool_call(acc)
+    assert flushed and flushed[0]["function"]["name"] == "Edit"
+
+    # Responses streamer: mid frames exist and complete still has tools.
+    s = oresp.ResponsesLiveStreamer(
+        response_id="resp_sd",
+        model="g",
+        allowed_tool_names={"Edit"},
+    )
+    s.start()
+    mid = s.on_tool_delta(
+        [
+            {
+                "index": 0,
+                "id": "call_sd2",
+                "function": {"name": "Update", "arguments": full_args},
+            }
+        ]
+    )
+    assert mid, "mid tool frames must exist before complete"
+    assert s.has_client_payload()
+    done = s.complete(usage={"prompt_tokens": 1, "completion_tokens": 1})
+    names = _collect_function_names(mid + done)
+    assert names and all(n == "Edit" for n in names), names
+
+    # Anthropic serial helper must yield even when client_gone=True.
+    async def _run():
+        events = [
+            'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"Edit","input":{}}}\n\n',
+            'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+        ]
+        out = []
+        async for ev in application._yield_anthropic_events_serial(
+            events, client_gone=True, protocol="anthropic"
+        ):
+            out.append(ev)
+        return out
+
+    out = asyncio.run(_run())
+    assert len(out) == 2, out
+    print("test_soft_disconnect_does_not_drop_body_frames OK")
+
+
+
+def test_codex_reasoning_not_leaked_as_output_text():
+    """Codex must not see model monologue as assistant output_text.
+
+    v1.9.73 streamed reasoning via streamer.on_text_delta(reasoning) for
+    openai-native clients. That made short turns (hello) print the full
+    thinking chain in the Codex UI. Reasoning stays internal.
+    """
+    import re
+    from pathlib import Path
+
+    app_src = Path("/app/app.py")
+    if not app_src.exists():
+        app_src = Path(__file__).resolve().parent.parent / "app.py"
+    src = app_src.read_text(encoding="utf-8")
+    assert "reasoning_as_text" not in src, "reasoning_as_text path must be removed"
+    # Mid-stream must not call on_text_delta(reasoning)
+    assert not re.search(r"on_text_delta\(\s*reasoning\s*\)", src), src
+    assert not re.search(r"on_text_delta\(\s*joined_reasoning\s*\)", src), src
+    # Keepalive on reasoning still present (held TTFT diagnostic)
+    assert 'kind="reasoning"' in src and "held=True" in src
+    print("test_codex_reasoning_not_leaked_as_output_text OK")
+
+def _collect_function_names(frames):
+    import json
+
+    names = []
+    for f in frames or []:
+        for line in str(f).splitlines():
+            if not line.startswith("data:"):
+                continue
+            raw = line[5:].strip()
+            if not raw or raw == "[DONE]":
+                continue
+            try:
+                p = json.loads(raw)
+            except Exception:
+                continue
+            item = p.get("item") or {}
+            if isinstance(item, dict) and item.get("name"):
+                names.append(item["name"])
+            if p.get("type") == "response.completed":
+                for it in (p.get("response") or {}).get("output") or []:
+                    if isinstance(it, dict) and it.get("type") == "function_call" and it.get("name"):
+                        names.append(it["name"])
+    return names
+
+
+def _collect_anthropic_tool_names(frames):
+    import json
+
+    names = []
+    for f in frames or []:
+        for line in str(f).splitlines():
+            if not line.startswith("data:"):
+                continue
+            raw = line[5:].strip()
+            if not raw or raw == "[DONE]":
+                continue
+            try:
+                p = json.loads(raw)
+            except Exception:
+                continue
+            if p.get("type") == "content_block_start":
+                cb = p.get("content_block") or {}
+                if cb.get("type") == "tool_use" and cb.get("name"):
+                    names.append(cb["name"])
+    return names
 
 
 if __name__ == "__main__":

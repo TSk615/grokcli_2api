@@ -211,6 +211,15 @@ class YesCaptchaSolver:
             f"(endpoint={self._endpoint})"
         )
 
+    def _is_local_endpoint(self) -> bool:
+        ep = (getattr(self, "_endpoint", None) or getattr(self, "endpoint", None) or "").strip().lower()
+        return (
+            "127.0.0.1" in ep
+            or "localhost" in ep
+            or ep.endswith(":5072")
+            or "/5072" in ep
+        )
+
     def solve_turnstile(
         self,
         website_url: str,
@@ -224,7 +233,7 @@ class YesCaptchaSolver:
         Args:
             website_url: The page URL where Turnstile is embedded
             website_key: The Turnstile sitekey (format: 0x4...)
-            premium: Prefer TurnstileTaskProxylessM1 first
+            premium: Prefer TurnstileTaskProxylessM1 first (remote YesCaptcha only)
             fallback_non_premium: if premium fails/timeouts, retry standard type
 
         Returns:
@@ -235,14 +244,21 @@ class YesCaptchaSolver:
         if not website_url or not website_key:
             raise ValueError("website_url and website_key are required for Turnstile")
 
+        # Inline local Camoufox only implements Proxyless. Skip M1 there so we
+        # don't burn createTask on ERROR_TASK_NOT_SUPPORTED, and so the final
+        # aggregated error no longer looks like "YesCaptcha create… M1".
+        local = self._is_local_endpoint()
+        use_premium = bool(premium) and not local
+
         task_types: list[str] = []
-        if premium:
+        if use_premium:
             task_types.append("TurnstileTaskProxylessM1")
             if fallback_non_premium:
                 task_types.append("TurnstileTaskProxyless")
         else:
             task_types.append("TurnstileTaskProxyless")
-            if fallback_non_premium:
+            # Remote only: optional M1 secondary when caller did not request premium-first.
+            if fallback_non_premium and not local:
                 task_types.append("TurnstileTaskProxylessM1")
 
         errors: list[str] = []

@@ -2156,10 +2156,12 @@ def _run_registration(
             # Local inline solver is single-process and browser-backed; concurrent
             # createTask storms from many registration workers cause timeouts /
             # mixed results. Serialize local solves while keeping YesCaptcha parallel.
+            # Local Camoufox has no premium tier — force Proxyless only.
+            use_premium = bool(premium) and provider != "local"
             kwargs = {
                 "website_url": url,
                 "website_key": sitekey,
-                "premium": bool(premium),
+                "premium": use_premium,
                 "fallback_non_premium": True,
             }
             if provider == "local":
@@ -2169,7 +2171,8 @@ def _run_registration(
             return solver.solve_turnstile(**kwargs)
 
         try:
-            turnstile = _solve_turnstile(website_url, premium=True)
+            # Local: Proxyless only. Remote YesCaptcha: premium M1 first.
+            turnstile = _solve_turnstile(website_url, premium=(provider != "local"))
         except _RegCancelled:
             raise
         except Exception as captcha_err:
@@ -2256,11 +2259,8 @@ def _run_registration(
                     f"create_account hard error ({signup_err}); refreshing Turnstile+email code",
                 )
                 try:
-                    turnstile = solver.solve_turnstile(
-                        website_url=website_url,
-                        website_key=sitekey,
-                        premium=True,
-                        fallback_non_premium=True,
+                    turnstile = _solve_turnstile(
+                        website_url, premium=(provider != "local")
                     )
                 except Exception as captcha_err:  # noqa: BLE001
                     print(f"[grok-build-auth] turnstile refresh failed: {captcha_err}")
@@ -2436,11 +2436,8 @@ def _run_registration(
                 time.sleep(2.0)
                 signin_url = "https://accounts.x.ai/sign-in?redirect=grok-com"
                 try:
-                    signin_turnstile = solver.solve_turnstile(
-                        website_url=signin_url,
-                        website_key=sitekey,
-                        premium=True,
-                        fallback_non_premium=True,
+                    signin_turnstile = _solve_turnstile(
+                        signin_url, premium=(provider != "local")
                     )
                 except Exception:
                     signin_turnstile = turnstile
@@ -2454,12 +2451,7 @@ def _run_registration(
                 # One more captcha + login if first CreateSession returned empty.
                 if not sso:
                     try:
-                        signin_turnstile = solver.solve_turnstile(
-                            website_url=signin_url,
-                            website_key=sitekey,
-                            premium=False,
-                            fallback_non_premium=True,
-                        )
+                        signin_turnstile = _solve_turnstile(signin_url, premium=False)
                         time.sleep(1.5)
                         sso = client.obtain_session_via_password(
                             email=email,

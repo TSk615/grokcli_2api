@@ -54,11 +54,18 @@ import config as _config
 import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.9.73"
+APP_VERSION = "1.9.76"
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
     "usage_request_ctx", default=None
+)
+
+# Client-registered tool names for this request (Claude Code Edit vs Update, …).
+# Used by the OpenAI chat/completions outbound path to remap Grok's invented
+# Update/StrReplace tool names to what the client actually registered.
+_allowed_tool_names_ctx: ContextVar[set[str] | None] = ContextVar(
+    "allowed_tool_names_ctx", default=None
 )
 
 # Shared upstream HTTP client (per process / worker) — reuse TLS + keepalive.
@@ -2465,16 +2472,16 @@ class _DisconnectProbe:
         raw = hits_needed
         if raw is None:
             try:
-                raw = int(os.getenv("GROK2API_DISCONNECT_HITS", "3") or 3)
+                raw = int(os.getenv("GROK2API_DISCONNECT_HITS", "5") or 5)
             except (TypeError, ValueError):
-                raw = 3
-        self.hits_needed = max(1, min(8, int(raw)))
+                raw = 5
+        self.hits_needed = max(1, min(12, int(raw)))
         span = min_span_sec
         if span is None:
             try:
-                span = float(os.getenv("GROK2API_DISCONNECT_SPAN_SEC", "1.5") or 1.5)
+                span = float(os.getenv("GROK2API_DISCONNECT_SPAN_SEC", "2.5") or 2.5)
             except (TypeError, ValueError):
-                span = 1.5
+                span = 2.5
         self.min_span_sec = max(0.0, min(30.0, float(span)))
         self.hits = 0
         self.first_hit_at: float | None = None
@@ -2929,15 +2936,19 @@ async def _yield_anthropic_events_serial(
     )
     n = len(events)
     for i, ev in enumerate(events):
-        if client_gone:
-            return
+        # Soft-disconnect probes are best-effort and false-positive under
+        # backpressure. Dropping mid-stream content_block/tool_use events while
+        # still advancing assembler state is what makes Claude Code / sub2api
+        # see intermittent hard cuts ("stream interrupted" / open tool_use).
+        # Always ship body events; only a failed write proves the client is gone.
         if (
             gap > 0
             and i > 0
             and '"type": "content_block_start"' in ev
             and "tool_use" in ev
         ):
-            await asyncio.sleep(gap)
+            if not client_gone:
+                await asyncio.sleep(gap)
         yield ev
 
 
@@ -3087,6 +3098,21 @@ def _ingest_tool_call_deltas(
                 )
 
 
+def _outbound_tool_name(name: str | None) -> str:
+    """Remap Update/StrReplace → Edit for Claude Code via OpenAI chat path."""
+    raw = (name or "").strip()
+    if not raw:
+        return raw
+    try:
+        allowed = _allowed_tool_names_ctx.get()
+    except Exception:
+        allowed = None
+    try:
+        return anth.canonical_outbound_tool_name(raw, allowed_names=allowed)
+    except Exception:
+        return raw
+
+
 def _build_outbound_tool_item(
     acc: dict[int, dict[str, Any]], entry: dict[str, Any], *, remaining: str
 ) -> dict[str, Any]:
@@ -3095,9 +3121,25 @@ def _build_outbound_tool_item(
     Always include a stable call id on first emission. sub2api keys Anthropic
     content blocks by tool call id; frames without id can later surface as
     Claude Code "Content block not found".
+
+    Also remaps Grok's invented Update/StrReplace name → Edit (Claude Code)
+    and alias-normalizes arguments (path→file_path, oldString→old_string).
     """
     out_index = _assign_dense_tool_out_index(acc, entry)
-    name = (entry.get("function", {}).get("name") or "").strip()
+    fn = entry.get("function") if isinstance(entry.get("function"), dict) else {}
+    raw_name = (fn.get("name") or "").strip()
+    name = _outbound_tool_name(raw_name)
+    if name and name != raw_name:
+        fn = dict(fn)
+        fn["name"] = name
+        entry["function"] = fn
+    if remaining and str(remaining).strip():
+        try:
+            remaining = anth.normalize_tool_arguments_json(
+                remaining, tool_name=name or raw_name or None
+            )
+        except Exception:
+            pass
     tool_id = (entry.get("id") or "").strip()
     if not tool_id:
         tool_id = f"call_{uuid.uuid4().hex[:24]}"
@@ -3201,7 +3243,11 @@ def _flush_one_tool_call(acc: dict[int, dict[str, Any]]) -> list[dict[str, Any]]
         if entry.get("_emitted"):
             continue
         fn = entry.get("function") or {}
-        name = (fn.get("name") or "").strip()
+        raw_name = (fn.get("name") or "").strip()
+        name = _outbound_tool_name(raw_name)
+        if name and name != raw_name:
+            entry.setdefault("function", {})["name"] = name
+            fn = entry.get("function") or fn
         args = fn.get("arguments") or ""
         args = _coerce_tool_arguments(args, tool_name=name or None)
         entry.setdefault("function", {})["arguments"] = args
@@ -3270,23 +3316,28 @@ def _merge_tool_name(current: str, incoming: str) -> str:
     OpenAI usually sends the full name once. Some proxies re-send the full name
     on later chunks; always-append would produce `web_searchweb_search` and break
     tool dispatch intermittently.
+
+    After merging, remap Update/StrReplace → Edit so the OpenAI chat path never
+    holds Grok's invented edit-tool name for Claude Code via sub2api.
     """
     cur = (current or "").strip()
     name = (incoming or "").strip()
     if not name:
-        return cur
-    if not cur:
-        return name
-    if name == cur:
-        return cur
-    if name.startswith(cur):
+        merged = cur
+    elif not cur:
+        merged = name
+    elif name == cur:
+        merged = cur
+    elif name.startswith(cur):
         # progressive expansion (rare) or full name after prefix
-        return name
-    if cur.startswith(name):
+        merged = name
+    elif cur.startswith(name):
         # ignore shorter re-send / fragment
-        return cur
-    # Different name on same index — prefer the newer complete token
-    return name
+        merged = cur
+    else:
+        # Different name on same index — prefer the newer complete token
+        merged = name
+    return _outbound_tool_name(merged) if merged else merged
 
 
 def _legacy_function_call_to_tool_calls(function_call: Any) -> list[dict[str, Any]] | None:
@@ -3402,7 +3453,7 @@ def _finalize_tool_calls(
             continue
         tool_id = entry.get("id") or f"call_{uuid.uuid4().hex[:24]}"
         args = fn.get("arguments")
-        name = (fn.get("name") or "").strip()
+        name = _outbound_tool_name((fn.get("name") or "").strip())
         if args is None:
             args = ""
         else:
@@ -3895,6 +3946,19 @@ async def chat_completions(
         body["prompt_cache_key"] = pck
         body["_prompt_cache_key"] = pck
         body["_prompt_cache_key_minted"] = bool(pck_minted)
+
+    # Bind client-registered tools so OpenAI chat outbound remaps
+    # Update/StrReplace → Edit for Claude Code via sub2api.
+    try:
+        _allowed_tool_names_ctx.set(
+            anth.extract_tool_names(body.get("tools") if isinstance(body, dict) else None)
+            or set()
+        )
+    except Exception:
+        try:
+            _allowed_tool_names_ctx.set(set())
+        except Exception:
+            pass
 
     _note_request_metrics(prefer_account=prefer_account, conv_fp=conv_fp)
 
@@ -4494,8 +4558,10 @@ async def _stream_proxy_with_failover_inner(
                                     )
 
                         if emit_content or emit_reasoning or emit_tool_calls:
-                            if client_gone:
-                                continue
+                            # Always ship body frames even on soft-disconnect
+                            # probes. Skipping here drops tool_calls/text while
+                            # upstream continues, so terminal arrives without the
+                            # matching mid-stream items (Claude Code hard cut).
                             # Only after we know we will yield: bind success and
                             # lock failover. Premature stream_started + client_gone
                             # used to block silent account failover on empty turns.
@@ -5377,6 +5443,7 @@ async def anthropic_messages(
                 tool_calls=tool_calls,
                 model=model,
                 message_id=message_id,
+                allowed_tool_names=anth.extract_tool_names(body.get("tools")),
             )
             # Normalize Anthropic usage (input/output + cache details) for the ledger.
             au = result.get("usage") if isinstance(result, dict) else None
@@ -5888,6 +5955,9 @@ async def openai_responses(
                         created_at=created_at,
                         previous_response_id=str(prev_id) if prev_id else None,
                         metadata=metadata,
+                        allowed_tool_names=anth.extract_tool_names(
+                            body.get("tools")
+                        ),
                     )
                     content_parts: list[str] = []
                     reasoning_parts: list[str] = []
@@ -6086,72 +6156,28 @@ async def openai_responses(
                                             timing.mark_first_token(kind="content")
                                             # on_text_delta already opens envelope.
                                             stream_started = True
-                                            if not client_gone:
-                                                for frame in text_frames:
-                                                    yield frame
+                                            for frame in text_frames:
+                                                yield frame
                                     if reasoning:
-                                        # Keep reasoning internal for Claude/sub2api
-                                        # (content_block races). Codex / OpenAI-native
-                                        # clients have no such race — stream reasoning
-                                        # as visible text ASAP so long thinking turns
-                                        # do not sit on keepalive-only for many seconds.
+                                        # Keep reasoning INTERNAL for every client.
+                                        # v1.9.73 streamed reasoning as output_text for
+                                        # Codex "accelerate" — that leaked model
+                                        # monologues ("The user is just saying hello…")
+                                        # into the visible assistant message. Codex
+                                        # already gets keepalives + early envelope for
+                                        # TTFT; thinking belongs in x_grok2api_reasoning
+                                        # / usage only, never response.output_text.
                                         reasoning_parts.append(reasoning)
-                                        native_client = False
-                                        try:
-                                            native_client = (
-                                                history_compact.is_openai_native_client(
-                                                    (
-                                                        (_resp_usage_ctx or {}).get(
-                                                            "user_agent"
-                                                        )
-                                                        if isinstance(
-                                                            _resp_usage_ctx, dict
-                                                        )
-                                                        else None
-                                                    )
-                                                )
-                                            )
-                                        except Exception:
-                                            native_client = False
-                                        streamed_reasoning = False
                                         if (
-                                            native_client
-                                            and not client_gone
-                                            and not streamer.any_shipable_tool(
-                                                terminal=False
-                                            )
-                                            and (reasoning or "").strip()
+                                            timing is not None
+                                            and timing.t_first_token is None
                                         ):
-                                            text_frames = streamer.on_text_delta(
-                                                reasoning
+                                            timing.mark_held()
+                                            timing.mark_first_token(
+                                                kind="reasoning", held=True
                                             )
-                                            if text_frames:
-                                                streamed_reasoning = True
-                                                saw_model_output = True
-                                                stream_started = True
-                                                _note_success_once()
-                                                if (
-                                                    timing is not None
-                                                    and timing.t_first_token is None
-                                                ):
-                                                    timing.mark_first_token(
-                                                        kind="reasoning_as_text"
-                                                    )
-                                                for frame in text_frames:
-                                                    yield frame
-                                        if not streamed_reasoning:
-                                            if (
-                                                timing is not None
-                                                and timing.t_first_token is None
-                                            ):
-                                                # Count upstream reasoning as first token for
-                                                # diagnostics even though body is held.
-                                                timing.mark_held()
-                                                timing.mark_first_token(
-                                                    kind="reasoning", held=True
-                                                )
-                                            if not client_gone:
-                                                yield _sse_keepalive()
+                                        if not client_gone:
+                                            yield _sse_keepalive()
                                     if tool_calls:
                                         _merge_tool_call_delta(
                                             tool_acc, tool_calls
@@ -6167,9 +6193,8 @@ async def openai_responses(
                                             _note_success_once()
                                             timing.mark_first_token(kind="tool")
                                             stream_started = True
-                                            if not client_gone:
-                                                for frame in tool_frames:
-                                                    yield frame
+                                            for frame in tool_frames:
+                                                yield frame
                                         else:
                                             if timing is not None:
                                                 timing.mark_held()
@@ -6263,23 +6288,10 @@ async def openai_responses(
                                         if isinstance(tc, dict)
                                     )
                                 )
-                            if (
-                                not streamer.has_client_payload()
-                                and not (joined_content or "").strip()
-                                and (joined_reasoning or "").strip()
-                                and not can_ship_tools
-                            ):
-                                text_frames = streamer.on_text_delta(joined_reasoning)
-                                if text_frames:
-                                    saw_model_output = True
-                                    stream_started = True
-                                    _note_success_once()
-                                    if timing is not None and timing.t_first_token is None:
-                                        timing.mark_first_token(
-                                            kind="reasoning_as_text", held=True
-                                        )
-                                    for frame in text_frames:
-                                        yield frame
+                            # Do NOT dump joined_reasoning into output_text as a
+                            # last-ditch body. That is how Codex users see the full
+                            # thinking chain on short turns (hello / ack). Prefer
+                            # empty_complete → response.failed / failover instead.
 
                             # Empty HTTP 200 / incomplete tool preview only:
                             # no client-visible text or completed tool frames.
@@ -6362,24 +6374,10 @@ async def openai_responses(
                                 reasoning=joined_reasoning,
                                 force_flush_partial_tools=True,
                             )
-                            if not complete_frames and not streamer.has_client_payload():
-                                # Last chance: promote reasoning if complete() still
-                                # empty (e.g. incomplete tools blocked shipable check
-                                # earlier but reasoning arrived late).
-                                if (joined_reasoning or "").strip() and not any(
-                                    str(p or "") for p in streamer._text_parts
-                                ):
-                                    text_frames = streamer.on_text_delta(
-                                        joined_reasoning
-                                    )
-                                    if text_frames:
-                                        for frame in text_frames:
-                                            yield frame
-                                        complete_frames = streamer.complete(
-                                            usage=ledger_usage,
-                                            reasoning="",
-                                            force_flush_partial_tools=True,
-                                        )
+                            # Never promote joined_reasoning into output_text —
+                            # that is the Codex "thinking chain as answer" leak on
+                            # short turns (hello / ack). Empty body falls through to
+                            # empty_complete → response.failed / failover below.
                             if not complete_frames and not streamer.has_client_payload():
                                 empty_err = (
                                     "Upstream returned HTTP 200 with empty model output "
@@ -6633,6 +6631,7 @@ async def openai_responses(
         created_at=created_at,
         previous_response_id=str(prev_id) if prev_id else None,
         metadata=metadata,
+        allowed_tool_names=anth.extract_tool_names(body.get("tools")),
     )
     result["x_grok2api_account"] = creds.email or creds.auth_key
     _attach_cache_debug_fields(
@@ -6729,6 +6728,7 @@ async def _stream_anthropic_with_failover_inner(
         return prompt_est
 
     tools_requested = _body_requests_tools(body)
+    allowed_tool_names = anth.extract_tool_names(body.get("tools"))
     if timing is not None:
         timing.mark_tools_requested(tools_requested)
     upstream_body = _body_for_upstream(body)
@@ -6739,6 +6739,7 @@ async def _stream_anthropic_with_failover_inner(
             model=model,
             tools_requested=tools_requested,
             max_tools=history_compact.resolve_outbound_max_tools("anthropic"),
+            allowed_tool_names=allowed_tool_names,
         )
         finished = False
         stream_started = False
@@ -6925,7 +6926,7 @@ async def _stream_anthropic_with_failover_inner(
                                 _note_success_once()
                                 if not stream_started:
                                     open_frames = _open_anthropic_stream()
-                                    if open_frames and not client_gone:
+                                    if open_frames:
                                         for ev in open_frames:
                                             yield ev
                                 async for ev in _yield_anthropic_events_serial(

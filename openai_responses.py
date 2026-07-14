@@ -760,6 +760,7 @@ def build_responses_object(
     created_at: int | None = None,
     previous_response_id: str | None = None,
     metadata: dict[str, Any] | None = None,
+    allowed_tool_names: set[str] | list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Assemble a non-stream Responses object from chat completion pieces."""
     output: list[dict[str, Any]] = []
@@ -788,9 +789,23 @@ def build_responses_object(
         name = (fn.get("name") or tc.get("name") or "").strip()
         if not name:
             continue
+        try:
+            import anthropic_compat as anth
+
+            name = anth.canonical_outbound_tool_name(
+                name, allowed_names=allowed_tool_names
+            )
+        except Exception:
+            pass
         args = fn.get("arguments") if fn else tc.get("arguments")
         if not isinstance(args, str):
             args = _stringify(args) if args is not None else "{}"
+        try:
+            import anthropic_compat as anth
+
+            args = anth.normalize_tool_arguments_json(args, tool_name=name)
+        except Exception:
+            pass
         call_id = (tc.get("id") or tc.get("call_id") or "").strip()
         if not call_id:
             call_id = f"call_{uuid.uuid4().hex[:24]}"
@@ -874,6 +889,7 @@ def iter_responses_sse_from_completion(
     previous_response_id: str | None = None,
     metadata: dict[str, Any] | None = None,
     chunk_chars: int = 48,
+    allowed_tool_names: set[str] | list[str] | tuple[str, ...] | None = None,
 ) -> list[str]:
     """Build a complete Responses SSE sequence from a finished chat completion.
 
@@ -994,9 +1010,23 @@ def iter_responses_sse_from_completion(
         name = (fn.get("name") or tc.get("name") or "").strip()
         if not name:
             continue
+        try:
+            import anthropic_compat as anth
+
+            name = anth.canonical_outbound_tool_name(
+                name, allowed_names=allowed_tool_names
+            )
+        except Exception:
+            pass
         args = fn.get("arguments") if fn else tc.get("arguments")
         if not isinstance(args, str):
             args = _stringify(args) if args is not None else "{}"
+        try:
+            import anthropic_compat as anth
+
+            args = anth.normalize_tool_arguments_json(args, tool_name=name)
+        except Exception:
+            pass
         call_id = (tc.get("id") or tc.get("call_id") or "").strip()
         if not call_id:
             call_id = f"call_{uuid.uuid4().hex[:24]}"
@@ -1062,6 +1092,7 @@ def iter_responses_sse_from_completion(
         created_at=created,
         previous_response_id=previous_response_id,
         metadata=metadata,
+        allowed_tool_names=allowed_tool_names,
     )
     emit(
         "response.completed",
@@ -1161,12 +1192,16 @@ class ResponsesLiveStreamer:
         created_at: int | None = None,
         previous_response_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        allowed_tool_names: set[str] | list[str] | tuple[str, ...] | None = None,
     ) -> None:
         self.response_id = response_id
         self.model = model
         self.created_at = int(created_at or time.time())
         self.previous_response_id = previous_response_id
         self.metadata = metadata if isinstance(metadata, dict) else None
+        # Client-registered tool names (Claude Code Edit, …). Used to remap
+        # model-invented Update/StrReplace → Edit before emission.
+        self._allowed_tool_names: set[str] = set(allowed_tool_names or ())
         self._seq = _Seq(0)
         self._started = False
         self._text_open = False
@@ -1371,17 +1406,28 @@ class ResponsesLiveStreamer:
         cur = (current or "").strip()
         inc = (incoming or "").strip()
         if not inc:
-            return cur
-        if not cur:
-            return inc
+            merged = cur
+        elif not cur:
+            merged = inc
         # True suffix fragment.
-        if inc.startswith(cur):
-            return inc
-        if cur.endswith(inc):
-            return cur
-        if inc in cur:
-            return cur
-        return cur + inc
+        elif inc.startswith(cur):
+            merged = inc
+        elif cur.endswith(inc):
+            merged = cur
+        elif inc in cur:
+            merged = cur
+        else:
+            # Divergent full names (Update vs Edit) — prefer the longer / later one
+            # then canonicalize below.
+            merged = inc if len(inc) >= len(cur) else cur
+        try:
+            import anthropic_compat as anth
+
+            return anth.canonical_outbound_tool_name(
+                merged, allowed_names=self._allowed_tool_names
+            )
+        except Exception:
+            return merged
 
     def _merge_tool_args(
         self, current: str, incoming: str, *, tool_name: str | None = None
@@ -1465,6 +1511,16 @@ class ResponsesLiveStreamer:
                 if slot.get("call_id") or str(args).strip():
                     break
                 continue
+            # Remap Update/StrReplace → Edit (Claude Code registered name).
+            try:
+                import anthropic_compat as anth
+
+                name = anth.canonical_outbound_tool_name(
+                    name, allowed_names=self._allowed_tool_names
+                )
+                slot["name"] = name
+            except Exception:
+                pass
             # Normalize aliases before readiness/emission so Update/Edit keys
             # match Claude Code schema even if the model used path/oldString.
             try:
@@ -1741,6 +1797,26 @@ class ResponsesLiveStreamer:
                 continue
             if not name:
                 continue
+            # Remap Update/StrReplace → Edit on the terminal path too.
+            # _emit_ready_tools already remaps, but this fallback used to ship
+            # the raw model name when args only became complete at stream end.
+            try:
+                import anthropic_compat as anth
+
+                name = anth.canonical_outbound_tool_name(
+                    name, allowed_names=self._allowed_tool_names
+                )
+                slot["name"] = name
+            except Exception:
+                pass
+            try:
+                import anthropic_compat as anth
+
+                if isinstance(args, str) and args.strip():
+                    args = anth.normalize_tool_arguments_json(args, tool_name=name)
+                    slot["arguments"] = args
+            except Exception:
+                pass
             term_args = self._terminal_args(
                 args if isinstance(args, str) else str(args), tool_name=name
             )

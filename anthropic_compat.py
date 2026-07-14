@@ -783,6 +783,11 @@ _TOOL_ARG_KEY_ALIASES: dict[str, str] = {
     "newstr": "new_string",
     "newtext": "new_string",
     "new": "new_string",
+    # Write: models often invent "contents" while Claude Code requires "content".
+    "contents": "content",
+    "filecontent": "content",
+    "file_content": "content",
+    "filecontents": "content",
     "notebookpath": "notebook_path",
     "notebook": "notebook_path",
     "cmd": "command",
@@ -796,15 +801,125 @@ _TOOL_ARG_KEY_ALIASES: dict[str, str] = {
     "glob_pattern": "pattern",
 }
 
+# Grok / OpenAI-style agents often emit Update / StrReplace while Claude Code
+# only registers Edit. Emitting the invented name makes sub2api → Claude Code
+# reject the tool ("unknown tool") and the edit never applies — looks like
+# "Update still broken". Remap known edit aliases to Edit on the way out.
+# NEVER include TaskUpdate / TodoWrite here (different tools).
+_EDIT_TOOL_NAME_ALIASES: frozenset[str] = frozenset(
+    {
+        "update",
+        "strreplace",
+        "str_replace",
+        "stringreplace",
+        "string_replace",
+        "fileedit",
+        "file_edit",
+        "replace",
+        "strreplaceeditor",
+        "str_replace_editor",
+        "strreplacebasededittool",
+        "str_replace_based_edit_tool",
+    }
+)
+
+# Agent/task tools that share a suffix with filesystem tools — never remap.
+_PROTECTED_TOOL_NAME_KEYS: frozenset[str] = frozenset(
+    {
+        "taskupdate",
+        "taskcreate",
+        "taskget",
+        "tasklist",
+        "taskoutput",
+        "taskstop",
+        "todowrite",
+        "todoread",
+    }
+)
+
 
 def _tool_name_key(name: str | None) -> str:
     return re.sub(r"[^a-z0-9_]+", "", (name or "").strip().lower())
+
+
+def canonical_outbound_tool_name(
+    name: str | None,
+    *,
+    allowed_names: set[str] | list[str] | tuple[str, ...] | None = None,
+) -> str:
+    """Map model-invented edit tool names to Claude Code's registered name.
+
+    Claude Code → sub2api → grokcli-2api registers ``Edit``. Upstream Grok often
+    returns ``Update`` / ``StrReplace`` with the same args. Shipping that name
+    makes Claude Code reject the tool_use (unknown tool) even when JSON is valid.
+
+    Rules:
+    - TaskUpdate / TodoWrite / etc. never remapped
+    - If ``allowed_names`` contains an exact/case match for the raw name, keep it
+    - Else if name is an edit alias and ``Edit`` (any case) is allowed → that Edit
+    - Else if name is an edit alias and no allow-list → ``Edit``
+    - Otherwise keep the original name
+    """
+    raw = (name or "").strip()
+    if not raw:
+        return raw
+    key = _tool_name_key(raw)
+    if not key or key in _PROTECTED_TOOL_NAME_KEYS:
+        return raw
+
+    allowed_list = [str(x).strip() for x in (allowed_names or []) if str(x).strip()]
+    allowed_by_key: dict[str, str] = {}
+    for a in allowed_list:
+        ak = _tool_name_key(a)
+        if ak and ak not in allowed_by_key:
+            allowed_by_key[ak] = a
+
+    # Prefer exact registered spelling when the model already used a known tool.
+    if key in allowed_by_key:
+        return allowed_by_key[key]
+
+    if key in _EDIT_TOOL_NAME_ALIASES or key == "update":
+        if "edit" in allowed_by_key:
+            return allowed_by_key["edit"]
+        # No allow-list (or Edit not advertised): still normalize for Claude Code.
+        if not allowed_by_key or any(
+            k in allowed_by_key for k in ("edit", "update", "strreplace", "str_replace")
+        ):
+            # If only Update was advertised, keep the advertised spelling.
+            for alt in ("update", "strreplace", "str_replace", "stringreplace"):
+                if alt in allowed_by_key:
+                    return allowed_by_key[alt]
+            return "Edit"
+        return "Edit"
+
+    return raw
+
+
+def extract_tool_names(tools: Any) -> set[str]:
+    """Collect tool names from OpenAI / Anthropic / Responses tool lists."""
+    names: set[str] = set()
+    if not isinstance(tools, list):
+        return names
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        n = t.get("name")
+        if isinstance(n, str) and n.strip():
+            names.add(n.strip())
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else None
+        if fn and isinstance(fn.get("name"), str) and fn["name"].strip():
+            names.add(fn["name"].strip())
+    return names
 
 
 def _required_keys_for_tool(name: str | None) -> tuple[str, ...]:
     key = _tool_name_key(name)
     if not key:
         return ()
+    # Readiness for Update/StrReplace uses the same keys as Edit.
+    if key in _EDIT_TOOL_NAME_ALIASES:
+        key = "edit"
     if key in _TOOL_REQUIRED_KEYS:
         return _TOOL_REQUIRED_KEYS[key]
     # Suffix match ONLY on token boundaries (underscore / mcp double-underscore).
@@ -961,6 +1076,8 @@ def _parse_tool_arguments(raw: Any) -> dict[str, Any]:
 
 def openai_tool_calls_to_content_blocks(
     tool_calls: list[Any] | None,
+    *,
+    allowed_tool_names: set[str] | list[str] | tuple[str, ...] | None = None,
 ) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = []
     if not tool_calls:
@@ -970,9 +1087,15 @@ def openai_tool_calls_to_content_blocks(
             continue
         fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
         name = (fn or {}).get("name") or tc.get("name") or ""
+        name = canonical_outbound_tool_name(
+            str(name or ""), allowed_names=allowed_tool_names
+        )
         args_raw = (fn or {}).get("arguments")
         if args_raw is None:
             args_raw = tc.get("arguments") or tc.get("input")
+        # Normalize arg aliases with tool context (contents→content for Write).
+        if isinstance(args_raw, str):
+            args_raw = normalize_tool_arguments_json(args_raw, tool_name=name)
         blocks.append(
             {
                 "type": "tool_use",
@@ -1027,6 +1150,7 @@ def openai_completion_to_anthropic(
     tool_calls: list[Any] | None = None,
     model: str,
     message_id: str | None = None,
+    allowed_tool_names: set[str] | list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Map collected OpenAI-style completion fields to Anthropic message."""
     blocks: list[dict[str, Any]] = []
@@ -1034,7 +1158,9 @@ def openai_completion_to_anthropic(
         blocks.append({"type": "thinking", "thinking": reasoning})
     if content:
         blocks.append({"type": "text", "text": content})
-    tool_blocks = openai_tool_calls_to_content_blocks(tool_calls)
+    tool_blocks = openai_tool_calls_to_content_blocks(
+        tool_calls, allowed_tool_names=allowed_tool_names
+    )
     blocks.extend(tool_blocks)
 
     if not blocks:
@@ -1483,6 +1609,7 @@ class AnthropicStreamAssembler:
         model: str,
         tools_requested: bool = False,
         max_tools: int | None = None,
+        allowed_tool_names: set[str] | list[str] | tuple[str, ...] | None = None,
     ) -> None:
         self.message_id = message_id
         self.model = model
@@ -1495,6 +1622,9 @@ class AnthropicStreamAssembler:
         self._saw_tool = False  # True once a tool_use block is started outbound
         self._tools_pending = False  # upstream tool deltas seen, may be incomplete
         self._tools_requested = bool(tools_requested)
+        # Client-registered tool names (Claude Code Edit, …). Used to remap
+        # model-invented Update/StrReplace → Edit on outbound emission.
+        self._allowed_tool_names: set[str] = set(allowed_tool_names or ())
         # Held (content, reasoning) pairs while waiting to learn if tools win.
         self._held_pre_tool: list[tuple[str | None, str | None]] = []
         self._output_chars = 0
@@ -1772,6 +1902,13 @@ class AnthropicStreamAssembler:
                     state["name"] = self._merge_name(
                         state.get("name") or "", str(raw["name"])
                     )
+                # Remap Update/StrReplace → Edit (Claude Code) as soon as we know
+                # the name, so readiness + outbound use the registered tool.
+                if state.get("name"):
+                    state["name"] = canonical_outbound_tool_name(
+                        state.get("name") or "",
+                        allowed_names=self._allowed_tool_names,
+                    )
 
                 args_piece = None
                 _tn = state.get("name") or ""
@@ -1949,7 +2086,18 @@ class AnthropicStreamAssembler:
             if state.get("stopped"):
                 continue
             name = (state.get("name") or "").strip()
+            if name:
+                name = canonical_outbound_tool_name(
+                    name, allowed_names=self._allowed_tool_names
+                )
+                state["name"] = name
             args = (state.get("args") or "").strip()
+            if args and name:
+                try:
+                    args = normalize_tool_arguments_json(args, tool_name=name)
+                    state["args"] = args
+                except Exception:
+                    pass
             # Skip pure ghost previews (no name, no args).
             if not state.get("started") and not name and not args:
                 continue

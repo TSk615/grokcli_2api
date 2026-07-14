@@ -2,21 +2,21 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / SSO / JSON 导入导出、协议注册。
 
-**当前版本：v1.9.73** · early SSE · TTFT 明细 · Codex 加速 · 任务终态帧
+**当前版本：v1.9.76** · Update→Edit · 防假断流 · Codex 思考链不泄漏 · early SSE / TTFT
 
 [![GHCR](https://img.shields.io/badge/ghcr.io-hm2899%2Fgrokcli--2api-blue)](https://github.com/users/HM2899/packages/container/package/grokcli-2api)
 [![Release](https://img.shields.io/github/v/release/HM2899/grokcli-2api?display_name=tag)](https://github.com/HM2899/grokcli-2api/releases)
 
 | 镜像（全小写） | 说明 |
 |----------------|------|
-| `ghcr.io/hm2899/grokcli-2api:1.9.73` | 当前版本 |
+| `ghcr.io/hm2899/grokcli-2api:1.9.76` | 当前版本 |
 | `ghcr.io/hm2899/grokcli-2api:latest` | 最近 `v*` tag |
 | `ghcr.io/hm2899/grokcli-2api:edge` | `main` 最新 |
 
 - **独立运行**：不依赖本地 Grok CLI / 浏览器 OAuth
 - **Hybrid 存储（默认强制）**：PostgreSQL 持久 + Redis 热状态 + 多 Worker
 - **协议注册**：内置 `grok-build-auth`（纯 HTTP，无需 Chromium）
-- **中继友好**：兼容 new-api / sub2api / Claude Code / Codex 工具流
+- **中继友好**：兼容 new-api / sub2api / Claude Code / Codex；`Update`/`StrReplace` 自动映射为 Claude Code `Edit`
 - **大账号池**：Token 自动续期、模型健康探测、冷却状态落库
 - **会话粘性**：`prompt_cache_key` / `previous_response_id` 固定同一账号，利于多轮缓存
 - **秒开流 + 可观测**：early SSE 信封；用量明细含 `ttft_ms` / `latency_ms`；任务日志 + 终态帧
@@ -49,6 +49,7 @@
 |------|------|
 | OpenAI 兼容 | `/v1/models` · `/v1/chat/completions` · `/v1/responses` · SSE |
 | Anthropic 兼容 | `/v1/messages` · tools / tool_use · `count_tokens` |
+| Claude Code 工具 | Grok `Update`/`StrReplace` → 客户端 `Edit`；参数别名归一化；残缺编辑不下发 |
 | 管理台 | 账号、Key、协议注册、测活、续期、**任务日志**、用量、设置 |
 | 多账号轮询 | `round_robin` / `least_used` / `random`；可选**出站代理池**（聊天/测活/续期） |
 | 会话粘性 | `prompt_cache_key`（body/header）与 Responses `previous_response_id` 粘同一账号；未传时自动 mint 并回传 |
@@ -59,7 +60,7 @@
 | SSO / JSON | 后台任务 + 实时进度；JSON 支持多文件导入 / 选中导出 |
 | 任务日志 | 注册、SSO、JSON、测活、续期等结果落 PG |
 | 用量统计 | 代理侧 token / 请求：今日·近 N 天·累计；按 Key / 账号 / 模型；**首字 TTFT / 完成耗时** |
-| 流式可靠性 | early SSE 信封；client_gone / 错误路径仍发终态帧（`message_stop` / `response.completed|failed` + `[DONE]`） |
+| 流式可靠性 | early SSE 信封；**假阳性 client_gone 不再丢中间 tool/text 帧**；错误/断开仍发终态帧 |
 | 容器时区 | 默认 `TZ=Asia/Shanghai`（日志与本地时间） |
 
 ---
@@ -140,7 +141,7 @@ ghcr.io/hm2899/grokcli-2api
 **正确示例：**
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.73
+docker pull ghcr.io/hm2899/grokcli-2api:1.9.76
 # 或
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
@@ -179,7 +180,7 @@ services:
       retries: 10
 
   grokcli-2api:
-    image: ghcr.io/hm2899/grokcli-2api:1.9.73
+    image: ghcr.io/hm2899/grokcli-2api:1.9.76
     ports:
       # 只映射应用；不要给 postgres/redis 加 ports
       - "3000:3000"
@@ -403,15 +404,16 @@ docker exec grokcli-2api sh -c 'echo TZ=$TZ; date'
 ```bash
 # 1) app.py 中 APP_VERSION 必须与 git tag 一致（镜像路径全小写）
 # 2) 推 main → edge + 版本号；推 v* tag → 额外 latest + GitHub Release
-git add -A && git commit -m "release: v1.9.73"
+git add -A && git commit -m "release: v1.9.76"
 git push origin main
-git tag -a v1.9.73 -m "v1.9.73"
-git push origin v1.9.73
-gh release create v1.9.73 --title "v1.9.73 early SSE · TTFT · Codex" --notes-file - <<'EOF'
+git tag -a v1.9.76 -m "v1.9.76"
+git push origin v1.9.76
+gh release create v1.9.76 --title "v1.9.76 Update→Edit · 防假断流 · Codex 思考链不泄漏" --notes-file - <<'EOF'
 ## Highlights
-- early SSE 信封 + TTFT / latency 用量明细
-- Codex / Responses 多工具加速与 sticky prompt_cache_key
-- 任务/工具流终态帧，避免 sub2api / Claude Code 卡 running
+- Claude Code：`Update`/`StrReplace` → `Edit`（全路径 + 参数归一化）
+- 假阳性 client_gone 不再丢中间 tool/text 帧；断开探测更严
+- Codex：思考链不再泄漏为 output_text（修 v1.9.73 加速副作用）
+- early SSE / TTFT / 终态帧继承
 EOF
 # 监视构建
 gh run list --workflow=docker-publish.yml --limit 3
@@ -420,7 +422,7 @@ gh run list --workflow=docker-publish.yml --limit 3
 成功后拉取（**必须小写**）：
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.73
+docker pull ghcr.io/hm2899/grokcli-2api:1.9.76
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
 
@@ -464,7 +466,20 @@ docker-compose.yml                    # redis + postgres（内网）+ app
 
 ## 版本
 
-- **v1.9.73**（当前）
+- **v1.9.76**（当前）
+  - **Codex 思考链不泄漏**：停止把 `reasoning` 当 `output_text`（修 v1.9.73 Codex 加速副作用）
+  - 空响应不再用思考链充数；走 empty_complete / failover
+  - 继承 v1.9.75：假断流修复、Update→Edit、本地过盾 Proxyless
+- **v1.9.75**
+  - **假阳性 client_gone 不再丢中间帧**（Responses / chat / Anthropic body 始终下发）
+  - 断开探测更严：`DISCONNECT_HITS` 默认 5、`SPAN` 2.5s
+  - 继承 v1.9.74：Update→Edit 全路径 remap
+- **v1.9.74**
+  - **Claude Code Update→Edit**：Grok 发明的 `Update`/`StrReplace` 出站统一映射为 `Edit`
+  - 参数别名归一化（`path`/`oldString` → `file_path`/`old_string`）；残缺 Update 不下发
+  - OpenAI chat / Responses / Anthropic 全路径 + 终端 force-close 覆盖
+  - 本地 Camoufox 过盾仅 Proxyless（跳过 YesCaptcha M1 误报）
+- **v1.9.73**
   - **用量明细首字/完成时间**：`ttft_ms` + `latency_ms` 落库与管理台展示
   - **Codex 加速**：原生 Responses 多工具/零 gap、大上下文自动压缩、`previous_response_id` sticky 恢复同一 prompt_cache_key
   - **断联加固**：修复 warmup 污染 AsyncClient 导致的 `Event loop is closed`；本地 infra 错误不冷却账号
@@ -546,7 +561,7 @@ docker-compose.yml                    # redis + postgres（内网）+ app
 - **v1.9.45–1.9.38**：YYDS 域名、任务日志、JSON/SSO 进度、内联 hybrid 等
 - 更早变更见 [GitHub Releases](https://github.com/HM2899/grokcli-2api/releases)
 
-> 镜像 tag 与 `app.py` 中 `APP_VERSION` 一致（当前 **1.9.73**）。  
+> 镜像 tag 与 `app.py` 中 `APP_VERSION` 一致（当前 **1.9.76**）。  
 > 拉取路径固定 **`ghcr.io/hm2899/grokcli-2api`**（全小写）。
 
 ## License
