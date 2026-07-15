@@ -2,21 +2,21 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / SSO / JSON 导入导出、协议注册。
 
-**当前版本：v1.9.81** · Update 偶发失效修复 · 注册 SSO 入库 · 系统设置扩展 · sub2api 账号容量
+**当前版本：v1.9.82** · Update both-complete 路径纠偏 · 注册后自动入库 sub2api · SSO 持久化
 
 [![GHCR](https://img.shields.io/badge/ghcr.io-hm2899%2Fgrokcli--2api-blue)](https://github.com/users/HM2899/packages/container/package/grokcli-2api)
 [![Release](https://img.shields.io/github/v/release/HM2899/grokcli-2api?display_name=tag)](https://github.com/HM2899/grokcli-2api/releases)
 
 | 镜像（全小写） | 说明 |
 |----------------|------|
-| `ghcr.io/hm2899/grokcli-2api:1.9.81` | 当前版本 |
+| `ghcr.io/hm2899/grokcli-2api:1.9.82` | 当前版本 |
 | `ghcr.io/hm2899/grokcli-2api:latest` | 最近 `v*` tag |
 | `ghcr.io/hm2899/grokcli-2api:edge` | `main` 最新 |
 
 - **独立运行**：不依赖本地 Grok CLI / 浏览器 OAuth
 - **Hybrid 存储（默认强制）**：PostgreSQL 持久 + Redis 热状态 + 多 Worker
-- **协议注册**：内置 `grok-build-auth`（纯 HTTP，无需 Chromium）；**注册成功后 SSO 写入账号库**
-- **中继友好**：兼容 new-api / sub2api / Claude Code / Codex；`Update`/`StrReplace` → `Edit`；**后到完整参数覆盖错误预览路径**（修偶发 `Error editing file`）
+- **协议注册**：内置 `grok-build-auth`（纯 HTTP，无需 Chromium）；**SSO 入库**；可选 **注册成功后自动推 sub2api**
+- **中继友好**：兼容 new-api / sub2api / Claude Code / Codex；`Update`/`StrReplace` → `Edit`；**后到完整参数覆盖错误路径（含 both-complete）**
 - **大账号池**：Token 自动续期、模型健康探测、冷却状态落库；维护间隔 / 探测模型等可在管理台热改
 - **会话粘性**：`prompt_cache_key` / `previous_response_id` 固定同一账号；TTL 可配置
 - **秒开流 + 可观测**：early SSE 信封；用量明细含 `ttft_ms` / `latency_ms`；任务日志 + 终态帧
@@ -49,7 +49,7 @@
 |------|------|
 | OpenAI 兼容 | `/v1/models` · `/v1/chat/completions` · `/v1/responses` · SSE |
 | Anthropic 兼容 | `/v1/messages` · tools / tool_use · `count_tokens` |
-| Claude Code 工具 | Grok `Update`/`StrReplace` → 客户端 `Edit`；**后到完整参数覆盖错误预览路径**；`target_file` 等别名归一；残缺编辑不下发 |
+| Claude Code 工具 | Grok `Update`/`StrReplace` → 客户端 `Edit`；**后到完整参数覆盖错误路径（含 both-complete）**；`target_file` 等别名归一；残缺编辑不下发 |
 | 注册机 | 批次自愈 + 孤儿回收；全局 inflight；Device Flow 重试；**SSO 入库 + 文件备份**；导出可走账号库；进度卡防连环 toast |
 | 管理台 | 账号、Key、协议注册、测活、续期、任务日志、用量、**系统设置（维护/压缩/探测/sub2api 容量）** |
 | 多账号轮询 | `round_robin` / `least_used` / `random`；可选**出站代理池**（聊天/测活/续期） |
@@ -146,7 +146,7 @@ ghcr.io/hm2899/grokcli-2api
 **正确示例：**
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.81
+docker pull ghcr.io/hm2899/grokcli-2api:1.9.82
 # 或
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
@@ -185,7 +185,7 @@ services:
       retries: 10
 
   grokcli-2api:
-    image: ghcr.io/hm2899/grokcli-2api:1.9.81
+    image: ghcr.io/hm2899/grokcli-2api:1.9.82
     ports:
       # 只映射应用；不要给 postgres/redis 加 ports
       - "3000:3000"
@@ -428,17 +428,15 @@ docker exec grokcli-2api sh -c 'echo TZ=$TZ; date'
 ```bash
 # 1) app.py 中 APP_VERSION 必须与 git tag 一致（镜像路径全小写）
 # 2) 推 main → edge + 版本号；推 v* tag → 额外 latest + GitHub Release
-git add -A && git commit -m "release: v1.9.81"
+git add -A && git commit -m "release: v1.9.82"
 git push origin main
-git tag -a v1.9.81 -m "v1.9.81"
-git push origin v1.9.81
-gh release create v1.9.81 --title "v1.9.81 Update 偶发失效修复 · 注册 SSO 入库 · 设置扩展" --notes-file - <<'EOF'
+git tag -a v1.9.82 -m "v1.9.82"
+git push origin v1.9.82
+gh release create v1.9.82 --title "v1.9.82 Update both-complete 路径纠偏 · 注册自动入库 sub2api" --notes-file - <<'EOF'
 ## Highlights
-- Update 偶发 `Error editing file`：后到完整参数覆盖错误预览路径
-- 注册成功账号写入 SSO（账号库 + data/register_sso 备份）；导出可走账号库
-- 系统设置扩展：维护间隔 / 探测模型 / 粘性 TTL / 历史压缩 / OpenAI 工具上限
-- sub2api 推送：账号容量 concurrency、优先级、rate_multiplier 可配置
-- 注册进度卡：已结束任务刷新不再连环 toast / 假 running
+- Update/Edit both-complete：后到完整 path 覆盖先到错误 file_path（修 Error editing file）
+- 注册成功后可选自动推送 sub2api（auto_push_on_register）
+- 注册 SSO 入库 / 导出走账号库；sub2api 账号容量可配置
 EOF
 # 监视构建
 gh run list --workflow=docker-publish.yml --limit 3
@@ -447,7 +445,7 @@ gh run list --workflow=docker-publish.yml --limit 3
 成功后拉取（**必须小写**）：
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.81
+docker pull ghcr.io/hm2899/grokcli-2api:1.9.82
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
 
@@ -493,7 +491,13 @@ docker-compose.yml                    # redis + postgres（内网）+ app
 
 ## 版本
 
-- **v1.9.81**（当前）
+- **v1.9.82**（当前）
+  - **Update both-complete 路径纠偏（Claude Code → sub2api）**：两边都是完整 Update/Edit 时，**后到完整参数为准**（`path` 可覆盖错误 `file_path`）；不完整后到仍不能覆盖完整先到
+  - doubled JSON / 流式 merge 同步；`normalize` 不同路径值时 **later wins**；同值保留 `file_path` 拼写
+  - OpenAI Responses 本地 merge 镜像同步；回归覆盖 both-complete / doubled both-complete
+  - **注册成功后自动入库 sub2api**（设置项 `auto_push_on_register`）：协议注册导入本地后立刻 `push_account`；失败不拖垮注册
+  - 继承 v1.9.81：注册 SSO 入库与备份、系统设置扩展、sub2api 账号容量、进度卡防连环 toast
+- **v1.9.81**
   - **Update 偶发失效修复（Claude Code → sub2api）**：后到**完整** Update/Edit 参数覆盖先到的错误 `file_path` 预览；完整包不被不完整 path 别名覆盖；`target_file` 等别名归一
   - OpenAI Responses 本地 merge 镜像同步；回归测试覆盖 doubled JSON / 流式 merge 两种顺序
   - **注册账号持久化 SSO**：导入时写入 `sso`/`sso_cookie` + 密码；`data/register_sso/` 文件备份；账号列表显示 SSO 标记
@@ -620,7 +624,7 @@ docker-compose.yml                    # redis + postgres（内网）+ app
 - **v1.9.45–1.9.38**：YYDS 域名、任务日志、JSON/SSO 进度、内联 hybrid 等
 - 更早变更见 [GitHub Releases](https://github.com/HM2899/grokcli-2api/releases)
 
-> 镜像 tag 与 `app.py` 中 `APP_VERSION` 一致（当前 **1.9.81**）。  
+> 镜像 tag 与 `app.py` 中 `APP_VERSION` 一致（当前 **1.9.82**）。  
 > 拉取路径固定 **`ghcr.io/hm2899/grokcli-2api`**（全小写）。
 
 ## License

@@ -614,20 +614,22 @@ def _merge_tool_arg_dicts(
         except (TypeError, ValueError):
             return False
 
-    # Prefer the last complete object as the merge base when earlier ones are
-    # incomplete partials (the intermittent "wrong file_path sticks" path).
+    # Prefer the *latest complete* object as merge base whenever it is not the
+    # first dict. Covers:
+    #   incomplete → complete   (path-only preview then full edit)
+    #   complete   → complete   (wrong early file_path body, later path rewrite)
+    # Leaving base at 0 only when no later complete exists.
     base_idx = 0
-    if tool_name is not None or any(_obj_complete(d) for d in dicts):
-        last_complete = -1
-        for i, d in enumerate(dicts):
-            if _obj_complete(d):
-                last_complete = i
-        if last_complete > 0 and not _obj_complete(dicts[0]):
-            base_idx = last_complete
+    last_complete = -1
+    for i, d in enumerate(dicts):
+        if _obj_complete(d):
+            last_complete = i
+    if last_complete > 0:
+        base_idx = last_complete
 
     if base_idx > 0:
-        # Start from the complete rewrite; fold non-conflicting keys from
-        # earlier partials (e.g. replace_all) and later extras.
+        # Start from the latest complete rewrite; fold non-conflicting keys from
+        # earlier objects (e.g. replace_all) and later incomplete extras.
         base = dict(dicts[base_idx])
         base_canons = {_canonical_tool_arg_key(str(k)) for k in base.keys()}
         for i, d in enumerate(dicts):
@@ -636,7 +638,8 @@ def _merge_tool_arg_dicts(
             for k, v in d.items():
                 canon = _canonical_tool_arg_key(str(k))
                 if i < base_idx and canon in base_canons:
-                    # Earlier partial must not override fields the complete rewrite set.
+                    # Earlier object must not override fields the later complete set
+                    # (especially file_path vs path).
                     continue
                 if k not in base:
                     base[k] = v
@@ -658,8 +661,20 @@ def _merge_tool_arg_dicts(
                     base[k] = v
         return normalize_tool_argument_keys(base)
 
+    # No later complete base: sequential merge. If a later object introduces any
+    # path alias, drop earlier path keys first so stale file_path cannot survive
+    # when values differ across aliases.
     merged: dict[str, Any] = {}
     for d in dicts:
+        if merged and _dict_has_path_tool_arg(d):
+            # Only strip when later actually supplies a non-empty path value.
+            later_path_nonempty = False
+            for k, v in d.items():
+                if _is_path_tool_arg_key(k) and not _tool_arg_value_empty(v):
+                    later_path_nonempty = True
+                    break
+            if later_path_nonempty:
+                merged = _strip_path_tool_args(merged)
         for k, v in d.items():
             if k not in merged:
                 merged[k] = v
@@ -683,7 +698,7 @@ def _merge_tool_arg_dicts(
                 # Prefer later value when both set (correction / expansion).
                 if v not in (None, "", [], {}):
                     merged[k] = v
-    # Apply key alias preference once at the end (canonical beats alias).
+    # Alias collapse: different path values → later wins (see normalize).
     return normalize_tool_argument_keys(merged)
 
 
@@ -1042,6 +1057,19 @@ def _tool_arg_value_empty(value: Any) -> bool:
     return value in (None, "", [], {})
 
 
+def _is_path_tool_arg_key(key: str) -> bool:
+    return _canonical_tool_arg_key(str(key or "")) == "file_path"
+
+
+def _dict_has_path_tool_arg(d: dict[str, Any]) -> bool:
+    return any(_is_path_tool_arg_key(k) for k in d.keys())
+
+
+def _strip_path_tool_args(d: dict[str, Any]) -> dict[str, Any]:
+    """Drop file_path / path / target_file aliases from a raw tool-arg dict."""
+    return {k: v for k, v in d.items() if not _is_path_tool_arg_key(k)}
+
+
 def normalize_tool_argument_keys(obj: Any) -> Any:
     """Rename common alternate tool-arg keys to Claude Code schema names.
 
@@ -1049,15 +1077,17 @@ def normalize_tool_argument_keys(obj: Any) -> Any:
     oldString→old_string.
 
     Preference when several keys collapse to the same canonical name:
-    1. Non-empty value from an **already-canonical** key wins over aliases
-       (``file_path`` beats ``path`` / ``filepath`` / ``file``).
-    2. Non-empty beats empty.
-    3. Otherwise keep the first non-empty (stable).
+    1. Non-empty beats empty.
+    2. If both non-empty and values **equal**, prefer already-canonical key
+       (``file_path`` spelling over ``path``).
+    3. If both non-empty and values **differ**, **later wins** (insertion
+       order). Stream merge must put the authoritative rewrite last so a
+       stale early ``file_path`` cannot beat a later correct ``path``.
 
     Claude Code → sub2api → grokcli-2api often sees both ``path`` (OpenAI /
-    Cursor style) and ``file_path`` (Claude Code Edit/Update schema) in one
-    object after stream merge. First-alias-wins used to make Update/Edit open
-    the wrong file when ``path`` happened to appear before ``file_path``.
+    Cursor style) and ``file_path`` (Claude Code Edit/Update schema) after
+    stream merge. Canonical-always-wins used to keep a wrong early
+    ``file_path`` over a later complete rewrite that only set ``path``.
     """
     if not isinstance(obj, dict):
         return obj
@@ -1077,16 +1107,16 @@ def normalize_tool_argument_keys(obj: Any) -> Any:
             chosen[canon] = (v, from_canon)
             continue
         if new_empty:
-            # Keep prior (possibly empty) unless the new key is canonical and
-            # the prior came from an alias — still prefer non-empty above.
+            # Keep prior non-empty; empty later does not wipe.
             continue
-        # Both non-empty: exact canonical key beats alias (path vs file_path).
-        if from_canon and not old_canon:
-            chosen[canon] = (v, True)
+        # Both non-empty.
+        if old_v == v:
+            # Same value: prefer canonical spelling (file_path over path).
+            if from_canon and not old_canon:
+                chosen[canon] = (v, True)
             continue
-        if old_canon and not from_canon:
-            continue
-        # Same class (both alias or both canonical) — keep first non-empty.
+        # Different values: later occurrence wins (authoritative rewrite).
+        chosen[canon] = (v, from_canon)
     return {k: v for k, (v, _) in chosen.items()}
 
 
@@ -1758,11 +1788,30 @@ def merge_tool_argument_delta(
                         continue
                     if k not in merged:
                         merged[k] = v
+            elif a_complete_obj and b_complete_obj:
+                # BOTH complete: later rewrite is authoritative.
+                # Critical Claude Code → sub2api case:
+                #   cur   = {"file_path":"/wrong","old_string":"a","new_string":"b"}
+                #   piece = {"path":"/correct","old_string":"a","new_string":"c"}
+                # Canonical-first normalize used to keep /wrong. Later complete
+                # must own path + edit body; only fold non-conflicting extras.
+                merged = dict(b)
+                b_canons = {
+                    _canonical_tool_arg_key(str(k)) for k in b.keys()
+                }
+                for k, v in a.items():
+                    canon = _canonical_tool_arg_key(str(k))
+                    if canon in b_canons:
+                        continue
+                    if k not in merged:
+                        merged[k] = v
             else:
-                # Both complete or both incomplete: merge keys, later same-key
-                # wins; cross-alias conflicts resolved by normalize (canonical
-                # beats alias when both non-empty).
+                # Both incomplete: later same-key wins. If later supplies any
+                # path alias, drop earlier path keys so a stale file_path does
+                # not survive normalize against a later path.
                 merged = dict(a)
+                if _dict_has_path_tool_arg(b):
+                    merged = _strip_path_tool_args(merged)
                 for k, v in b.items():
                     if k not in merged:
                         merged[k] = v

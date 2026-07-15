@@ -471,6 +471,7 @@ def _session_task_log_payload(sess: dict[str, Any] | None) -> dict[str, Any]:
             "status": st,
             "error": s.get("error"),
             "imported_account_ids": list(s.get("imported_account_ids") or [])[:20],
+            "sub2api_push": s.get("sub2api_push"),
             "adapter_build": s.get("adapter_build") or ADAPTER_BUILD,
         },
     }
@@ -3035,6 +3036,46 @@ def _run_registration(
             "refresh_token": bool(token.get("refresh_token")),
             "email": email,
         }
+        # Optional: auto-push newly registered accounts into sub2api.
+        # Controlled by settings → sub2api → auto_push_on_register.
+        # Failures are recorded on the session but never fail registration.
+        sub2api_push: dict[str, Any] | None = None
+        if imported_ids:
+            try:
+                update(
+                    "pushing_sub2api",
+                    f"imported {len(imported_ids)} account(s); "
+                    f"checking auto-push to sub2api [{ADAPTER_BUILD}]",
+                    imported_account_ids=imported_ids,
+                    imported_accounts=imported_accounts,
+                )
+                from sub2api_client import maybe_auto_push_registered_accounts
+
+                sub2api_push = maybe_auto_push_registered_accounts(
+                    imported_ids,
+                    source="register-email",
+                )
+                sess["sub2api_push"] = sub2api_push
+                if sub2api_push and not sub2api_push.get("skipped"):
+                    ok_n = int(sub2api_push.get("success") or 0)
+                    fail_n = int(sub2api_push.get("failed") or 0)
+                    update(
+                        "pushing_sub2api",
+                        f"sub2api auto-push done: ok={ok_n} fail={fail_n} "
+                        f"[{ADAPTER_BUILD}]",
+                        imported_account_ids=imported_ids,
+                        imported_accounts=imported_accounts,
+                        sub2api_push=sub2api_push,
+                    )
+            except Exception as e:  # noqa: BLE001
+                sub2api_push = {
+                    "ok": False,
+                    "skipped": False,
+                    "error": str(e),
+                    "total": len(imported_ids),
+                }
+                sess["sub2api_push"] = sub2api_push
+                print(f"[grok-build-auth] WARN: sub2api auto-push failed: {e}")
         # Auto probe newly imported accounts so they are validated in the pool.
         # Release global admission BEFORE the settle sleep so bulk jobs don't
         # hold scarce inflight slots for REGISTER_PROBE_DELAY_SEC after success.

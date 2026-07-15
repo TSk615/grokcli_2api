@@ -417,6 +417,10 @@
       <label class="g2a-check"><input type="checkbox" id="set-sub2api-auto-group" checked /> 分组不存在时自动创建</label>
     </div>
     <div class="g2a-field">
+      <label class="g2a-check"><input type="checkbox" id="set-sub2api-auto-push-register" /> 注册成功后自动入库 sub2api</label>
+      <div class="g2a-muted" style="margin-top:4px">协议注册导入本地后立刻推送到上方分组；需同时启用 sub2api 并填好 URL/登录</div>
+    </div>
+    <div class="g2a-field">
       <label for="set-sub2api-concurrency">推送并发</label>
       <input id="set-sub2api-concurrency" type="number" class="g2a-input" min="1" max="16" step="1" value="4" />
       <div class="g2a-muted" style="margin-top:4px">本地→sub2api 同时推送几个账号；默认 4</div>
@@ -452,6 +456,7 @@
   <pre id="sub2api-test-result" class="g2a-log" style="margin-top:10px;max-height:160px;display:none"></pre>
   <p class="g2a-muted" style="margin:10px 0 0;line-height:1.55" id="sub2api-hint">
     保存后到「账号」页：可「导入 sub2api（选中/全部）」在线推送；或「导出 sub2api 数据」下载官方 <code>sub2api-data</code> 备份，在 sub2api 管理台「导入数据」上传。
+    勾选「注册成功后自动入库 sub2api」后，协议注册导入本地账号会<strong>立刻</strong>推送到上方配置的分组。
   </p>
 </section>
 
@@ -472,6 +477,6 @@
   <script src="/static/dist/api.b6d8a65a8a.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.4835665ff4.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.eaf06d79f0.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.0a1cd78145.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

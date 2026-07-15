@@ -137,8 +137,11 @@ def _local_canonical_tool_arg_key(key: str) -> str:
 def _local_normalize_tool_arg_keys(obj: Any) -> Any:
     """Mirror of anthropic_compat.normalize_tool_argument_keys.
 
-    Canonical keys (``file_path``) beat aliases (``path`` / ``filepath``) so
-    Update/Edit stream merges cannot open the wrong file.
+    Preference when several keys collapse to the same canonical name:
+    1. Non-empty beats empty.
+    2. Equal non-empty values → prefer already-canonical spelling.
+    3. Different non-empty values → **later wins** (stale early file_path must
+       not beat a later complete path rewrite from sub2api / Grok streams).
     """
     if not isinstance(obj, dict):
         return obj
@@ -160,11 +163,13 @@ def _local_normalize_tool_arg_keys(obj: Any) -> Any:
             continue
         if _empty(v):
             continue
-        if from_canon and not old_canon:
-            chosen[canon] = (v, True)
+        # Both non-empty.
+        if old_v == v:
+            if from_canon and not old_canon:
+                chosen[canon] = (v, True)
             continue
-        if old_canon and not from_canon:
-            continue
+        # Different values: later occurrence wins.
+        chosen[canon] = (v, from_canon)
     return {k: v for k, (v, _) in chosen.items()}
 
 
@@ -218,19 +223,25 @@ def _local_merge_tool_arg_dicts(
         except (TypeError, ValueError):
             return False
 
-    # Later complete rewrite wins over earlier incomplete partials — fixes the
-    # intermittent Update path where a wrong early file_path sticks forever.
+    # Later complete rewrite wins over earlier objects — covers incomplete→complete
+    # and complete→complete (wrong early file_path body, later path rewrite).
     base_idx = 0
     last_complete = -1
     for i, d in enumerate(dicts):
         if _obj_complete(d):
             last_complete = i
-    if last_complete > 0 and not _obj_complete(dicts[0]):
+    if last_complete > 0:
         base_idx = last_complete
 
+    def _is_path_key(key: str) -> bool:
+        return _local_canonical_tool_arg_key(str(key or "")) == "file_path"
+
+    def _strip_path_keys(d: dict[str, Any]) -> dict[str, Any]:
+        return {k: v for k, v in d.items() if not _is_path_key(k)}
+
     if base_idx > 0:
-        # Later complete rewrite is the base. Earlier incomplete path-only
-        # previews must not pin a wrong file_path over the complete payload.
+        # Later complete rewrite is the base. Earlier path/body must not pin a
+        # wrong file_path over the complete payload.
         base = dict(dicts[base_idx])
         base_canons = {_local_canonical_tool_arg_key(str(k)) for k in base.keys()}
         for i, d in enumerate(dicts):
@@ -260,9 +271,9 @@ def _local_merge_tool_arg_dicts(
                     base[k] = v
         return _local_normalize_tool_arg_keys(base)
 
-    # No complete-later base: merge in order. If an earlier complete object is
-    # followed by incomplete fragments, do not let incomplete path aliases
-    # overwrite fields already set by the complete object.
+    # No later-complete base: sequential merge. Incomplete later fragments must
+    # not clobber fields from an earlier complete object; non-empty later path
+    # still replaces earlier path keys when values differ across aliases.
     first_complete = -1
     for i, d in enumerate(dicts):
         if _obj_complete(d):
@@ -279,6 +290,15 @@ def _local_merge_tool_arg_dicts(
             } | {
                 _local_canonical_tool_arg_key(str(k)) for k in merged.keys()
             }
+        # If later supplies a non-empty path under any alias, drop earlier path
+        # keys so normalize cannot keep a stale file_path over a later path.
+        later_path_nonempty = any(
+            _is_path_key(k) and v not in (None, "", [], {}) for k, v in d.items()
+        )
+        if later_path_nonempty and (
+            is_complete or first_complete < 0 or i <= first_complete
+        ):
+            merged = _strip_path_keys(merged)
         for k, v in d.items():
             canon = _local_canonical_tool_arg_key(str(k))
             if (

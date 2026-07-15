@@ -5343,6 +5343,9 @@ function fillSub2apiForm(cfg) {
   }
   if ($("set-sub2api-group-name")) $("set-sub2api-group-name").value = cfg.group_name || "";
   if ($("set-sub2api-auto-group")) $("set-sub2api-auto-group").checked = cfg.auto_create_group !== false;
+  if ($("set-sub2api-auto-push-register")) {
+    $("set-sub2api-auto-push-register").checked = !!cfg.auto_push_on_register;
+  }
   if ($("set-sub2api-concurrency")) $("set-sub2api-concurrency").value = cfg.concurrency != null ? cfg.concurrency : 4;
   if ($("set-sub2api-account-concurrency")) {
     const ac = cfg.account_concurrency != null ? cfg.account_concurrency : (cfg.account_capacity != null ? cfg.account_capacity : 3);
@@ -5378,6 +5381,9 @@ function collectSub2apiPatch() {
     email: $("set-sub2api-email") ? ($("set-sub2api-email").value || "").trim() : "",
     group_name: $("set-sub2api-group-name") ? ($("set-sub2api-group-name").value || "").trim() : "",
     auto_create_group: !!( $("set-sub2api-auto-group") && $("set-sub2api-auto-group").checked ),
+    auto_push_on_register: !!(
+      $("set-sub2api-auto-push-register") && $("set-sub2api-auto-push-register").checked
+    ),
     notes_prefix: $("set-sub2api-notes") ? (($("set-sub2api-notes").value || "").trim() || "grokcli-2api") : "grokcli-2api",
   };
   const gid = $("set-sub2api-group-id") ? ($("set-sub2api-group-id").value || "").trim() : "";

@@ -40,6 +40,9 @@ def _default_config() -> dict[str, Any]:
         "group_id": None,
         "group_name": "",
         "auto_create_group": True,
+        # After protocol registration succeeds and the account is imported
+        # locally, automatically push it into sub2api (requires enabled + URL).
+        "auto_push_on_register": False,
         # How many accounts to push in parallel (local → sub2api)
         "concurrency": 4,
         # Per-account capacity written into sub2api account.concurrency
@@ -77,6 +80,13 @@ def _normalize_config(raw: Any, *, include_secrets: bool = True) -> dict[str, An
             out["group_id"] = None
     out["group_name"] = str(raw.get("group_name") or "").strip()
     out["auto_create_group"] = bool(raw.get("auto_create_group", True))
+    # Accept several aliases from UI / older drafts
+    auto_push = raw.get("auto_push_on_register")
+    if auto_push is None:
+        auto_push = raw.get("auto_import_on_register")
+    if auto_push is None:
+        auto_push = raw.get("auto_push_registration")
+    out["auto_push_on_register"] = bool(auto_push)
     try:
         conc = int(raw.get("concurrency") or 4)
     except (TypeError, ValueError):
@@ -819,6 +829,104 @@ def push_account(
             "error": str(e),
             "method": "sso",
         }
+
+
+def maybe_auto_push_registered_accounts(
+    account_ids: list[str] | None,
+    *,
+    cfg: dict[str, Any] | None = None,
+    source: str = "register-email",
+) -> dict[str, Any]:
+    """Push freshly registered local accounts into sub2api when configured.
+
+    Safe no-op when:
+    - ``auto_push_on_register`` is off
+    - sub2api is not enabled / missing URL or credentials
+    - no account ids were provided
+
+    Never raises — registration success must not fail because of sub2api push.
+    """
+    ids = [str(x).strip() for x in (account_ids or []) if str(x).strip()]
+    if not ids:
+        return {"ok": True, "skipped": True, "reason": "no_accounts", "results": []}
+    try:
+        live = cfg or get_sub2api_config(include_secrets=True)
+    except Exception as e:  # noqa: BLE001
+        return {
+            "ok": False,
+            "skipped": True,
+            "reason": f"config_error: {e}",
+            "results": [],
+        }
+    if not bool(live.get("auto_push_on_register")):
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "auto_push_on_register_disabled",
+            "results": [],
+        }
+    if not bool(live.get("enabled")):
+        return {
+            "ok": False,
+            "skipped": True,
+            "reason": "sub2api_disabled",
+            "results": [],
+        }
+    if not str(live.get("base_url") or "").strip():
+        return {
+            "ok": False,
+            "skipped": True,
+            "reason": "missing_base_url",
+            "results": [],
+        }
+    if not str(live.get("email") or "").strip() or not (
+        str(live.get("password") or "").strip() or str(live.get("token") or "").strip()
+    ):
+        return {
+            "ok": False,
+            "skipped": True,
+            "reason": "missing_credentials",
+            "results": [],
+        }
+
+    results: list[dict[str, Any]] = []
+    ok_n = 0
+    fail_n = 0
+    for aid in ids:
+        try:
+            r = push_account(aid, cfg=live)
+        except Exception as e:  # noqa: BLE001
+            r = {"ok": False, "account_id": aid, "error": str(e), "method": "auto"}
+        if not isinstance(r, dict):
+            r = {"ok": False, "account_id": aid, "error": "invalid push result"}
+        r.setdefault("source", source)
+        results.append(r)
+        if r.get("ok"):
+            ok_n += 1
+        else:
+            fail_n += 1
+        try:
+            # Light pacing so bulk registration does not stampede sub2api.
+            time.sleep(0.05)
+        except Exception:
+            pass
+    summary = {
+        "ok": fail_n == 0,
+        "skipped": False,
+        "source": source,
+        "total": len(ids),
+        "success": ok_n,
+        "failed": fail_n,
+        "results": results,
+    }
+    try:
+        print(
+            f"[sub2api] auto_push_on_register source={source} "
+            f"total={len(ids)} ok={ok_n} fail={fail_n}"
+        )
+    except Exception:
+        pass
+    return summary
 
 
 def push_accounts(

@@ -3245,6 +3245,10 @@ class Sub2ApiConfigBody(BaseModel):
     group_id: int | None = None
     group_name: str | None = None
     auto_create_group: bool | None = None
+    auto_push_on_register: bool | None = Field(
+        default=None,
+        description="After protocol registration imports a local account, auto-push it to sub2api",
+    )
     concurrency: int | None = Field(
         default=None, ge=1, le=16, description="Local push parallelism"
     )
