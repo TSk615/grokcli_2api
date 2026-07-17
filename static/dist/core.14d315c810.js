@@ -24,15 +24,6 @@ window.G2A = window.G2A || {};
   let dashCache = null;
   let loginSessionId = null;
   let devicePollTimer = null;
-  let regFinishedNotified = false;
-  let regStopping = false;
-  let regPollInFlight = false;
-  let regLastStatusText = "";
-  let regLastEmailText = "";
-  let regProbedIds = new Set();
-  let regProbeRunning = false;
-  // Survive hard refresh: remember which batch/sessions the UI was tracking.
-  const REG_TRACK_KEY = "g2a_reg_track_v1";
   let keysCache = [];
   let quotaCache = {};
   let uiRefreshTimer = null;
@@ -106,9 +97,12 @@ function setLogPanel(id, text, { forceShow = false } = {}) {
   if (!el) return;
   const val = (text == null ? "" : String(text)).trim();
   const empty = !val || val === "—" || val === "-" || val === "暂无" || val === "idle";
+  const next = empty ? "—" : val;
   if (empty && !forceShow) {
-    if (next === regLastLogText && !el.classList.contains("hidden")) return;
-    regLastLogText = next;
+    el.textContent = next;
+    el.classList.add("is-empty", "hidden");
+    el.hidden = true;
+    return;
   }
   if (el.textContent === next && !el.classList.contains("hidden")) {
     el.classList.remove("is-empty", "hidden");
@@ -369,7 +363,7 @@ function clearSoftNavBusy(reason) {
 
 function hideEmptyLogPanels() {
   try { if (!loginSessionId) setDeviceLoginIdle(true); } catch (_) {}
-  ["device-log", "reg-log", "probe-result", "sso-result"].forEach((id) => {
+  ["device-log", "probe-result", "sso-result"].forEach((id) => {
     const el = $(id);
     if (!el) return;
     const val = (el.textContent || "").trim();
@@ -378,7 +372,6 @@ function hideEmptyLogPanels() {
       el.hidden = true;
     }
   });
-  }
 }
 
 function rebindPageControls() {
@@ -387,20 +380,6 @@ function rebindPageControls() {
   try { hideEmptyLogPanels(); } catch (_) {}
   // Soft-nav replaces .g2a-content; sub2api buttons must be rebound every time.
   try { bindSub2apiUi(); } catch (_) {}
-  // Soft-nav swaps DOM; re-show active registration card + keep polling if needed.
-  // Full page refresh loses in-memory ids — restore from backend when missing.
-  try {
-    const page = document.body.dataset.page || pageFromPath(location.pathname) || "";
-    if (page === "accounts") {
-      // Soft-nav keeps JS heap, but hard-refresh recovery may land here first.
-      if (!hasTrackedRegTask()) applyRegTrack(loadRegTrack());
-      if (hasTrackedRegTask()) {
-        showPanel("reg-session-box");
-        // Never re-poll a finished card (avoids completion-toast spam).
-      } else {
-      }
-    }
-  } catch (_) {}
 
   // Re-bind controls after soft navigation content swaps. Idempotent.
   try { if (window.G2A && G2A.bindThemeToggle) G2A.bindThemeToggle(document); } catch (_) {}
@@ -2366,9 +2345,6 @@ pip install -r requirements.txt
 /* ── Protocol registration removed ─────────────── */
 
 /* ── Events ─────────────────────────────────────────── */
-}).catch(() => {
-});
-
 document.querySelectorAll(".sidebar .nav-btn").forEach(btn => {
   btn.onclick = () => switchTab(btn.dataset.tab);
 });
