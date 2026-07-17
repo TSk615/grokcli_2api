@@ -2112,13 +2112,13 @@ def _normalize_registration_config(
     cfg["gptmail_domain"] = _pick_domain("gptmail_domain")
     cfg["cfmail_domain"] = _pick_domain("cfmail_domain")
     cfg["prefix"] = _pick_str("prefix", 64)
+    normalize_yyds_base_url = None  # type: ignore[assignment]
+    normalize_gptmail_base_url = None  # type: ignore[assignment]
+    normalize_cfmail_base_url = None  # type: ignore[assignment]
     try:
         normalize_mail_provider = _normalize_mail_provider
     except Exception:
         normalize_mail_provider = None  # type: ignore[assignment]
-        normalize_yyds_base_url = None  # type: ignore[assignment]
-        normalize_gptmail_base_url = None  # type: ignore[assignment]
-        normalize_cfmail_base_url = None  # type: ignore[assignment]
 
     mail_raw = _pick_str("mail_provider", 32).lower()
     # Prefer explicit mail_provider; only use base_url as a hint when empty.
