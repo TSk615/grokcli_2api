@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 import time
 import uuid
@@ -1721,6 +1722,14 @@ async def get_sso_import_job(
 # ── JSON import / export jobs (progress polling) ───────────────────────────
 
 _IO_JOB_TTL_SEC = 3600
+try:
+    _JSON_IMPORT_MAX_FILE_MB = int(
+        os.getenv("GROK2API_JSON_IMPORT_MAX_FILE_MB", "128") or 128
+    )
+except (TypeError, ValueError):
+    _JSON_IMPORT_MAX_FILE_MB = 128
+_JSON_IMPORT_MAX_FILE_MB = max(8, min(512, _JSON_IMPORT_MAX_FILE_MB))
+_JSON_IMPORT_MAX_FILE_BYTES = _JSON_IMPORT_MAX_FILE_MB * 1024 * 1024
 _io_jobs_lock = threading.Lock()
 _io_jobs_local: dict[str, dict[str, Any]] = {}
 
@@ -2186,8 +2195,11 @@ async def import_account_file(
         raise HTTPException(status_code=400, detail=f"read file failed: {e}") from e
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="empty file")
-    if len(raw_bytes) > 8 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="file too large (max 8MB)")
+    if len(raw_bytes) > _JSON_IMPORT_MAX_FILE_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"file too large (max {_JSON_IMPORT_MAX_FILE_MB}MB)",
+        )
     try:
         text = raw_bytes.decode("utf-8-sig")
     except UnicodeDecodeError as e:
@@ -2266,10 +2278,10 @@ async def import_account_files_bulk(
             raise HTTPException(status_code=400, detail=f"read file failed: {e}") from e
         if not raw_bytes:
             continue
-        if len(raw_bytes) > 8 * 1024 * 1024:
+        if len(raw_bytes) > _JSON_IMPORT_MAX_FILE_BYTES:
             raise HTTPException(
                 status_code=400,
-                detail=f"file too large (max 8MB): {f.filename}",
+                detail=f"file too large (max {_JSON_IMPORT_MAX_FILE_MB}MB): {f.filename}",
             )
         try:
             text = raw_bytes.decode("utf-8-sig").strip()

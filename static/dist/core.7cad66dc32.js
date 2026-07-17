@@ -2889,7 +2889,7 @@ async function importAccountJsonFiles({
             const job = await waitJsonIoJob(rr.job_id, {
               kind: "import",
               totalHint: 1,
-              maxWaitMs: 180000,
+              maxWaitMs: 1800000,
             });
             totalImported += Number((job && job.count) || 0);
             if (job && (job.status === "error" || job.ok === false)) totalFailed++;
@@ -2962,7 +2962,7 @@ async function importAccountJsonFiles({
     const finalJob = await waitJsonIoJob(jobId, {
       kind: "import",
       totalHint: started.total || files.length,
-      maxWaitMs: Math.max(120000, files.length * 30000),
+      maxWaitMs: Math.max(1800000, files.length * 60000),
     });
     if (!finalJob) throw new Error("导入超时，未拿到任务结果");
     const st = String(finalJob.status || "");
