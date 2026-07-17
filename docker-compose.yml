@@ -1,9 +1,13 @@
+# Parallel deployment stack (does not collide with original grokcli-2api).
+# Containers / network / volume / host port are all renamed.
+name: grokcli-2api-lite
+
 services:
   # Redis / Postgres are internal-only (no host port publish).
   # App reaches them via the compose network: redis:6379 / postgres:5432.
   redis:
     image: redis:7-alpine
-    container_name: grokcli-2api-redis
+    container_name: grokcli-2api-lite-redis
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     environment:
       TZ: "${TZ:-Asia/Shanghai}"
@@ -16,7 +20,7 @@ services:
 
   postgres:
     image: postgres:16-alpine
-    container_name: grokcli-2api-postgres
+    container_name: grokcli-2api-lite-postgres
     environment:
       TZ: "${TZ:-Asia/Shanghai}"
       PGTZ: "${TZ:-Asia/Shanghai}"
@@ -24,7 +28,7 @@ services:
       POSTGRES_PASSWORD: grok2api
       POSTGRES_DB: grok2api
     volumes:
-      - grok2api_pg:/var/lib/postgresql/data
+      - grok2api_lite_pg:/var/lib/postgresql/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U grok2api -d grok2api"]
@@ -32,24 +36,20 @@ services:
       timeout: 5s
       retries: 10
 
-  # Single app container: API + inline Turnstile Solver (same process tree)
-  grokcli-2api:
+  # App only (protocol registration / inline captcha removed)
+  grokcli-2api-lite:
     build:
       context: .
       dockerfile: Dockerfile
-    image: grokcli-2api:local
-    container_name: grokcli-2api
+    image: grokcli-2api-lite:local
+    container_name: grokcli-2api-lite
     env_file:
       - path: .env
         required: false
     ports:
-      # Only the app API is published. Postgres/Redis stay internal-only
-      # (compose network). Inline Turnstile Solver listens on container
-      # loopback 127.0.0.1:5072 and is NOT published to the host.
-      - "3000:3000"
-    shm_size: "1gb"
-    security_opt:
-      - seccomp:unconfined
+      # Host port 3010 avoids clashing with original stack on 3000.
+      # Postgres/Redis stay internal-only (compose network).
+      - "3010:3000"
     environment:
       TZ: "${TZ:-Asia/Shanghai}"
       GROK2API_HOST: "0.0.0.0"
@@ -66,41 +66,39 @@ services:
       GROK2API_REDIS_URL: "redis://redis:6379/0"
       DATABASE_URL: "postgresql://grok2api:grok2api@postgres:5432/grok2api"
       GROK2API_DATABASE_URL: "postgresql://grok2api:grok2api@postgres:5432/grok2api"
-      # Inline local Turnstile Solver (same container)
-      # Idle memory: warm browsers only when solving captcha; reclaim after quiet period
     healthcheck:
-      # $$ keeps substitution inside the container so override ports (e.g. 40081) work
+      # $$ keeps substitution inside the container so override ports work
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${GROK2API_PORT:-3000}/health >/dev/null"]
       interval: 10s
       timeout: 3s
       retries: 12
-      start_period: 90s
+      start_period: 40s
     volumes:
-      - ./data:/app/data
+      - ./data-lite:/app/data
     depends_on:
       redis:
         condition: service_healthy
       postgres:
         condition: service_healthy
-    # Explicit aliases so external stacks (sub2api etc.) can resolve us after recreate
+    # Explicit aliases so external stacks can resolve this lite instance
     networks:
       default:
         aliases:
-          - grokcli-2api
+          - grokcli-2api-lite
     restart: unless-stopped
 
 volumes:
-  grok2api_pg:
+  grok2api_lite_pg:
 
 # Fixed project network name so other compose stacks can join as external:
 #   networks:
-#     grokcli-net:
-#       name: grokcli-2api_default
+#     grokcli-lite-net:
+#       name: grokcli-2api-lite_default
 #       external: true
-# Downstream DNS: http://grokcli-2api:<port>/v1
+# Downstream DNS: http://grokcli-2api-lite:3000/v1
 networks:
   default:
-    name: grokcli-2api_default
+    name: grokcli-2api-lite_default
     driver: bridge
     labels:
-      com.grokcli-2api.network: "shared-upstream"
+      com.grokcli-2api.network: "lite-stack"

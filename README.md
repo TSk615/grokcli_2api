@@ -88,10 +88,16 @@ cp .env.example .env
 # 编辑 .env：至少改 GROK2API_ADMIN_PASSWORD；生产请改 Postgres 密码
 
 docker compose up -d --build
-curl -fsS http://127.0.0.1:3000/health
+curl -fsS http://127.0.0.1:3010/health
 ```
 
-浏览器打开：`http://127.0.0.1:3000/admin`
+浏览器打开：`http://127.0.0.1:3010/admin`
+
+> 并行部署说明：本仓库 compose 使用独立命名，避免与原版实例冲突：
+> - 项目名 / 网络：`grokcli-2api-lite` / `grokcli-2api-lite_default`
+> - 容器：`grokcli-2api-lite`、`grokcli-2api-lite-redis`、`grokcli-2api-lite-postgres`
+> - 宿主机端口：`3010`（原版常用 `3000`）
+> - 数据目录 / 卷：`./data-lite`、`grok2api_lite_pg`
 
 
 **默认只映射应用端口 `3000`（内联部署）。**
@@ -99,7 +105,7 @@ curl -fsS http://127.0.0.1:3000/health
 
 | 服务 | 容器内地址 | 是否映射到宿主机 |
 |------|------------|------------------|
-| app | `0.0.0.0:3000` | 是 → `127.0.0.1:3000` |
+| app | `0.0.0.0:3000` | 是 → `127.0.0.1:3010`（lite 栈；原版多为 3000） |
 | postgres | `postgres:5432` | **否**（compose 内网） |
 | redis | `redis:6379` | **否**（compose 内网） |
 
@@ -387,9 +393,9 @@ API：
 ```bash
 curl -fsS http://127.0.0.1:3000/health
 curl -fsS http://127.0.0.1:3000/metrics | head
-docker compose logs -f grokcli-2api
+docker compose logs -f grokcli-2api-lite
 # 时区
-docker exec grokcli-2api sh -c 'echo TZ=$TZ; date'
+docker exec grokcli-2api-lite sh -c 'echo TZ=$TZ; date'
 ```
 
 - 仅 **leader** worker 跑 Token 续期与模型健康任务（Redis 选主）
