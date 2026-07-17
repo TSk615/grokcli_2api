@@ -126,7 +126,7 @@ window.G2A = window.G2A || {};
       const pathStr = String(path || "");
       const ignore401 =
         pathStr.startsWith("/status") ||
-        pathStr.includes("/register-email/sessions/");
+        false;
       // During grace window keep token; only notify unauthorized outside grace.
       if (res.status === 401 && !ignore401) {
         if (!inAuthGrace()) {

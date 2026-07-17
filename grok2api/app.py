@@ -56,7 +56,7 @@ import grok2api.config as _config
 import grok2api.protocol.history_compact as history_compact
 from grok2api.upstream.models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.9.91"
+APP_VERSION = "1.9.92"
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -623,47 +623,6 @@ def _on_startup() -> None:
         # watching and will start maintainers when the lock becomes free.
         print("  token maintainer: waiting for leader election (re-elect armed)")
         print("  model health: waiting for leader election (re-elect armed)")
-
-    # Registration engine is optional — never block API startup.
-    # Engine: dongguatanglinux/grok-build-auth (HTTP protocol) + MoeMail + sso_to_auth_json.
-    try:
-        import grok2api.upstream.grok_build_adapter as _reg
-
-        st = _reg.registration_available()
-        if st.get("available"):
-            print(
-                "  registration: ready "
-                f"(engine={st.get('engine') or 'grok-build-auth'} "
-                f"build={st.get('adapter_build')})"
-            )
-            # After image upgrade / process restart the batch runner is gone but
-            # Redis sessions stay non-terminal (solving_turnstile…). Reclaim and
-            # auto-resume a few newest open batches so registration does not hang.
-            try:
-                auto = str(os.environ.get("GROK2API_REG_AUTO_RESUME", "1") or "1").strip().lower()
-                if auto not in {"0", "false", "no", "off"}:
-                    reclaim = getattr(_reg, "reclaim_orphaned_registration_batches", None)
-                    if callable(reclaim):
-                        rr = reclaim(auto_resume=True)
-                        print(
-                            "  registration reclaim: "
-                            f"sessions={rr.get('sessions_reclaimed') or 0} "
-                            f"batches_resumed={rr.get('batches_resumed') or 0}"
-                        )
-                # Keep a mid-run watchdog even if reclaim found nothing — multi-hour
-                # bulk jobs can lose their runner later without a process restart.
-                ensure_wd = getattr(_reg, "_ensure_registration_watchdog", None)
-                if callable(ensure_wd):
-                    ensure_wd()
-            except Exception as e:  # noqa: BLE001
-                print(f"  registration reclaim skipped: {e}")
-        else:
-            print(
-                f"  registration: unavailable ({st.get('error')}) "
-                f"(build={st.get('adapter_build')})"
-            )
-    except Exception as e:  # noqa: BLE001
-        print(f"  registration: unavailable ({e})")
 
 
 async def _on_shutdown() -> None:
@@ -3775,13 +3734,7 @@ def _normalize_stream_finish_reason(
 @app.get("/health")
 async def health():
     """Bounded readiness probe — never triggers OIDC refresh or full account dump."""
-    reg: dict[str, Any] = {"available": False}
-    try:
-        import grok2api.upstream.grok_build_adapter as _reg
-
-        reg = _reg.registration_available()
-    except Exception as e:  # noqa: BLE001
-        reg = {"available": False, "error": str(e)}
+    reg: dict[str, Any] = {"available": False, "error": "protocol registration removed"}
     store_info: dict[str, Any] = {}
     leader_info: dict[str, Any] = {}
     try:
@@ -7939,7 +7892,6 @@ def _reload_kwargs() -> dict:
             str(root / "store"),
             str(root / "static" / "js"),
             str(root / "static" / "admin"),
-            str(root / "grok-build-auth"),
         ]
     else:
         resolved = []
@@ -7963,7 +7915,6 @@ def _reload_kwargs() -> dict:
         "*/.git/*",
         "*/data/*",
         "*/static/dist/*",
-        "*/turnstile-solver/logs/*",
         "*/.venv/*",
         "*/venv/*",
     ]

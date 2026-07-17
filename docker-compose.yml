@@ -67,20 +67,7 @@ services:
       DATABASE_URL: "postgresql://grok2api:grok2api@postgres:5432/grok2api"
       GROK2API_DATABASE_URL: "postgresql://grok2api:grok2api@postgres:5432/grok2api"
       # Inline local Turnstile Solver (same container)
-      GROK2API_CAPTCHA_PROVIDER: "${GROK2API_CAPTCHA_PROVIDER:-local}"
-      CAPTCHA_PROVIDER: "${CAPTCHA_PROVIDER:-local}"
-      GROK2API_LOCAL_SOLVER_URL: "${GROK2API_LOCAL_SOLVER_URL:-http://127.0.0.1:5072}"
-      LOCAL_SOLVER_URL: "${LOCAL_SOLVER_URL:-http://127.0.0.1:5072}"
-      GROK2API_INLINE_SOLVER: "${GROK2API_INLINE_SOLVER:-1}"
-      TURNSTILE_HOST: "127.0.0.1"
-      TURNSTILE_PORT: "5072"
-      # Align with registration concurrency (default 3)
-      GROK2API_REG_CONCURRENCY: "${GROK2API_REG_CONCURRENCY:-3}"
-      TURNSTILE_THREAD: "${TURNSTILE_THREAD:-${GROK2API_REG_CONCURRENCY:-3}}"
-      TURNSTILE_BROWSER_TYPE: "${TURNSTILE_BROWSER_TYPE:-camoufox}"
       # Idle memory: warm browsers only when solving captcha; reclaim after quiet period
-      TURNSTILE_LAZY: "${TURNSTILE_LAZY:-1}"
-      TURNSTILE_IDLE_SEC: "${TURNSTILE_IDLE_SEC:-180}"
     healthcheck:
       # $$ keeps substitution inside the container so override ports (e.g. 40081) work
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${GROK2API_PORT:-3000}/health >/dev/null"]
@@ -90,7 +77,6 @@ services:
       start_period: 90s
     volumes:
       - ./data:/app/data
-      - ./turnstile-solver/logs:/app/turnstile-solver/logs
     depends_on:
       redis:
         condition: service_healthy

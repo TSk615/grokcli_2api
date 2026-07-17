@@ -1826,6 +1826,26 @@ def apply_runtime_settings_to_modules() -> None:
 
 # ── protocol registration config (MoeMail / YesCaptcha / proxy) ────────────
 
+def _normalize_mail_provider(provider, *, base_url=None):
+    p = str(provider or "").strip().lower()
+    if p in {"moemail", "moe", "moe-mail"}:
+        return "moemail"
+    if p in {"yyds", "yydsmail"}:
+        return "yyds"
+    if p in {"gptmail", "gpt-mail"}:
+        return "gptmail"
+    if p in {"cfmail", "cf", "cloudflare", "cloudflare_temp_email"}:
+        return "cfmail"
+    b = str(base_url or "").lower()
+    if "215.im" in b:
+        return "yyds"
+    if "chatgpt.org.uk" in b:
+        return "gptmail"
+    if "moemail" in b:
+        return "moemail"
+    return p or "moemail"
+
+
 _REG_CONFIG_KEYS = (
     "mail_provider",
     "base_url",
@@ -2012,7 +2032,7 @@ def _env_registration_defaults() -> dict[str, Any]:
             out["mail_provider"] = mail_provider
         elif MOEMAIL_BASE_URL:
             try:
-                from grok2api.upstream.moemail import normalize_mail_provider
+                normalize_mail_provider = _normalize_mail_provider
 
                 out["mail_provider"] = normalize_mail_provider(
                     None, base_url=str(MOEMAIL_BASE_URL)
@@ -2093,12 +2113,7 @@ def _normalize_registration_config(
     cfg["cfmail_domain"] = _pick_domain("cfmail_domain")
     cfg["prefix"] = _pick_str("prefix", 64)
     try:
-        from grok2api.upstream.moemail import (
-            normalize_cfmail_base_url,
-            normalize_gptmail_base_url,
-            normalize_mail_provider,
-            normalize_yyds_base_url,
-        )
+        normalize_mail_provider = _normalize_mail_provider
     except Exception:
         normalize_mail_provider = None  # type: ignore[assignment]
         normalize_yyds_base_url = None  # type: ignore[assignment]
@@ -2392,7 +2407,7 @@ def set_registration_config(
 
     # Resolve selected provider early so we can treat inactive slots carefully.
     try:
-        from grok2api.upstream.moemail import normalize_mail_provider as _nmp
+        _nmp = _normalize_mail_provider
 
         prov = _nmp(
             str(
@@ -2763,26 +2778,7 @@ def apply_registration_config_to_runtime(cfg: dict[str, Any] | None = None) -> N
     except Exception:
         pass
 
-    # Adapter caches YESCAPTCHA_KEY / probe delay at import — refresh module attrs.
-    try:
-        import grok2api.upstream.grok_build_adapter as gba
-
-        if hasattr(gba, "CAPTCHA_PROVIDER"):
-            gba.CAPTCHA_PROVIDER = provider
-        if hasattr(gba, "MAIL_PROVIDER"):
-            gba.MAIL_PROVIDER = mail_provider
-        if hasattr(gba, "REGISTER_PROBE_DELAY_SEC"):
-            gba.REGISTER_PROBE_DELAY_SEC = float(probe_delay)
-        if provider == "local":
-            gba.YESCAPTCHA_KEY = "local"
-            if hasattr(gba, "LOCAL_SOLVER_URL"):
-                gba.LOCAL_SOLVER_URL = "http://127.0.0.1:5072"
-        else:
-            gba.YESCAPTCHA_KEY = yes or ""
-            if hasattr(gba, "LOCAL_SOLVER_URL"):
-                gba.LOCAL_SOLVER_URL = ""
-    except Exception:
-        pass
+    # Protocol registration adapter removed; no adapter runtime refresh.
 
 
 def resolve_registration_inputs(
@@ -2801,7 +2797,7 @@ def resolve_registration_inputs(
 
     # Resolve target provider early so empty active domain/key can clear.
     try:
-        from grok2api.upstream.moemail import normalize_mail_provider as _nmp
+        _nmp = _normalize_mail_provider
 
         prov = _nmp(
             str(

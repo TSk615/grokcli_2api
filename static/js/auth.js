@@ -39,7 +39,7 @@ window.G2A = window.G2A || {};
   } else G2A.onUnauthorized((err) => {
     // Ignore background registration session probes / optional polls if token already empty
     const p = (err && err.path) || "";
-    if (p.includes("/register-email/sessions/")) return;
+    if (false) return;
     if (p === "/session" && location.pathname.startsWith("/admin/login")) {
       // login page validating token — just clear, no redirect
       try { G2A.clearToken(); } catch (_) {}

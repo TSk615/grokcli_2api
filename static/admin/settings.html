@@ -96,7 +96,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
-  <link rel="stylesheet" href="/static/dist/admin-antd.1031c5bb2f.css" />
+  <link rel="stylesheet" href="/static/dist/admin-antd.2dddb9a5ee.css" />
   <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
 
 </head>
@@ -228,7 +228,7 @@
   <div class="g2a-card-head">
     <div>
       <h3>账号出站代理池</h3>
-      <p>账号池请求上游（聊天 / 测活 / Token 续期）走代理。按账号粘性选代理，与会话粘性配合更稳。协议注册可共用同一列表，也可单独配置。</p>
+      <p>账号池请求上游（聊天 / 测活 / Token 续期）走代理。按账号粘性选代理，与会话粘性配合更稳。</p>
     </div>
     <span id="outbound-proxy-pill" class="g2a-tag">—</span>
   </div>
@@ -418,7 +418,7 @@
     </div>
     <div class="g2a-field">
       <label class="g2a-check"><input type="checkbox" id="set-sub2api-auto-push-register" /> 注册成功后自动入库 sub2api</label>
-      <div class="g2a-muted" style="margin-top:4px">协议注册导入本地后立刻推送到上方分组；需同时启用 sub2api 并填好 URL/登录</div>
+      <div class="g2a-muted" style="margin-top:4px">账号导入本地后立刻推送到上方分组；需同时启用 sub2api 并填好 URL/登录</div>
     </div>
     <div class="g2a-field">
       <label for="set-sub2api-concurrency">推送并发</label>
@@ -456,7 +456,7 @@
   <pre id="sub2api-test-result" class="g2a-log" style="margin-top:10px;max-height:160px;display:none"></pre>
   <p class="g2a-muted" style="margin:10px 0 0;line-height:1.55" id="sub2api-hint">
     保存后到「账号」页：可「导入 sub2api（选中/全部）」在线推送；或「导出 sub2api 数据」下载官方 <code>sub2api-data</code> 备份，在 sub2api 管理台「导入数据」上传。
-    勾选「注册成功后自动入库 sub2api」后，协议注册导入本地账号会<strong>立刻</strong>推送到上方配置的分组。
+    勾选「注册成功后自动入库 sub2api」后，新导入本地账号会<strong>立刻</strong>推送到上方配置的分组。
   </p>
 </section>
 
@@ -487,7 +487,7 @@
     </div>
     <div class="g2a-field">
       <label class="g2a-check"><input type="checkbox" id="set-cliproxyapi-auto-push-register" /> 注册成功后自动入库 CPA</label>
-      <div class="g2a-muted" style="margin-top:4px">协议注册导入本地后立刻推送到 CPA；需同时启用并填好 URL / Key</div>
+      <div class="g2a-muted" style="margin-top:4px">账号导入本地后立刻推送到 CPA；需同时启用并填好 URL / Key</div>
     </div>
     <div class="g2a-field">
       <label for="set-cliproxyapi-concurrency">推送并发</label>
@@ -534,10 +534,10 @@
       </div>
     </div>
   </div>
-  <script src="/static/dist/utils.360f09cd20.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/api.c4edde3d16.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/auth.fa7b1e0e4d.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.d60204b9f3.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/utils.c46b9a7ce6.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/api.a4a81c4e29.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/state.5846ce62e4.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/auth.64fa85e43f.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.43b2be7a14.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

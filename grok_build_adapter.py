@@ -1,8 +1,0 @@
-"""Compatibility shim — implementation lives in grok2api.upstream.grok_build_adapter."""
-from __future__ import annotations
-
-from importlib import import_module as _import_module
-import sys as _sys
-
-_impl = _import_module("grok2api.upstream.grok_build_adapter")
-_sys.modules[__name__] = _impl

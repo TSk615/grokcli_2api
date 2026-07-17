@@ -43,10 +43,6 @@ if ($LASTEXITCODE -ne 0) {
     python -m pip install -r requirements.txt
 }
 
-# Vendored grok-build-auth package path
-$env:PYTHONPATH = (Join-Path $PSScriptRoot "grok-build-auth") + (
-    if ($env:PYTHONPATH) { ";" + $env:PYTHONPATH } else { "" }
-)
 
 if (-not $env:GROK2API_OPEN_BROWSER) { $env:GROK2API_OPEN_BROWSER = "1" }
 if (-not $env:GROK2API_HOST) { $env:GROK2API_HOST = "127.0.0.1" }
@@ -56,7 +52,6 @@ if (-not $env:GROK2API_REASONING_COMPAT) { $env:GROK2API_REASONING_COMPAT = "off
 $port = $env:GROK2API_PORT
 Write-Host "Starting grokcli-2api..."
 Write-Host "  Admin: http://127.0.0.1:$port/admin"
-Write-Host "  Registration: grok-build-auth (HTTP protocol)"
 Write-Host "  (browser opens automatically unless GROK2API_OPEN_BROWSER=0)"
 
 python app.py
@@ -65,7 +60,5 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host "[ERROR] service exited with code $LASTEXITCODE"
     Write-Host "Common fixes:"
     Write-Host "  1) python -m pip install -r requirements.txt"
-    Write-Host "  2) ensure grok-build-auth exists"
-    Write-Host "  3) protocol registration needs YesCaptcha + MoeMail"
     exit $LASTEXITCODE
 }

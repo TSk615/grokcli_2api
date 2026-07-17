@@ -28,7 +28,6 @@ export REDIS_URL="${REDIS_URL:-${GROK2API_REDIS_URL:-redis://127.0.0.1:6379/0}}"
 export DATABASE_URL="${DATABASE_URL:-${GROK2API_DATABASE_URL:-postgresql://grok2api:grok2api@127.0.0.1:5432/grok2api}}"
 export GROK2API_REDIS_URL="${GROK2API_REDIS_URL:-$REDIS_URL}"
 export GROK2API_DATABASE_URL="${GROK2API_DATABASE_URL:-$DATABASE_URL}"
-export PYTHONPATH="$(pwd)/grok-build-auth${PYTHONPATH:+:$PYTHONPATH}"
 
 # Prefer host Python for editable local sources (not the baked Docker image).
 PY=python3

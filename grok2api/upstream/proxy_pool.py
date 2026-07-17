@@ -172,6 +172,97 @@ def _hostport_userpass(raw: str) -> str | None:
     return f"{scheme}://{auth}@{host}:{port}"
 
 
+def normalize_proxy_config(
+    proxy: str | None = None,
+    *,
+    username: str | None = None,
+    password: str | None = None,
+) -> dict[str, Any] | None:
+    """Normalize a proxy URL into curl/httpx-friendly forms."""
+    # Prefer explicit proxy; otherwise fall back to first env pool/single proxy.
+    if proxy is None or not str(proxy).strip():
+        env_text = _env_proxy_text()
+        proxy = split_proxy_text(env_text)[0] if env_text else ""
+    raw = (proxy or "").strip()
+    if not raw:
+        return None
+    env_user = _env_proxy_user()
+    env_pass = _env_proxy_pass()
+    lower = raw.lower()
+    if lower.startswith("soket5://"):
+        raw = "socks5://" + raw.split("://", 1)[1]
+    elif lower.startswith("socket5://"):
+        raw = "socks5://" + raw.split("://", 1)[1]
+    elif "://" not in raw:
+        raw = f"http://{raw}"
+
+    parsed = urlparse(raw)
+    if parsed.scheme not in {"http", "https", "socks5", "socks5h"}:
+        raise ValueError("proxy scheme must be http, https, socks5, or socks5h")
+    if not parsed.netloc or not parsed.hostname:
+        raise ValueError("proxy must include host and port")
+    try:
+        port = parsed.port
+    except ValueError as e:
+        raise ValueError("proxy port is invalid") from e
+    proxy_user = (username if username is not None else "").strip()
+    proxy_pass = (password if password is not None else "").strip()
+    if not proxy_user and username is None:
+        proxy_user = env_user
+    if not proxy_pass and password is None:
+        proxy_pass = env_pass
+    if not proxy_user and parsed.username:
+        proxy_user = unquote(parsed.username)
+    if not proxy_pass and parsed.password:
+        proxy_pass = unquote(parsed.password)
+
+    if proxy_pass and not proxy_user:
+        raise ValueError("proxy username is required when proxy password is set")
+
+    host = parsed.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    if port is not None:
+        host = f"{host}:{port}"
+    proxy_no_auth = urlunparse(
+        (
+            parsed.scheme,
+            host,
+            parsed.path or "",
+            parsed.params or "",
+            parsed.query or "",
+            parsed.fragment or "",
+        )
+    )
+    proxy_auth = (proxy_user, proxy_pass) if proxy_user else None
+    proxy_with_auth = proxy_no_auth
+    if proxy_user:
+        auth = quote(proxy_user, safe="")
+        if proxy_pass:
+            auth = f"{auth}:{quote(proxy_pass, safe='')}"
+        proxy_with_auth = urlunparse(
+            (
+                parsed.scheme,
+                f"{auth}@{host}",
+                parsed.path or "",
+                parsed.params or "",
+                parsed.query or "",
+                parsed.fragment or "",
+            )
+        )
+    return {
+        "proxy": proxy_with_auth,
+        "curl_proxy": proxy_no_auth,
+        "proxy_auth": proxy_auth,
+    }
+
+
+# Back-compat alias used by older adapter code paths.
+_normalize_proxy_config = normalize_proxy_config
+
+
+
+
 def canonicalize_proxy_line(
     raw: str,
     *,
@@ -182,8 +273,6 @@ def canonicalize_proxy_line(
 
     Raises ValueError when the line is not a usable proxy.
     """
-    from grok2api.upstream.moemail import normalize_proxy_config
-
     line = (raw or "").strip()
     if not line:
         raise ValueError("empty proxy line")

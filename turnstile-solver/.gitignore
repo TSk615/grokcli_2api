@@ -1,7 +1,0 @@
-.venv/
-__pycache__/
-*.py[cod]
-logs/
-keys/
-.env
-*.log
