@@ -25,7 +25,7 @@ python3 scripts/_test_tool_call_parse_fix.py
 | 路径 | 覆盖 |
 |------|------|
 | `_test_task_status_terminal.py` | TaskUpdate / Update 路径 / 终态帧 |
-| `_test_cpa_affinity_improvements.py` | 会话粘性：Claude session / messages hash / model 隔离 / 清绑定 |
+| `_test_cpa_affinity_improvements.py` | 会话粘性：Claude session / stable seed / model 隔离 / 清绑定 |
 | `_test_strict_cooldown_rotation.py` | 冷却池硬排除 live 轮询 |
 | `_test_rotation_load_spread.py` | pick-time inflight 负载分散 |
 | `_test_free_usage_hard_kick.py` | 没额度立即冷却踢出 |

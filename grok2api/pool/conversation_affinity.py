@@ -8,8 +8,7 @@ Fingerprint priority (callers may re-order for Responses):
   2. OpenAI ``prompt_cache_key`` (alone — do not fold message root)
   3. Responses ``previous_response_id`` chain → linked session_fp + account
   4. OpenAI `user` + conversation root
-  5. Messages content hash fallback (CPA-style short/full)
-  6. Stable hash of conversation root (first user + weak system salt)
+  5. Stable conversation seed (first user + weak system salt)
 
 Optional ``model`` scopes the fingerprint so the same client session on a
 different model does not inherit a stale account binding (CPA
@@ -334,8 +333,7 @@ def conversation_fingerprint(
       1. conversation_id (explicit client session / chat id)
       2. prompt_cache_key (OpenAI / sub2api / Claude Code cache sticky key)
       3. user + conversation root
-      4. messages content hash (CPA short/full fallback)
-      5. conversation root alone
+      4. conversation root alone
 
     When ``prompt_cache_key`` is present it is used *alone* (plus optional
     api_key_id / model). We intentionally do **not** fold conversation root into
@@ -369,15 +367,6 @@ def conversation_fingerprint(
         if root:
             parts.append(f"root:{root}")
         return _finalize_fp(parts)
-
-    # CPA-style messages hash before weak root-only. Multi-turn clients that
-    # omit conversation_id / prompt_cache_key still stick when history grows
-    # consistently (full hash). First-turn short hash covers brand-new chats.
-    msg_fp = messages_content_fingerprint(
-        messages, api_key_id=api_key_id, model=model
-    )
-    if msg_fp:
-        return msg_fp
 
     root = _conversation_root(messages)
     if not root:
@@ -486,6 +475,17 @@ def _conversation_root(messages: list[Any] | None) -> str:
         if content or role:
             chunks.append(f"{role}:{content[:800]}")
     return "prefix:" + "\n".join(chunks)
+
+
+def stable_conversation_seed(messages: list[Any] | None) -> str | None:
+    """Stable first-turn seed for auto prompt_cache_key minting.
+
+    This intentionally matches the sticky fallback: first user text plus a weak,
+    churn-resistant system salt. It avoids full messages hashes, which change as
+    history grows and break prompt-cache locality.
+    """
+    root = _conversation_root(messages)
+    return root or None
 
 
 def _purge_locked(now: float | None = None) -> None:
@@ -1071,7 +1071,7 @@ def resolve_responses_affinity(
       1. explicit conversation_id
       2. prompt_cache_key
       3. previous_response_id chain (account + linked session_fp)
-      4. user / messages-hash / message root fingerprint
+      4. user / stable conversation seed
 
     When a previous_response_id hits, the returned session_fp is the *linked*
     multi-turn identity (not the per-response chain key and not a fresh root
@@ -1084,7 +1084,7 @@ def resolve_responses_affinity(
     if not _enabled():
         return None, None, "disabled"
 
-    # 1–2 / 4: ordinary conversation fingerprint (cid / pck / msg-hash / root).
+    # 1–2 / 4: ordinary conversation fingerprint (cid / pck / stable seed).
     base_fp = conversation_fingerprint(
         messages,
         user=user,
@@ -1118,14 +1118,8 @@ def resolve_responses_affinity(
             session = base_fp or response_chain_fingerprint(prev, api_key_id=api_key_id)
             return session, account, "previous_response_id_legacy"
 
-    # 4. msg-hash / root / user fingerprint.
+    # 4. stable seed / user fingerprint.
     if base_fp:
         prefer = get_affinity(base_fp)
-        # Distinguish CPA-style messages hash from weak root for observability.
-        msg_fp = messages_content_fingerprint(
-            messages, api_key_id=api_key_id, model=model
-        )
-        if msg_fp and msg_fp == base_fp:
-            return base_fp, prefer, "messages_hash" if prefer else "messages_hash_new"
         return base_fp, prefer, "root" if prefer else "root_new"
     return None, None, "none"

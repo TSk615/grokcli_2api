@@ -1091,11 +1091,6 @@ _UPSTREAM_UNSUPPORTED_PARAMS = frozenset(
         "logprobs",
         "top_logprobs",
         "n",
-        # OpenAI prompt-cache request fields are not accepted by cli-chat-proxy.
-        # We still accept them on the public API for sticky affinity + relay
-        # compatibility, then strip before upstream.
-        "prompt_cache_key",
-        "prompt_cache_retention",
     }
 )
 
@@ -1589,7 +1584,11 @@ def _ensure_stream_include_usage(body: dict[str, Any]) -> None:
 
 
 def _body_for_upstream(body: dict[str, Any]) -> dict[str, Any]:
-    """Copy body without private grokcli-2api keys (never send to cli-chat-proxy)."""
+    """Copy body without private grokcli-2api keys.
+
+    Public prompt_cache_key / prompt_cache_retention are preserved for upstream
+    prefix-cache parity with CPA.
+    """
     if not isinstance(body, dict):
         return body
     out = dict(body)
@@ -1598,9 +1597,6 @@ def _body_for_upstream(body: dict[str, Any]) -> dict[str, Any]:
     out.pop("_prompt_cache_key", None)
     out.pop("_prompt_cache_key_minted", None)
     out.pop("_prompt_cache_retention", None)
-    # OpenAI prompt-cache request fields are for sticky affinity / client echo only.
-    out.pop("prompt_cache_key", None)
-    out.pop("prompt_cache_retention", None)
     return out
 
 
@@ -1666,13 +1662,14 @@ def _ensure_prompt_cache_key(
     previous_response_id: str | None = None,
     user: str | None = None,
     seed: str | None = None,
+    messages: list[Any] | None = None,
 ) -> tuple[str | None, bool]:
     """Return ``(prompt_cache_key, minted)``.
 
     Prefer client-provided key (body / metadata / headers). When missing, mint a
-    stable key from conversation / previous_response_id / user so multi-turn
-    stickiness works for sub2api/Claude Code even without an explicit cache key.
-    The minted key is written onto ``body`` for later echo in responses.
+    stable key from conversation / previous_response_id / first-user seed / user
+    so multi-turn stickiness works for sub2api/Claude Code even without an
+    explicit cache key. The minted key is written onto ``body`` for later echo.
     """
     pck = None
     if isinstance(body, dict):
@@ -1688,12 +1685,16 @@ def _ensure_prompt_cache_key(
             body["_prompt_cache_key_minted"] = False
         return pck, False
 
+    seed_s = seed
+    if not seed_s and messages is not None:
+        seed_s = conversation_affinity.stable_conversation_seed(messages)
+
     minted = conversation_affinity.mint_prompt_cache_key(
         api_key_id=api_key_id,
         conversation_id=conversation_id,
         previous_response_id=previous_response_id,
         user=user,
-        seed=seed,
+        seed=seed_s,
     )
     if isinstance(body, dict):
         body["prompt_cache_key"] = minted
@@ -1723,6 +1724,57 @@ def _prompt_cache_key_headers(
         "X-Grok2API-Prompt-Cache-Key": pck,
         "X-Grok2API-Prompt-Cache-Key-Minted": "1" if is_minted else "0",
     }
+
+
+def _upstream_conv_id(
+    body: dict[str, Any] | None,
+    *,
+    prompt_cache_key: str | None = None,
+    conversation_id: str | None = None,
+) -> str | None:
+    """Stable id sent as x-grok-conv-id for upstream prompt cache."""
+    for value in (prompt_cache_key, conversation_id):
+        s = conversation_affinity.normalize_prompt_cache_key(value)
+        if s:
+            return s
+    if not isinstance(body, dict):
+        return None
+    for key in (
+        "prompt_cache_key",
+        "_prompt_cache_key",
+        "conversation_id",
+        "conversation",
+        "thread_id",
+        "session_id",
+    ):
+        value = body.get(key)
+        if isinstance(value, dict):
+            value = value.get("id")
+        s = conversation_affinity.normalize_prompt_cache_key(value)
+        if s:
+            return s
+    meta = body.get("metadata")
+    if isinstance(meta, dict):
+        for key in (
+            "prompt_cache_key",
+            "session_id",
+            "sessionId",
+            "thread_id",
+            "conversation_id",
+        ):
+            s = conversation_affinity.normalize_prompt_cache_key(meta.get(key))
+            if s:
+                return s
+        sid = conversation_affinity.extract_claude_session_id(
+            meta.get("user_id") if meta else None
+        )
+        if sid:
+            return sid
+    for key in ("user", "user_id"):
+        sid = conversation_affinity.extract_claude_session_id(body.get(key))
+        if sid:
+            return sid
+    return None
 
 
 def _cache_debug_headers(usage: dict[str, Any] | None) -> dict[str, str]:
@@ -4082,6 +4134,7 @@ def _resolve_conversation_affinity(
         api_key_id=api_key_id,
         conversation_id=conv_id,
         user=getattr(req, "user", None),
+        messages=req.messages,
     )
     fp = conversation_affinity.conversation_fingerprint(
         req.messages,
@@ -4191,8 +4244,8 @@ async def chat_completions(
         timing.emit(ok=False, error=str(e))
         return _client_pool_error(e)
 
-    # Stamp auto/minted prompt_cache_key onto body for response echo (stripped
-    # before upstream by _sanitize_upstream_body / _body_for_upstream).
+    # Stamp auto/minted prompt_cache_key onto body for response echo and
+    # upstream prompt-cache locality.
     if isinstance(body, dict) and pck:
         body["prompt_cache_key"] = pck
         body["_prompt_cache_key"] = pck
@@ -4271,7 +4324,7 @@ async def chat_completions(
     for attempt_i, creds in enumerate(chain):
         if attempt_i > 0:
             _note_account_pick(creds.auth_key)
-        headers = upstream_headers(creds.token, model)
+        headers = upstream_headers(creds.token, model, _upstream_conv_id(body))
         try:
             timing.mark_upstream_start(account_id=creds.auth_key, attempt=attempt_i)
             content, reasoning, finish, usage, tool_calls = await _collect_completion(
@@ -4552,7 +4605,7 @@ async def _stream_proxy_with_failover_inner(
     for idx, creds in enumerate(chain):
         if idx > 0:
             _note_account_pick(creds.auth_key)
-        headers = upstream_headers(creds.token, model)
+        headers = upstream_headers(creds.token, model, _upstream_conv_id(body))
         finished = False
         saw_tool_calls = False  # True only after a tool frame is outbound
         tools_pending = False  # upstream tool deltas seen but not yet emitted
@@ -5508,6 +5561,7 @@ def _resolve_anthropic_affinity(
             api_key_id=api_key_id,
             conversation_id=conv_id,
             user=anth.metadata_user_id(req),
+            messages=oa_msgs,
         )
     fp = conversation_affinity.conversation_fingerprint(
         oa_msgs,
@@ -5696,7 +5750,7 @@ async def anthropic_messages(
     for _pick_i, creds in enumerate(chain):
         if _pick_i > 0:
             _note_account_pick(creds.auth_key)
-        headers = upstream_headers(creds.token, model)
+        headers = upstream_headers(creds.token, model, _upstream_conv_id(body))
         try:
             content, reasoning, finish, usage, tool_calls = await _collect_completion(
                 url=url, headers=headers, body=body, account_id=creds.auth_key
@@ -5952,6 +6006,7 @@ def _responses_affinity(
         previous_response_id=prev_s or None,
         user=str(user) if user else None,
         seed=seed,
+        messages=messages,
     )
     # Do NOT put previous_response_id into conversation_id — it changes every
     # turn and would shatter stickiness. Resolve it via response-chain binding.
@@ -6124,7 +6179,7 @@ async def openai_responses(
         for _pick_i, creds in enumerate(chain):
             if _pick_i > 0:
                 _note_account_pick(creds.auth_key)
-            headers = upstream_headers(creds.token, model)
+            headers = upstream_headers(creds.token, model, _upstream_conv_id(body))
             try:
                 content, reasoning, finish, usage, tool_calls = await _collect_completion(
                     url=url,
@@ -6255,7 +6310,7 @@ async def openai_responses(
                 for idx, creds in enumerate(chain):
                     if idx > 0:
                         _note_account_pick(creds.auth_key)
-                    headers = upstream_headers(creds.token, model)
+                    headers = upstream_headers(creds.token, model, _upstream_conv_id(body))
                     streamer = oai_resp.ResponsesLiveStreamer(
                         response_id=response_id,
                         model=model,
@@ -7042,7 +7097,7 @@ async def _stream_anthropic_with_failover_inner(
     for idx, creds in enumerate(chain):
         if idx > 0:
             _note_account_pick(creds.auth_key)
-        headers = upstream_headers(creds.token, model)
+        headers = upstream_headers(creds.token, model, _upstream_conv_id(body))
         assembler = anth.AnthropicStreamAssembler(
             message_id=message_id,
             model=model,

@@ -16,7 +16,7 @@
 - **独立运行**：不依赖本地 Grok CLI / 浏览器 OAuth
 - **Hybrid 存储（默认强制）**：PostgreSQL 持久 + Redis 热状态 + 多 Worker
 - **大账号池轮询**：`round_robin` / `least_used` / `random`；**没额度立即冷却踢出**；pick-time inflight 负载分散
-- **会话粘性 / Prompt Cache**：`prompt_cache_key` / Claude session / messages hash；model 隔离绑定；TTL 可热改
+- **会话粘性 / Prompt Cache**：`prompt_cache_key` / Claude session / stable seed；model 隔离绑定；TTL 可热改
 - **中继友好**：兼容 new-api / sub2api / CLIProxyAPI / Claude Code / Codex；`Update`/`StrReplace` → `Edit`；**后到完整参数覆盖错误路径**
 - **秒开流 + 可观测**：early SSE 信封；用量明细含 `ttft_ms` / `latency_ms` / **思考强度**；任务日志 + 终态帧
 
@@ -228,14 +228,14 @@ echo "$GITHUB_TOKEN" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-s
 
 上游（Grok / cli-chat-proxy）的 prompt cache 是 **自动 prefix cache**：同一账号 + 相同 messages/tools 前缀 → usage 里出现 `prompt_tokens_details.cached_tokens`。本项目对齐 [superagent-ai/grok-cli](https://github.com/superagent-ai/grok-cli) 的做法，并吸收 [CLIProxyAPI (CPA)](https://github.com/router-for-me/CLIProxyAPI) 的 session-affinity 思路，**主动创造命中条件**：
 
-1. **粘账号**（affinity：`prompt_cache_key` / conversation / response 链 / messages hash）
+1. **粘账号**（affinity：`prompt_cache_key` / conversation / response 链 / stable seed）
 2. **按 model 隔离绑定**（同 session 换模型不会复用旧账号绑定）
 3. **出站前缀稳定**（tools schema 规范化 + name 排序；messages 字段/参数 JSON 规范化；system 文本形态统一）
 4. **历史压缩前缀稳定**（`HISTORY_PREFIX_STABLE`：旧 tool 结果确定性 placeholder，不反复改写）
 5. **账号失效清绑定**（disable / quota 踢号时 `clear_affinity_for_account`）
 6. **可观测**（响应字段 / header 回传 cache 命中量）
 
-> 注意：CPA 对官方 `api.x.ai` 会透传 `prompt_cache_key` + `x-grok-conv-id`。本项目上游是 cookie SSO → cli-chat-proxy，**不认**这些字段——我们只把 `prompt_cache_key` 当 **本地粘性指纹**，出站前会剥掉。
+> 注意：本项目会把 `prompt_cache_key` 当 **本地粘性指纹**，并保留透传到上游的 `prompt_cache_key` + `x-grok-conv-id`，主动创造 prefix cache 命中条件。是否真正出现 `cached_tokens` 仍取决于上游账号 / 模型。
 
 | 客户端提示 | 行为 |
 |------------|------|
@@ -244,7 +244,7 @@ echo "$GITHUB_TOKEN" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-s
 | Claude Code `metadata.user_id` 内嵌 `session_<uuid>` | 提取为 conversation id（CPA 同款） |
 | Responses `previous_response_id` | 用上轮发出的 `response_id` 找回账号（不再误当 conversation_id） |
 | 显式 `conversation_id` / `x-session-id` / `Session_id` / `x-amp-thread-id` / `x-client-request-id` | 最高优先 |
-| 无任何 session 标识 | messages 内容 hash 兜底（首轮 short / 多轮 full） |
+| 无任何 session 标识 | 稳定 conversation seed 兜底（首 user + 弱 system salt） |
 
 成功响应可观察：
 
@@ -521,7 +521,7 @@ docker-compose.yml                       # redis + postgres（内网）+ app
   - 粘账号冷却时也不再注入链尾；全池冷却时报 `Cooling=N`
   - 回归：`scripts/_test_strict_cooldown_rotation.py`
 - **v1.9.83**
-  - **CPA 风格会话粘性增强**：model 隔离绑定、Claude Code `session_<uuid>` 提取、messages hash 兜底、账号失效清绑定
+  - **CPA 风格会话粘性增强**：model 隔离绑定、Claude Code `session_<uuid>` 提取、稳定 seed 兜底、账号失效清绑定
   - 回归：`scripts/_test_cpa_affinity_improvements.py`
 - **v1.9.82**
   - **Update both-complete 路径纠偏（Claude Code → sub2api）**：两边都是完整 Update/Edit 时，**后到完整参数为准**（`path` 可覆盖错误 `file_path`）；不完整后到仍不能覆盖完整先到

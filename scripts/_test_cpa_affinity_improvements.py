@@ -130,9 +130,12 @@ def test_messages_hash_short_vs_full() -> None:
     fp_full2 = aff.messages_content_fingerprint(m3)
     ok(fp_full2 == fp_full, "system churn does not change full messages hash")
 
-    # conversation_fingerprint falls through to messages hash when no cid/pck/user.
+    # conversation_fingerprint falls through to the stable conversation seed when
+    # no cid/pck/user is present.
     fp_via = aff.conversation_fingerprint(m2)
-    ok(fp_via == fp_full, "conversation_fingerprint uses messages hash fallback")
+    fp_seed = aff.stable_conversation_seed(m2)
+    ok(fp_via == aff.conversation_fingerprint(m1), "seed is stable across turns")
+    ok(fp_seed is not None, f"stable seed={fp_seed}")
 
 
 def test_model_scoped_fingerprint() -> None:
@@ -181,7 +184,7 @@ def test_clear_affinity_for_account() -> None:
 
 
 def test_resolve_responses_messages_hash_source() -> None:
-    print("[resolve_responses source=messages_hash]")
+    print("[resolve_responses source=root]")
     _reset()
     msgs = [
         {"role": "user", "content": "r1"},
@@ -191,11 +194,11 @@ def test_resolve_responses_messages_hash_source() -> None:
     fp, prefer, source = aff.resolve_responses_affinity(msgs, model="grok-x")
     ok(fp is not None, f"fp={fp}")
     ok(prefer is None, "first turn no prefer")
-    ok(source in ("messages_hash_new", "root_new"), f"source={source}")
+    ok(source in ("root_new", "conversation_id_new"), f"source={source}")
     aff.bind_affinity(fp, "acct-1")
     fp2, prefer2, source2 = aff.resolve_responses_affinity(msgs, model="grok-x")
     ok(prefer2 == "acct-1", "sticky hit")
-    ok(source2 in ("messages_hash", "root"), f"hit source={source2}")
+    ok(source2 in ("root", "conversation_id"), f"hit source={source2}")
 
 
 def main() -> int:
