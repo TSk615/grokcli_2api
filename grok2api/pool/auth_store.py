@@ -195,6 +195,10 @@ def _pg_accounts():
     return None
 
 
+def using_postgres() -> bool:
+    return _pg_accounts() is not None
+
+
 def read_auth_map(path: Path | None = None) -> dict[str, Any]:
     path = path or AUTH_FILE
     # PostgreSQL durable backend (multi-worker / multi-host)
@@ -244,9 +248,9 @@ def read_auth_entry(
         pg = _pg_accounts()
         if pg is not None:
             try:
-                hit = pg.read_auth_entry(aid)
-                if hit is not None:
-                    return hit
+                # A PG miss is authoritative. Never fall back to read_auth_map,
+                # which would materialize every credentials payload.
+                return pg.read_auth_entry(aid)
             except Exception:
                 pass  # fall through to full map / file
     data = read_auth_map(path)

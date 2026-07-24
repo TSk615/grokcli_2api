@@ -56,7 +56,7 @@ import grok2api.config as _config
 import grok2api.protocol.history_compact as history_compact
 from grok2api.upstream.models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.9.92"
+APP_VERSION = "1.9.93"
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -450,6 +450,17 @@ def _on_startup() -> None:
     except Exception as e:  # noqa: BLE001
         print(f"  store: status unavailable ({e})")
 
+    try:
+        from grok2api.config import READY_INDEX_MODE
+
+        if READY_INDEX_MODE in ("shadow", "on"):
+            from grok2api.store.ready_redis import ensure_ready_index
+
+            indexed = ensure_ready_index(wait_sec=30.0)
+            print(f"  ready index: mode={READY_INDEX_MODE} accounts={indexed}")
+    except Exception as e:  # noqa: BLE001
+        print(f"  (ready index build skipped: {e})")
+
     # Seed model catalog into PostgreSQL when empty so multi-worker /v1/models
     # reads a shared durable source of truth (no models_cache.json).
     try:
@@ -471,18 +482,24 @@ def _on_startup() -> None:
         print(f"  (models catalog seed skipped: {e})")
 
     try:
-        from grok2api.upstream.oidc_auth import normalize_auth_file_keys
-        from grok2api.pool.auth_store import read_auth_map
+        from grok2api.config import READY_INDEX_MODE
+        from grok2api.pool.auth_store import using_postgres
 
-        r = normalize_auth_file_keys()
-        n_accounts = len(read_auth_map()) if not r.get("total") else int(r.get("total") or 0)
-        if r.get("changed"):
-            print(
-                f"  multi-account: remounted {r['changed']} auth key(s) "
-                f"→ per-user layout (total={r.get('total')})"
-            )
+        if READY_INDEX_MODE == "on" and using_postgres():
+            print("  multi-account: Redis ID index enabled; payloads load lazily")
         else:
-            print(f"  multi-account: {n_accounts} account(s) loaded")
+            from grok2api.upstream.oidc_auth import normalize_auth_file_keys
+            from grok2api.pool.auth_store import read_auth_map
+
+            r = normalize_auth_file_keys()
+            n_accounts = len(read_auth_map()) if not r.get("total") else int(r.get("total") or 0)
+            if r.get("changed"):
+                print(
+                    f"  multi-account: remounted {r['changed']} auth key(s) "
+                    f"→ per-user layout (total={r.get('total')})"
+                )
+            else:
+                print(f"  multi-account: {n_accounts} account(s) loaded")
     except Exception as e:  # noqa: BLE001
         print(f"  (auth normalize skipped: {e})")
 
@@ -490,17 +507,27 @@ def _on_startup() -> None:
     try:
         import time as _time
 
-        from grok2api.pool.auth import list_live_credentials
-        from grok2api.admin.settings_store import get_account_pool_state
         import grok2api.pool.account_pool as _ap
+        from grok2api.config import READY_INDEX_MODE
+        from grok2api.pool.auth_store import using_postgres
 
         t0 = _time.perf_counter()
-        live = list_live_credentials(include_expired=True, auto_refresh=False)
-        _ = get_account_pool_state()
-        chain = _ap.try_acquire_sequence(model=None)
+        if READY_INDEX_MODE == "on" and using_postgres():
+            chain = _ap.try_acquire_sequence(max_attempts=1, model=None)
+            live_count = "indexed"
+        else:
+            from grok2api.pool.auth import list_live_credentials
+            from grok2api.admin.settings_store import get_account_pool_state
+
+            live = list_live_credentials(include_expired=True, auto_refresh=False)
+            _ = get_account_pool_state()
+            chain = _ap.try_acquire_sequence(model=None)
+            live_count = str(len(live))
+        if chain:
+            _ap.release_account_pick(chain[0].auth_key or "")
         dt = int((_time.perf_counter() - t0) * 1000)
         print(
-            f"  pick warmup: live={len(live)} chain={len(chain)} "
+            f"  pick warmup: live={live_count} chain={len(chain)} "
             f"took={dt}ms"
         )
     except Exception as e:  # noqa: BLE001
@@ -2721,6 +2748,11 @@ def _record_usage_safe(
             ttft_ms=ttft_out,
             error=err_out,
             detail=detail_out or None,
+            request_id=(
+                getattr(timing, "req_id", None)
+                if timing is not None
+                else detail_out.get("request_id") or detail_out.get("req_id")
+            ),
         )
     except Exception:
         pass

@@ -9,11 +9,31 @@ import json
 import secrets
 import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 from grok2api.config import ACCOUNT_MODE, ADMIN_PASSWORD, DATA_DIR, SETTINGS_FILE
 
 _lock = threading.RLock()
+_async_pool_state_ctx: ContextVar[bool] = ContextVar(
+    "async_pool_state_writes", default=False
+)
+
+
+@contextmanager
+def async_pool_state_writes():
+    """Queue request-path status patches while keeping control-plane writes sync."""
+    token = _async_pool_state_ctx.set(True)
+    try:
+        yield
+    finally:
+        _async_pool_state_ctx.reset(token)
+
+
+def is_async_pool_state_write() -> bool:
+    """Return whether the current call is part of an async request write path."""
+    return bool(_async_pool_state_ctx.get())
 
 # All modes treat accounts equally — no "primary" account concept.
 VALID_ACCOUNT_MODES = ("round_robin", "random", "least_used")
@@ -95,6 +115,7 @@ _PG_SCALAR_KEYS = (
     "probe_fail_disable_streak",
     "probe_kick_cooldown_sec",
     "max_failover_attempts",
+    "usage_capture",
     # Protocol registration (MoeMail / YesCaptcha / proxy) — admin UI config
     "registration_config",
     # Outbound proxy pool for account-pool traffic (chat / probe / refresh)
@@ -717,6 +738,21 @@ def patch_account_pool_meta(account_id: str, patch: dict[str, Any]) -> dict[str,
         return {}
     if not isinstance(patch, dict) or not patch:
         return {}
+    try:
+        from grok2api.config import ASYNC_ACCOUNT_STATE
+        from grok2api.store.events_redis import publish_account_state
+        from grok2api.store.ready_redis import status_key
+        from grok2api.store.redis_client import get_json, redis_enabled
+
+        if ASYNC_ACCOUNT_STATE and _async_pool_state_ctx.get() and redis_enabled():
+            event_id, seq = publish_account_state(account_id, patch)
+            if event_id:
+                hot = get_json(status_key(account_id))
+                if isinstance(hot, dict):
+                    return hot
+                return {**patch, "state_version": seq}
+    except Exception:
+        pass
     pg = _pg_settings()
     if pg is not None:
         try:
@@ -726,6 +762,12 @@ def patch_account_pool_meta(account_id: str, patch: dict[str, Any]) -> dict[str,
                 pool = data.setdefault("account_pool", {})
                 if isinstance(pool, dict):
                     pool[account_id] = meta
+            try:
+                from grok2api.store.ready_redis import sync_account
+
+                sync_account(account_id, meta)
+            except Exception:
+                pass
             return meta
         except Exception:
             # Fall through to file/memory so status is never silently dropped.
@@ -855,6 +897,38 @@ def touch_account_stats(
                 last_status_code=None if (success and preserve_cooldown) else last_status_code,
                 cooldown_sec=None if preserve_cooldown else cooldown_sec,
             )
+    except Exception:
+        pass
+
+    # Failure status fields must remain durable too. Request paths are inside
+    # async_pool_state_writes(), so this publishes a versioned state event;
+    # probes/admin paths keep their synchronous control-plane write.
+    if not success:
+        state_patch = {k: v for k, v in durable_patch.items() if k != "last_used_at"}
+        if state_patch:
+            try:
+                patch_account_pool_meta(account_id, state_patch)
+            except Exception:
+                pass
+
+    # Normal request statistics are eventually durable. Redis is the hot
+    # source and the writer applies additive deltas without request-time row
+    # locks. If enqueue fails, continue into the legacy synchronous PG path.
+    try:
+        from grok2api.config import ASYNC_ACCOUNT_STATS
+        from grok2api.store.events_redis import publish_account_stats
+        from grok2api.store.pool_redis import get_stats
+        from grok2api.store.redis_client import redis_enabled
+
+        if ASYNC_ACCOUNT_STATS and redis_enabled():
+            event_id = publish_account_stats(
+                account_id,
+                success=bool(success),
+                occurred_at=now,
+            )
+            if event_id:
+                hot = get_stats(account_id)
+                return hot if isinstance(hot, dict) else durable_patch
     except Exception:
         pass
 
@@ -3225,6 +3299,8 @@ def update_runtime_settings(patch: dict[str, Any]) -> dict[str, Any]:
         set_probe_models(patch["probe_models"])
     if "default_model" in patch and patch["default_model"] is not None:
         set_default_model_setting(str(patch["default_model"]))
+    if "usage_capture" in patch and patch["usage_capture"] is not None:
+        set_usage_capture(patch["usage_capture"])
     if "account_mode" in patch and patch["account_mode"] is not None:
         set_account_mode(str(patch["account_mode"]))
     if "token_maintain_enabled" in patch and patch["token_maintain_enabled"] is not None:
@@ -3329,6 +3405,7 @@ def get_public_settings() -> dict[str, Any]:
             "has_management_key": False,
         }
     pool_policy = get_pool_policy()
+    usage_capture = get_usage_capture()
 
     return {
         "account_mode": get_account_mode(),
@@ -3362,6 +3439,7 @@ def get_public_settings() -> dict[str, Any]:
         "model_health_auto_disable": get_model_health_auto_disable(),
         "probe_models": get_probe_models(),
         "default_model": get_default_model_setting(),
+        "usage_capture": usage_capture,
         # Expose both nested and flat policy fields. Older UI/builds read the
         # flat keys directly; current UI prefers pool_policy.
         **pool_policy,
@@ -3373,3 +3451,59 @@ def get_public_settings() -> dict[str, Any]:
         "cliproxyapi_config": cliproxyapi_pub,
         "updated_at": data.get("updated_at"),
     }
+
+
+def get_usage_capture() -> dict[str, Any]:
+    """Return bounded usage detail capture policy for gateway workers."""
+    raw = _get_setting_value("usage_capture", None)
+    if not isinstance(raw, dict):
+        raw = {}
+    try:
+        from grok2api.config import USAGE_EVENT_SAMPLE_RATE, USAGE_SLOW_MS
+
+        sample_default = USAGE_EVENT_SAMPLE_RATE
+        slow_default = USAGE_SLOW_MS
+    except Exception:
+        sample_default = 0.05
+        slow_default = 5000
+    try:
+        sample = max(0.0, min(1.0, float(raw.get("sample_rate", sample_default))))
+    except (TypeError, ValueError):
+        sample = sample_default
+    try:
+        slow_ms = max(0, min(86_400_000, int(raw.get("slow_ms", slow_default))))
+    except (TypeError, ValueError):
+        slow_ms = slow_default
+    audit_until = raw.get("audit_until")
+    try:
+        audit_until = float(audit_until) if audit_until is not None else 0.0
+    except (TypeError, ValueError):
+        audit_until = 0.0
+    key_ids = raw.get("audit_key_ids")
+    if not isinstance(key_ids, list):
+        key_ids = []
+    return {
+        "sample_rate": sample,
+        "all_failures": bool(raw.get("all_failures", True)),
+        "slow_ms": slow_ms,
+        "audit_until": audit_until,
+        "audit_key_ids": [str(x) for x in key_ids if str(x).strip()][:500],
+    }
+
+
+def set_usage_capture(patch: dict[str, Any]) -> dict[str, Any]:
+    """Merge and persist usage detail capture policy."""
+    if not isinstance(patch, dict):
+        raise ValueError("usage_capture must be an object")
+    current = get_usage_capture()
+    current.update(patch)
+    # Reuse the same normalization by temporarily writing only the bounded
+    # values; the next read applies all clamps and defaults.
+    current["sample_rate"] = max(0.0, min(1.0, float(current.get("sample_rate", 0.05))))
+    current["slow_ms"] = max(0, min(86_400_000, int(current.get("slow_ms", 5000))))
+    current["all_failures"] = bool(current.get("all_failures", True))
+    current["audit_until"] = float(current.get("audit_until") or 0)
+    ids = current.get("audit_key_ids")
+    current["audit_key_ids"] = [str(x) for x in ids] if isinstance(ids, list) else []
+    _set_setting_value("usage_capture", current)
+    return get_usage_capture()

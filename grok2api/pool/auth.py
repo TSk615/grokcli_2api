@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from grok2api.pool.auth_store import read_auth_entry, read_auth_map
+from grok2api.pool.auth_store import read_auth_entry, read_auth_map, using_postgres
 from grok2api.config import (
     AUTH_FILE,
     CLI_VERSION,
@@ -333,6 +333,8 @@ def peek_credentials_by_id(
     except Exception:
         hit = None
     if hit is None:
+        if using_postgres():
+            return None
         # Last resort: full map (file backend / cold PG cache).
         try:
             data = _read_auth(path)
@@ -375,6 +377,8 @@ def load_credentials_by_id(account_id: str, path: Path | None = None) -> GrokCre
     if hit is not None:
         account_id, entry = hit
     else:
+        if using_postgres():
+            raise AuthError(f"Account not found: {account_id}")
         data = _read_auth(path)
         entry = data.get(account_id)
         if not isinstance(entry, dict):

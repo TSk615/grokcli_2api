@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections import OrderedDict
 from typing import Any, Callable
 
 from grok2api.store.pg import _ts, _unix, connection, json_dump, pg_enabled
@@ -38,10 +39,51 @@ _auth_map_cache: dict[str, Any] | None = None
 _auth_map_cache_at = 0.0
 _auth_map_cache_lock = threading.RLock()
 _AUTH_MAP_CACHE_TTL = 2.0
+_entry_cache: OrderedDict[str, tuple[float, str, dict[str, Any]]] = OrderedDict()
+
+
+def _entry_cache_limits() -> tuple[int, float]:
+    try:
+        from grok2api.config import (
+            ACCOUNT_PAYLOAD_CACHE_SIZE,
+            ACCOUNT_PAYLOAD_CACHE_TTL_SEC,
+        )
+
+        return int(ACCOUNT_PAYLOAD_CACHE_SIZE), float(ACCOUNT_PAYLOAD_CACHE_TTL_SEC)
+    except Exception:
+        return 2048, 600.0
 
 
 def enabled() -> bool:
     return pg_enabled()
+
+
+def _sync_ready_account(account_id: str, entry: dict[str, Any]) -> None:
+    try:
+        from grok2api.config import READY_INDEX_MODE
+
+        if READY_INDEX_MODE == "off":
+            return
+        from grok2api.upstream.oidc_auth import parse_expires_at
+        from grok2api.store.ready_redis import get_status, sync_account
+
+        token = entry.get("key") or entry.get("access_token") or entry.get("token")
+        meta = get_status(account_id)
+        if not meta:
+            try:
+                from grok2api.store.settings_pg import get_pool_meta
+
+                meta = get_pool_meta(account_id)
+            except Exception:
+                meta = {}
+        if not meta:
+            meta = {"enabled": True, "pool_status": "normal", "state_version": 0}
+        meta["expires_at"] = parse_expires_at(
+            entry.get("expires_at"), token if isinstance(token, str) else None
+        )
+        sync_account(account_id, meta)
+    except Exception:
+        pass
 
 
 def invalidate_auth_map_cache() -> None:
@@ -49,6 +91,26 @@ def invalidate_auth_map_cache() -> None:
     with _auth_map_cache_lock:
         _auth_map_cache = None
         _auth_map_cache_at = 0.0
+        _entry_cache.clear()
+
+
+def invalidate_auth_entry_cache(account_id: str) -> None:
+    """Invalidate one lazy payload while dropping any obsolete full-map snapshot."""
+    global _auth_map_cache, _auth_map_cache_at
+    aid = str(account_id or "").strip()
+    with _auth_map_cache_lock:
+        _auth_map_cache = None
+        _auth_map_cache_at = 0.0
+        if not aid:
+            return
+        for cache_key, (_at, resolved_id, payload) in list(_entry_cache.items()):
+            if (
+                cache_key == aid
+                or resolved_id == aid
+                or payload.get("user_id") == aid
+                or payload.get("principal_id") == aid
+            ):
+                _entry_cache.pop(cache_key, None)
 
 
 def read_auth_map() -> dict[str, Any]:
@@ -94,6 +156,15 @@ def read_auth_entry(account_id: str) -> tuple[str, dict[str, Any]] | None:
     if not aid:
         return None
     now = time.time()
+    max_entries, ttl = _entry_cache_limits()
+    with _auth_map_cache_lock:
+        cached_entry = _entry_cache.get(aid)
+        if cached_entry is not None:
+            cached_at, resolved_id, payload = cached_entry
+            if now - cached_at < ttl:
+                _entry_cache.move_to_end(aid)
+                return resolved_id, dict(payload)
+            _entry_cache.pop(aid, None)
     with _auth_map_cache_lock:
         if (
             _auth_map_cache is not None
@@ -138,6 +209,13 @@ def read_auth_entry(account_id: str) -> tuple[str, dict[str, Any]] | None:
     decoded = _decode_payload(payload)
     if not isinstance(decoded, dict):
         return None
+    if max_entries > 0:
+        with _auth_map_cache_lock:
+            _entry_cache[aid] = (time.time(), rid, dict(decoded))
+            _entry_cache[rid] = (time.time(), rid, dict(decoded))
+            _entry_cache.move_to_end(rid)
+            while len(_entry_cache) > max_entries:
+                _entry_cache.popitem(last=False)
     return rid, decoded
 
 
@@ -481,6 +559,14 @@ def write_auth_map(data: dict[str, Any]) -> None:
                 cur.execute("DELETE FROM account_pool WHERE account_id = %s", (aid,))
         conn.commit()
     invalidate_auth_map_cache()
+    try:
+        from grok2api.config import READY_INDEX_MODE
+        from grok2api.store.ready_redis import rebuild_ready_index
+
+        if READY_INDEX_MODE != "off":
+            rebuild_ready_index()
+    except Exception:
+        pass
 
 
 def mutate_auth_map(mutator: Callable[[dict[str, Any]], Any]) -> dict[str, Any]:
@@ -522,7 +608,8 @@ def upsert_account(account_id: str, entry: dict[str, Any]) -> None:
         with conn.cursor() as cur:
             _upsert_one(cur, account_id, entry)
         conn.commit()
-    invalidate_auth_map_cache()
+    invalidate_auth_entry_cache(account_id)
+    _sync_ready_account(account_id, entry)
 
 
 def upsert_account_merged(
@@ -622,6 +709,7 @@ def upsert_account_merged(
             _upsert_one(cur, account_id, entry)
         conn.commit()
     invalidate_auth_map_cache()
+    _sync_ready_account(account_id, entry)
     return account_id
 
 
@@ -635,7 +723,13 @@ def delete_account(account_id: str) -> bool:
             cur.execute("DELETE FROM account_pool WHERE account_id = %s", (account_id,))
         conn.commit()
     if deleted:
-        invalidate_auth_map_cache()
+        invalidate_auth_entry_cache(account_id)
+        try:
+            from grok2api.store.ready_redis import remove
+
+            remove(account_id)
+        except Exception:
+            pass
     return deleted
 
 

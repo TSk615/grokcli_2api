@@ -109,6 +109,7 @@ _POOL_CORE_KEYS = frozenset(
         "cooldown_tokens_actual",
         "cooldown_tokens_limit",
         "last_probe_status",
+        "state_version",
     }
 )
 
@@ -154,7 +155,7 @@ _POOL_SELECT_COLS = """
     last_used_at, last_error, cooldown_until, extra,
     pool_status, cooldown_count, cooldown_reason, cooldown_code,
     cooldown_model, cooldown_tokens_actual, cooldown_tokens_limit,
-    last_probe_status
+    last_probe_status, state_version
 """
 
 
@@ -213,6 +214,11 @@ def _row_to_meta(r) -> dict[str, Any]:
             meta["cooldown_tokens_limit"] = r[23]
     if len(r) > 24 and r[24] is not None:
         meta["last_probe_status"] = r[24]
+    if len(r) > 25 and r[25] is not None:
+        try:
+            meta["state_version"] = int(r[25] or 0)
+        except (TypeError, ValueError):
+            meta["state_version"] = 0
     # Normalize computed view flags from durable DB fields only.
     try:
         cd = int(meta.get("cooldown_count") or 0)
@@ -555,12 +561,75 @@ def patch_pool_meta(account_id: str, patch: dict[str, Any]) -> dict[str, Any]:
                     meta.pop(k, None)
                 else:
                     meta[k] = v
+            current_version = int(meta.get("state_version") or 0)
+            try:
+                from grok2api.store.events_redis import next_state_sequence
+
+                redis_version = int(next_state_sequence(account_id) or 0)
+            except Exception:
+                redis_version = 0
+            meta["state_version"] = max(current_version + 1, redis_version)
             # Status is computed from durable fields already on this account row.
             meta["pool_status"] = _derive_pool_status(meta)
             _upsert_pool(cur, account_id, meta, preserve_active_cooldown=False)
         conn.commit()
     invalidate_pool_state_cache()
     return meta
+
+
+def apply_pool_state_event(
+    cur,
+    account_id: str,
+    patch: dict[str, Any],
+    state_version: int,
+) -> bool:
+    """Apply one queued state patch inside the writer transaction.
+
+    The upsert is guarded by the durable version so a delayed request failure
+    cannot overwrite a later probe or admin action.
+    """
+    if not account_id or not isinstance(patch, dict):
+        return False
+    cur.execute(
+        f"""
+        SELECT {_POOL_SELECT_COLS}
+        FROM account_pool WHERE account_id = %s
+        FOR UPDATE
+        """,
+        (account_id,),
+    )
+    row = cur.fetchone()
+    if row:
+        meta = _row_to_meta(row)
+    else:
+        meta = {
+            "enabled": True,
+            "weight": 1,
+            "blocked_models": {},
+            "pool_status": "normal",
+            "cooldown_count": 0,
+            "state_version": 0,
+        }
+    current_version = int(meta.get("state_version") or 0)
+    version = max(0, int(state_version or 0))
+    if version <= current_version:
+        return False
+    for key, value in patch.items():
+        if value is None:
+            meta.pop(key, None)
+        else:
+            meta[key] = value
+    meta["state_version"] = version
+    meta["pool_status"] = _derive_pool_status(meta)
+    _upsert_pool(
+        cur,
+        account_id,
+        meta,
+        preserve_active_cooldown=False,
+        only_if_newer=True,
+        preserve_counters=True,
+    )
+    return True
 
 
 def _derive_pool_status(meta: dict[str, Any]) -> str:
@@ -632,6 +701,8 @@ def _upsert_pool(
     meta: dict[str, Any],
     *,
     preserve_active_cooldown: bool = False,
+    only_if_newer: bool = False,
+    preserve_counters: bool = False,
 ) -> None:
     blocked = meta.get("blocked_models") or {}
     if not isinstance(blocked, dict):
@@ -719,11 +790,11 @@ def _upsert_pool(
           cooldown_until, extra, updated_at,
           pool_status, cooldown_count, cooldown_reason, cooldown_code,
           cooldown_model, cooldown_tokens_actual, cooldown_tokens_limit,
-          last_probe_status
+          last_probe_status, state_version
         ) VALUES (
           %s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,
           %s,%s,%s,%s,%s,%s,%s::jsonb, now(),
-          %s,%s,%s,%s,%s,%s,%s,%s
+          %s,%s,%s,%s,%s,%s,%s,%s,%s
         )
         ON CONFLICT (account_id) DO UPDATE SET
           enabled = EXCLUDED.enabled,
@@ -735,10 +806,12 @@ def _upsert_pool(
           last_quota = EXCLUDED.last_quota,
           last_probe = EXCLUDED.last_probe,
           blocked_models = EXCLUDED.blocked_models,
-          request_count = EXCLUDED.request_count,
-          success_count = EXCLUDED.success_count,
-          fail_count = EXCLUDED.fail_count,
-          last_used_at = EXCLUDED.last_used_at,
+          request_count = CASE WHEN %s THEN account_pool.request_count ELSE EXCLUDED.request_count END,
+          success_count = CASE WHEN %s THEN account_pool.success_count ELSE EXCLUDED.success_count END,
+          fail_count = CASE WHEN %s THEN account_pool.fail_count ELSE EXCLUDED.fail_count END,
+          last_used_at = CASE WHEN %s
+            THEN GREATEST(account_pool.last_used_at, EXCLUDED.last_used_at)
+            ELSE EXCLUDED.last_used_at END,
           last_error = EXCLUDED.last_error,
           cooldown_until = CASE
             WHEN EXCLUDED.cooldown_until IS NOT NULL THEN EXCLUDED.cooldown_until
@@ -756,7 +829,9 @@ def _upsert_pool(
           cooldown_tokens_actual = EXCLUDED.cooldown_tokens_actual,
           cooldown_tokens_limit = EXCLUDED.cooldown_tokens_limit,
           last_probe_status = EXCLUDED.last_probe_status,
+          state_version = GREATEST(account_pool.state_version, EXCLUDED.state_version),
           updated_at = now()
+        WHERE (NOT %s) OR account_pool.state_version < EXCLUDED.state_version
         """,
         (
             account_id,
@@ -784,6 +859,12 @@ def _upsert_pool(
             meta.get("cooldown_tokens_actual"),
             meta.get("cooldown_tokens_limit"),
             meta.get("last_probe_status"),
+            int(meta.get("state_version") or 0),
+            bool(preserve_counters),
+            bool(preserve_counters),
+            bool(preserve_counters),
+            bool(preserve_counters),
             bool(preserve_active_cooldown),
+            bool(only_if_newer),
         ),
     )

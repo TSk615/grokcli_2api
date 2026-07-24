@@ -8,9 +8,20 @@ services:
   redis:
     image: redis:7-alpine
     container_name: grokcli-2api-lite-redis
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    command:
+      [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "everysec",
+        "--maxmemory-policy",
+        "noeviction",
+      ]
     environment:
       TZ: "${TZ:-Asia/Shanghai}"
+    volumes:
+      - grok2api_lite_redis:/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -61,6 +72,12 @@ services:
       GROK2API_STORE_BACKEND: "hybrid"
       # Multi-worker: default 2 (enough for hybrid; override via .env for large hosts)
       GROK2API_WORKERS: "${GROK2API_WORKERS:-2}"
+      GROK2API_ASYNC_ACCOUNT_STATS: "${GROK2API_ASYNC_ACCOUNT_STATS:-1}"
+      GROK2API_ASYNC_ACCOUNT_STATE: "${GROK2API_ASYNC_ACCOUNT_STATE:-1}"
+      GROK2API_ASYNC_USAGE: "${GROK2API_ASYNC_USAGE:-1}"
+      GROK2API_USAGE_EVENT_SAMPLE_RATE: "${GROK2API_USAGE_EVENT_SAMPLE_RATE:-0.05}"
+      GROK2API_READY_INDEX_MODE: "${GROK2API_READY_INDEX_MODE:-shadow}"
+      GROK2API_MAX_ACCOUNT_INFLIGHT: "${GROK2API_MAX_ACCOUNT_INFLIGHT:-2}"
       # In-stack service DNS (do not use 127.0.0.1 here)
       REDIS_URL: "redis://redis:6379/0"
       GROK2API_REDIS_URL: "redis://redis:6379/0"
@@ -87,8 +104,38 @@ services:
           - grokcli-2api-lite
     restart: unless-stopped
 
+  writer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: grokcli-2api-lite:local
+    container_name: grokcli-2api-lite-writer
+    env_file:
+      - path: .env
+        required: false
+    command: ["python", "-m", "grok2api.writer"]
+    environment:
+      TZ: "${TZ:-Asia/Shanghai}"
+      GROK2API_STORE_BACKEND: "hybrid"
+      GROK2API_WORKERS: "1"
+      REDIS_URL: "redis://redis:6379/0"
+      GROK2API_REDIS_URL: "redis://redis:6379/0"
+      DATABASE_URL: "postgresql://grok2api:grok2api@postgres:5432/grok2api"
+      GROK2API_DATABASE_URL: "postgresql://grok2api:grok2api@postgres:5432/grok2api"
+      GROK2API_WRITER_BATCH_SIZE: "${GROK2API_WRITER_BATCH_SIZE:-500}"
+      GROK2API_WRITER_FLUSH_SEC: "${GROK2API_WRITER_FLUSH_SEC:-1}"
+      GROK2API_WRITER_MAX_RETRIES: "${GROK2API_WRITER_MAX_RETRIES:-8}"
+      GROK2API_USAGE_EVENT_RETENTION_DAYS: "${GROK2API_USAGE_EVENT_RETENTION_DAYS:-30}"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   grok2api_lite_pg:
+  grok2api_lite_redis:
 
 # Fixed project network name so other compose stacks can join as external:
 #   networks:

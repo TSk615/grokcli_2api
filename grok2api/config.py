@@ -313,6 +313,58 @@ MAINTAINER_LEADER = (os.getenv("GROK2API_MAINTAINER_LEADER") or "auto").strip().
 
 # Redis key namespace prefix (all g2a:* keys).
 REDIS_KEY_PREFIX = (os.getenv("GROK2API_REDIS_PREFIX") or "g2a").strip() or "g2a"
+
+# Async write pipeline. Gateway workers keep only Redis operations on the
+# finished-request hot path; the dedicated writer persists batches to PG.
+ASYNC_ACCOUNT_STATS = _env_truthy("GROK2API_ASYNC_ACCOUNT_STATS", "1")
+ASYNC_ACCOUNT_STATE = _env_truthy("GROK2API_ASYNC_ACCOUNT_STATE", "1")
+ASYNC_USAGE = _env_truthy("GROK2API_ASYNC_USAGE", "1")
+WRITER_BATCH_SIZE = max(
+    1, min(5000, int(os.getenv("GROK2API_WRITER_BATCH_SIZE", "500") or 500))
+)
+WRITER_FLUSH_SEC = max(
+    0.1, min(5.0, float(os.getenv("GROK2API_WRITER_FLUSH_SEC", "1") or 1))
+)
+WRITER_MAX_RETRIES = max(
+    1, min(100, int(os.getenv("GROK2API_WRITER_MAX_RETRIES", "8") or 8))
+)
+USAGE_EVENT_SAMPLE_RATE = max(
+    0.0,
+    min(
+        1.0,
+        float(os.getenv("GROK2API_USAGE_EVENT_SAMPLE_RATE", "0.05") or 0.05),
+    ),
+)
+USAGE_SLOW_MS = max(
+    0, int(os.getenv("GROK2API_USAGE_SLOW_MS", "5000") or 5000)
+)
+USAGE_EVENT_RETENTION_DAYS = max(
+    1, int(os.getenv("GROK2API_USAGE_EVENT_RETENTION_DAYS", "30") or 30)
+)
+
+# Redis ready-index rollout: off keeps the legacy selector, shadow maintains the
+# index without selecting from it, and on uses the index for request picks.
+READY_INDEX_MODE = (
+    os.getenv("GROK2API_READY_INDEX_MODE", "shadow") or "shadow"
+).strip().lower()
+if READY_INDEX_MODE not in ("off", "shadow", "on"):
+    READY_INDEX_MODE = "shadow"
+MAX_ACCOUNT_INFLIGHT = max(
+    1, min(64, int(os.getenv("GROK2API_MAX_ACCOUNT_INFLIGHT", "2") or 2))
+)
+ACCOUNT_LEASE_TTL_SEC = max(
+    10, min(3600, int(os.getenv("GROK2API_ACCOUNT_LEASE_TTL_SEC", "90") or 90))
+)
+ACCOUNT_PAYLOAD_CACHE_SIZE = max(
+    0, min(20_000, int(os.getenv("GROK2API_ACCOUNT_PAYLOAD_CACHE_SIZE", "2048") or 2048))
+)
+ACCOUNT_PAYLOAD_CACHE_TTL_SEC = max(
+    1.0,
+    min(
+        3600.0,
+        float(os.getenv("GROK2API_ACCOUNT_PAYLOAD_CACHE_TTL_SEC", "600") or 600),
+    ),
+)
 # Leader lock TTL / renew interval (seconds).
 MAINTAINER_LEADER_TTL = _env_float(
     "GROK2API_MAINTAINER_LEADER_TTL", 30.0, minimum=5.0

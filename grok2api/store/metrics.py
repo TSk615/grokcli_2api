@@ -61,6 +61,12 @@ def prometheus_text() -> str:
         data["g2a_is_leader"] = 1.0 if ls.get("is_leader") else 0.0
     except Exception:
         pass
+    try:
+        from grok2api.store.events_redis import writer_metrics
+
+        data.update(writer_metrics())
+    except Exception:
+        pass
     for k, v in sorted(data.items()):
         lines.append(f"# TYPE {k} gauge")
         lines.append(f"{k} {v}")

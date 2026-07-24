@@ -1,11 +1,6 @@
 name: Build and push GHCR
 
 on:
-  push:
-    branches: [main]
-    tags: ["v*"]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -27,7 +22,7 @@ jobs:
       - name: Lowercase image name
         run: |
           set -euo pipefail
-          # github.repository may preserve owner casing (e.g. HM2899/...); Docker requires lowercase
+          # github.repository may preserve owner casing; Docker requires lowercase
           echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
           echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}"
 

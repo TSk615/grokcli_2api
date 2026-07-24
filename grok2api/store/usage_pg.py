@@ -46,11 +46,34 @@ def _day_from_ts(ts: float | None = None) -> date:
     return datetime.fromtimestamp(float(ts or time.time()), tz=timezone.utc).date()
 
 
+def ensure_event_partition(cur: Any, ts: float | None = None) -> str:
+    """Create the UTC month partition needed by one detail event."""
+    dt = datetime.fromtimestamp(float(ts or time.time()), tz=timezone.utc)
+    start = datetime(dt.year, dt.month, 1, tzinfo=timezone.utc)
+    if dt.month == 12:
+        end = datetime(dt.year + 1, 1, 1, tzinfo=timezone.utc)
+    else:
+        end = datetime(dt.year, dt.month + 1, 1, tzinfo=timezone.utc)
+    table = f"usage_events_y{dt.year:04d}m{dt.month:02d}"
+    cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (table,))
+    cur.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {table}
+        PARTITION OF usage_events_partitioned
+        FOR VALUES FROM ('{start.isoformat()}') TO ('{end.isoformat()}')
+        """
+    )
+    return table
+
+
 def record(
     *,
     prompt_tokens: int = 0,
     completion_tokens: int = 0,
     total_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    cache_creation_tokens: int = 0,
+    reasoning_tokens: int = 0,
     ok: bool = True,
     api_key_id: str | None = None,
     account_id: str | None = None,
@@ -64,6 +87,9 @@ def record(
     pt = max(0, int(prompt_tokens or 0))
     ct = max(0, int(completion_tokens or 0))
     tt = max(0, int(total_tokens or 0))
+    cr = max(0, int(cache_read_tokens or 0))
+    cc = max(0, int(cache_creation_tokens or 0))
+    rt = max(0, int(reasoning_tokens or 0))
     if tt <= 0:
         tt = pt + ct
     req = 1
@@ -71,7 +97,8 @@ def record(
     fail = 0 if ok else 1
     # Only count tokens on success (failed upstream often has no usage).
     if not ok:
-        pt = ct = tt = 0
+        pt = ct = tt = cr = cc = rt = 0
+    cache_hit = 1 if ok and cr > 0 else 0
 
     dims: list[tuple[str, str]] = [("global", "")]
     if api_key_id:
@@ -91,11 +118,14 @@ def record(
                           day, dim, dim_id,
                           requests, success, fail,
                           prompt_tokens, completion_tokens, total_tokens,
+                          cache_read_tokens, cache_creation_tokens, reasoning_tokens,
+                          cache_hit_requests,
                           updated_at
                         ) VALUES (
                           %s, %s, %s,
                           %s, %s, %s,
                           %s, %s, %s,
+                          %s, %s, %s, %s,
                           now()
                         )
                         ON CONFLICT (day, dim, dim_id) DO UPDATE SET
@@ -105,9 +135,13 @@ def record(
                           prompt_tokens = usage_daily.prompt_tokens + EXCLUDED.prompt_tokens,
                           completion_tokens = usage_daily.completion_tokens + EXCLUDED.completion_tokens,
                           total_tokens = usage_daily.total_tokens + EXCLUDED.total_tokens,
+                          cache_read_tokens = usage_daily.cache_read_tokens + EXCLUDED.cache_read_tokens,
+                          cache_creation_tokens = usage_daily.cache_creation_tokens + EXCLUDED.cache_creation_tokens,
+                          reasoning_tokens = usage_daily.reasoning_tokens + EXCLUDED.reasoning_tokens,
+                          cache_hit_requests = usage_daily.cache_hit_requests + EXCLUDED.cache_hit_requests,
                           updated_at = now()
                         """,
-                        (day, dim, dim_id, req, suc, fail, pt, ct, tt),
+                        (day, dim, dim_id, req, suc, fail, pt, ct, tt, cr, cc, rt, cache_hit),
                     )
                 # Lifetime columns on keys / accounts (success tokens only).
                 if ok and api_key_id and (pt or ct or tt):
@@ -382,6 +416,8 @@ def record_event(
     error: str | None = None,
     detail: dict[str, Any] | None = None,
     ts: float | None = None,
+    event_id: str | None = None,
+    capture_reason: str | None = None,
 ) -> int | None:
     """Insert one per-request usage event. Best-effort; returns id or None."""
     if not enabled():
@@ -431,26 +467,28 @@ def record_event(
     try:
         with connection() as conn:
             with conn.cursor() as cur:
+                ensure_event_partition(cur, ts)
                 cur.execute(
                     f"""
-                    INSERT INTO usage_events (
-                      created_at,
+                    INSERT INTO usage_events_partitioned (
+                      event_id, created_at,
                       api_key_id, account_id, model, protocol, path, stream, ok,
                       prompt_tokens, completion_tokens, total_tokens,
                       cache_read_tokens, cache_creation_tokens, reasoning_tokens,
                       client_ip, user_agent, status_code, latency_ms, ttft_ms,
-                      error, detail
+                      error, capture_reason, detail
                     ) VALUES (
-                      {created_expr},
+                      %s, {created_expr},
                       %s, %s, %s, %s, %s, %s, %s,
                       %s, %s, %s,
                       %s, %s, %s,
                       %s, %s, %s, %s, %s,
-                      %s, %s::jsonb
+                      %s, %s, %s::jsonb
                     )
                     RETURNING id
                     """,
                     (
+                        (str(event_id)[:128] if event_id else None),
                         *params_extra,
                         (str(api_key_id)[:256] if api_key_id else None),
                         (str(account_id)[:256] if account_id else None),
@@ -471,6 +509,7 @@ def record_event(
                         (int(lat_out) if lat_out is not None else None),
                         (int(ttft_out) if ttft_out is not None else None),
                         (str(error)[:500] if error else None),
+                        (str(capture_reason)[:80] if capture_reason else None),
                         json_dump(payload),
                     ),
                 )
@@ -489,8 +528,7 @@ def cache_aggregate(*, days: int | None = 7) -> dict[str, Any]:
       - last N days window (when days is set)
       - lifetime (all rows)
 
-    Source of truth is per-request ``usage_events`` (has cache_read_tokens).
-    Daily rollups intentionally do not store cache fields.
+    Source of truth is the full daily rollup. ``usage_events`` may be sampled.
     """
     empty_bucket = {
         "prompt_tokens": 0,
@@ -543,11 +581,10 @@ def cache_aggregate(*, days: int | None = 7) -> dict[str, Any]:
                       COALESCE(SUM(prompt_tokens), 0),
                       COALESCE(SUM(cache_read_tokens), 0),
                       COALESCE(SUM(cache_creation_tokens), 0),
-                      COALESCE(COUNT(*) FILTER (WHERE ok IS TRUE), 0),
-                      COALESCE(COUNT(*) FILTER (
-                        WHERE ok IS TRUE AND cache_read_tokens > 0
-                      ), 0)
-                    FROM usage_events
+                      COALESCE(SUM(success), 0),
+                      COALESCE(SUM(cache_hit_requests), 0)
+                    FROM usage_daily
+                    WHERE dim = 'global'
                     """
                 )
                 out["lifetime"] = _bucket_from_row(cur.fetchone())
@@ -559,13 +596,11 @@ def cache_aggregate(*, days: int | None = 7) -> dict[str, Any]:
                       COALESCE(SUM(prompt_tokens), 0),
                       COALESCE(SUM(cache_read_tokens), 0),
                       COALESCE(SUM(cache_creation_tokens), 0),
-                      COALESCE(COUNT(*) FILTER (WHERE ok IS TRUE), 0),
-                      COALESCE(COUNT(*) FILTER (
-                        WHERE ok IS TRUE AND cache_read_tokens > 0
-                      ), 0)
-                    FROM usage_events
-                    WHERE created_at >= date_trunc('day', now() AT TIME ZONE 'UTC')
-                          AT TIME ZONE 'UTC'
+                      COALESCE(SUM(success), 0),
+                      COALESCE(SUM(cache_hit_requests), 0)
+                    FROM usage_daily
+                    WHERE dim = 'global'
+                      AND day = (now() AT TIME ZONE 'UTC')::date
                     """
                 )
                 out["today"] = _bucket_from_row(cur.fetchone())
@@ -577,15 +612,11 @@ def cache_aggregate(*, days: int | None = 7) -> dict[str, Any]:
                       COALESCE(SUM(prompt_tokens), 0),
                       COALESCE(SUM(cache_read_tokens), 0),
                       COALESCE(SUM(cache_creation_tokens), 0),
-                      COALESCE(COUNT(*) FILTER (WHERE ok IS TRUE), 0),
-                      COALESCE(COUNT(*) FILTER (
-                        WHERE ok IS TRUE AND cache_read_tokens > 0
-                      ), 0)
-                    FROM usage_events
-                    WHERE created_at >= (
-                      date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
-                      - (%s::int - 1) * INTERVAL '1 day'
-                    )
+                      COALESCE(SUM(success), 0),
+                      COALESCE(SUM(cache_hit_requests), 0)
+                    FROM usage_daily
+                    WHERE dim = 'global'
+                      AND day >= (now() AT TIME ZONE 'UTC')::date - (%s::int - 1)
                     """,
                     (n,),
                 )
@@ -683,7 +714,7 @@ def list_events(
     try:
         with connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(f"SELECT COUNT(*) FROM usage_events{wh}", params)
+                cur.execute(f"SELECT COUNT(*) FROM usage_events_all{wh}", params)
                 total = int((cur.fetchone() or [0])[0] or 0)
                 total_pages = max(1, (total + size_i - 1) // size_i) if total else 1
                 page_i = min(page_i, total_pages)
@@ -695,8 +726,8 @@ def list_events(
                            prompt_tokens, completion_tokens, total_tokens,
                            cache_read_tokens, cache_creation_tokens, reasoning_tokens,
                            client_ip, user_agent, status_code, latency_ms, ttft_ms,
-                           error, detail
-                    FROM usage_events
+                           error, detail, event_id, capture_reason
+                    FROM usage_events_all
                     {wh}
                     ORDER BY created_at DESC, id DESC
                     LIMIT %s OFFSET %s
@@ -762,6 +793,8 @@ def list_events(
                 "ttft_ms": ttft_val,
                 "error": r[20],
                 "detail": detail if isinstance(detail, dict) else {},
+                "event_id": r[22],
+                "capture_reason": r[23],
                 "reasoning_effort": (
                     (detail.get("reasoning_effort") if isinstance(detail, dict) else None)
                     or (detail.get("thinking_intensity") if isinstance(detail, dict) else None)

@@ -281,8 +281,13 @@ def apply_free_usage_cooldown(
         return None
     if model and not parsed.get("model"):
         parsed["model"] = model
-    # Single-account meta only — probe/live hot path must not load whole pool.
-    meta = _pool_meta(account_id, {account_id: get_account_pool_meta(account_id)})
+    # Request traffic uses the Redis status index; probe/control paths retain
+    # the single-row PG lookup as their authoritative read.
+    meta = _pool_meta(
+        account_id,
+        {account_id: _request_path_meta(account_id)},
+        redis_overlay=False,
+    )
     now = _now()
 
     # Existing stack / count (durable).
@@ -785,6 +790,40 @@ def _pool_meta(
         # Durable count says cooling — don't trust stale normal label.
         out["pool_status"] = "cooldown"
     return out
+
+
+def _request_path_meta(account_id: str) -> dict[str, Any]:
+    """Read hot account state without touching PG on indexed request paths."""
+    request_indexed = False
+    try:
+        from grok2api.admin.settings_store import is_async_pool_state_write
+        from grok2api.config import READY_INDEX_MODE
+        from grok2api.store.redis_client import redis_enabled
+
+        request_indexed = (
+            is_async_pool_state_write()
+            and READY_INDEX_MODE == "on"
+            and redis_enabled()
+        )
+    except Exception:
+        request_indexed = False
+
+    if request_indexed:
+        try:
+            from grok2api.store.ready_redis import get_status
+
+            hot = get_status(account_id)
+            return dict(hot) if isinstance(hot, dict) else {}
+        except Exception:
+            # Indexed production mode is fail-closed; do not introduce a PG
+            # read fallback merely because a request-side Redis read failed.
+            return {}
+
+    try:
+        meta = get_account_pool_meta(account_id) or {}
+    except Exception:
+        meta = {}
+    return dict(meta) if isinstance(meta, dict) else {}
 
 
 def is_model_blocked(
@@ -1503,10 +1542,20 @@ def _effective_last_used(meta: dict[str, Any], soft_ts: float | None) -> float:
     return max(durable, soft)
 
 
-def note_account_pick(account_id: str | None) -> None:
+def note_account_pick(account_id: str | None) -> bool:
     """Pick-time soft mark so concurrent workers spread load immediately."""
     if not account_id:
-        return
+        return False
+    try:
+        from grok2api.config import READY_INDEX_MODE
+        from grok2api.store.ready_redis import claim_preferred
+
+        if READY_INDEX_MODE == "on" and not claim_preferred(
+            account_id, mode=get_account_mode()
+        ):
+            return False
+    except Exception:
+        pass
     now = time.time()
     with _local_spread_lock:
         n, exp = _local_inflight.get(account_id, (0, 0.0))
@@ -1520,6 +1569,7 @@ def note_account_pick(account_id: str | None) -> None:
         note_pick(account_id)
     except Exception:
         pass
+    return True
 
 
 def release_account_pick(account_id: str | None) -> None:
@@ -1537,6 +1587,14 @@ def release_account_pick(account_id: str | None) -> None:
         from grok2api.store.pool_redis import release_inflight
 
         release_inflight(account_id)
+    except Exception:
+        pass
+    try:
+        from grok2api.config import READY_INDEX_MODE
+        from grok2api.store.ready_redis import release
+
+        if READY_INDEX_MODE == "on":
+            release(account_id)
     except Exception:
         pass
 
@@ -1584,6 +1642,14 @@ _NORMALIZE_MIN_INTERVAL = 30.0  # avoid re-scanning auth.json every request
 def _ensure_multi_account_layout() -> None:
     """Re-key CLI client_id single-slot into per-user keys (throttled)."""
     global _last_normalize_at
+    try:
+        from grok2api.config import READY_INDEX_MODE
+        from grok2api.pool.auth_store import using_postgres
+
+        if READY_INDEX_MODE == "on" and using_postgres():
+            return
+    except Exception:
+        pass
     now = time.time()
     if now - _last_normalize_at < _NORMALIZE_MIN_INTERVAL:
         return
@@ -1614,6 +1680,27 @@ def acquire(
         mode = "round_robin"
 
     _ensure_multi_account_layout()
+
+    try:
+        from grok2api.config import READY_INDEX_MODE
+
+        if READY_INDEX_MODE == "on":
+            indexed = _try_acquire_indexed_sequence(
+                1,
+                model=model,
+                prefer_account_id=None,
+                exclude=exclude,
+            )
+            if indexed:
+                return _ensure_fresh_creds(indexed[0], auto_refresh=auto_refresh)
+            raise AuthError(
+                "No eligible accounts in Redis ready index. "
+                "Wait for index reconciliation or restore account status."
+            )
+    except AuthError:
+        raise
+    except Exception:
+        pass
 
     # Never network-refresh the whole pool here. Selection is pure local filtering;
     # only the single picked account is refreshed (if already expired).
@@ -1747,6 +1834,23 @@ def report_success(account_id: str | None, *, model: str | None = None) -> None:
     """
     if not account_id:
         return
+    try:
+        from grok2api.config import ASYNC_ACCOUNT_STATS
+        from grok2api.store.redis_client import redis_enabled
+
+        if ASYNC_ACCOUNT_STATS and redis_enabled():
+            release_account_pick(account_id)
+            touch_account_stats(
+                account_id,
+                success=True,
+                clear_cooldown=False,
+                consecutive_fails=0,
+                preserve_cooldown=True,
+                current_meta={},
+            )
+            return
+    except Exception:
+        pass
     release_account_pick(account_id)
     try:
         meta = get_account_pool_meta(account_id) or {}
@@ -1794,7 +1898,7 @@ def report_success(account_id: str | None, *, model: str | None = None) -> None:
             pass
 
 
-def report_failure(
+def _report_failure_impl(
     account_id: str | None,
     *,
     error: str = "",
@@ -1815,9 +1919,13 @@ def report_failure(
 
     release_account_pick(account_id)
 
-    # Read streak before writing so adaptive cooldown can scale.
-    state = get_account_pool_state()
-    meta = _pool_meta(account_id, state)
+    # Read one hot status record so adaptive cooldown does not load the pool or
+    # touch PG in READY_INDEX_MODE=on request traffic.
+    meta = _pool_meta(
+        account_id,
+        {account_id: _request_path_meta(account_id)},
+        redis_overlay=False,
+    )
     prev_streak = int(meta.get("consecutive_fails") or 0)
     streak = prev_streak + 1
 
@@ -2013,6 +2121,43 @@ def report_failure(
     }
 
 
+def report_failure(
+    account_id: str | None,
+    *,
+    error: str = "",
+    status_code: int | None = None,
+    cooldown: float | None = None,
+    model: str | None = None,
+    headers: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Request-path failure wrapper with Redis-first durable event delivery."""
+    try:
+        from grok2api.admin.settings_store import async_pool_state_writes
+        from grok2api.config import ASYNC_ACCOUNT_STATE
+        from grok2api.store.redis_client import redis_enabled
+
+        if ASYNC_ACCOUNT_STATE and redis_enabled():
+            with async_pool_state_writes():
+                return _report_failure_impl(
+                    account_id,
+                    error=error,
+                    status_code=status_code,
+                    cooldown=cooldown,
+                    model=model,
+                    headers=headers,
+                )
+    except Exception:
+        pass
+    return _report_failure_impl(
+        account_id,
+        error=error,
+        status_code=status_code,
+        cooldown=cooldown,
+        model=model,
+        headers=headers,
+    )
+
+
 def set_account_enabled(account_id: str, enabled: bool) -> dict[str, Any] | None:
     state = get_account_pool_state()
     # ensure key exists even if new
@@ -2077,8 +2222,8 @@ def block_model(
     """
     if not account_id or not model:
         return None
-    # Avoid full-pool reads on the probe hot path (many models × many accounts).
-    meta = get_account_pool_meta(account_id) or {}
+    # Probe/control callers use PG; request failures use the Redis status index.
+    meta = _request_path_meta(account_id)
     if not isinstance(meta, dict):
         meta = {}
     blocked = meta.get("blocked_models")
@@ -2135,7 +2280,7 @@ def unblock_model(account_id: str, model: str | None = None) -> dict[str, Any] |
     """Clear one model block, or all model blocks if model is None."""
     if not account_id:
         return None
-    meta = get_account_pool_meta(account_id) or {}
+    meta = _request_path_meta(account_id)
     if not isinstance(meta, dict):
         return None
     blocked = meta.get("blocked_models")
@@ -2169,7 +2314,7 @@ def disable_for_quota(
     source: str = "billing",
 ) -> dict[str, Any] | None:
     """Disable account permanently from rotation due to quota exhaustion."""
-    meta = get_account_pool_meta(account_id) or {}
+    meta = _request_path_meta(account_id)
     if not isinstance(meta, dict):
         meta = {}
     already = meta.get("enabled") is False and meta.get("disabled_for_quota")
@@ -2587,6 +2732,138 @@ def _ensure_fresh_creds(
         return creds
 
 
+def _acquire_indexed_one(
+    *,
+    model: str | None,
+    prefer_account_id: str | None,
+    exclude: set[str],
+) -> GrokCredentials | None:
+    """Atomically lease and then lazily load one indexed account."""
+    from grok2api.store.ready_redis import (
+        ensure_ready_index,
+        get_status,
+        is_ready,
+        list_candidates,
+        remove,
+    )
+
+    ids: list[str] = []
+    pref = str(prefer_account_id or "").strip()
+    if pref and is_ready(pref):
+        ids.append(pref)
+    ids.extend(list_candidates(limit=64, mode=get_account_mode()))
+    if not ids:
+        ensure_ready_index(wait_sec=5.0)
+        ids.extend(list_candidates(limit=64, mode=get_account_mode()))
+
+    for account_id in ids:
+        if not account_id or account_id in exclude:
+            continue
+        exclude.add(account_id)
+        meta = get_status(account_id)
+        if not meta.get("enabled", True) or meta.get("disabled_for_quota"):
+            continue
+        if is_in_cooldown(meta):
+            continue
+        if model and is_model_blocked(
+            account_id, model, {account_id: meta}, meta=meta
+        ):
+            continue
+        # The Lua-backed preferred claim enforces max inflight before any
+        # credential payload is fetched from PG/the local LRU.
+        if not note_account_pick(account_id):
+            continue
+        creds = peek_credentials_by_id(account_id)
+        if creds is None or creds.expired or not creds.token:
+            release_account_pick(account_id)
+            remove(account_id)
+            continue
+        return creds
+    return None
+
+
+class _LazyIndexedAccountChain:
+    """List-like failover chain that leases payloads only when iterated."""
+
+    def __init__(
+        self,
+        first: GrokCredentials,
+        *,
+        limit: int,
+        model: str | None,
+        seen: set[str],
+    ) -> None:
+        self._items = [first]
+        self._limit = max(1, int(limit))
+        self._model = model
+        self._seen = seen
+        self._exhausted = False
+
+    def __len__(self) -> int:
+        # Callers use len(chain) as the retry budget before asking the iterator
+        # for the next account; returning only loaded items would disable lazy
+        # failover after the first attempt.
+        return self._limit
+
+    def _load_through(self, index: int) -> None:
+        while (
+            not self._exhausted
+            and len(self._items) <= index
+            and len(self._items) < self._limit
+        ):
+            creds = _acquire_indexed_one(
+                model=self._model,
+                prefer_account_id=None,
+                exclude=self._seen,
+            )
+            if creds is None:
+                self._exhausted = True
+                break
+            self._items.append(creds)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return list(self)[index]
+        if int(index) < 0:
+            return list(self)[int(index)]
+        self._load_through(int(index))
+        if int(index) >= len(self._items):
+            raise IndexError(index)
+        return self._items[int(index)]
+
+    def __iter__(self):
+        for index in range(self._limit):
+            try:
+                yield self[index]
+            except IndexError:
+                return
+
+
+def _try_acquire_indexed_sequence(
+    max_attempts: int | None,
+    *,
+    model: str | None,
+    prefer_account_id: str | None,
+    exclude: set[str] | None = None,
+):
+    """Return a lazy failover chain without materializing credential payloads."""
+    limit = max(1, int(max_attempts or MAX_FAILOVER_ATTEMPTS))
+    seen = set(exclude or set())
+    first = _acquire_indexed_one(
+        model=model,
+        prefer_account_id=prefer_account_id,
+        exclude=seen,
+    )
+    if first is None:
+        return []
+    return _LazyIndexedAccountChain(
+        first,
+        limit=limit,
+        model=model,
+        seen=seen,
+    )
+
+
 def try_acquire_sequence(
     max_attempts: int | None = None,
     *,
@@ -2608,6 +2885,28 @@ def try_acquire_sequence(
     sticky is unusable.
     """
     _ensure_multi_account_layout()
+
+    try:
+        from grok2api.config import READY_INDEX_MODE
+
+        if READY_INDEX_MODE == "on":
+            indexed = _try_acquire_indexed_sequence(
+                max_attempts,
+                model=model,
+                prefer_account_id=prefer_account_id,
+            )
+            if indexed:
+                return indexed
+            raise AuthError(
+                "No eligible accounts in Redis ready index. "
+                "Wait for index reconciliation or restore account status."
+            )
+    except AuthError:
+        raise
+    except Exception:
+        # Rollout safety: unexpected index errors use the legacy selector. An
+        # empty/valid index result above remains fail-closed in on mode.
+        pass
 
     # ── Sticky affinity fast path (dominant multi-turn TTFT win) ──────────
     # Load only the preferred account + durable meta. Avoid list_live over
@@ -3055,7 +3354,11 @@ def kick_from_pool(
         return None
     reason_s = (reason or "手动移出轮询")[:300]
     if cooldown_sec and float(cooldown_sec) > 0:
-        meta0 = _pool_meta(account_id, {account_id: get_account_pool_meta(account_id)})
+        meta0 = _pool_meta(
+            account_id,
+            {account_id: _request_path_meta(account_id)},
+            redis_overlay=False,
+        )
         new_count = stack_cooldown_count(meta0, add=1)
         if PROBE_ONLY_COOLDOWN_RECOVERY:
             until = _now() + float(PROBE_HOLD_COOLDOWN_SEC)

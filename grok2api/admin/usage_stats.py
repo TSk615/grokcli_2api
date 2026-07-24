@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
 from typing import Any
 
 _FIELDS = (
@@ -22,6 +23,67 @@ _light_cache: dict[str, Any] | None = None
 _light_cache_at = 0.0
 _light_lock = threading.Lock()
 _LIGHT_TTL = 3.0
+
+
+def _capture_policy() -> dict[str, Any]:
+    try:
+        from grok2api.admin.settings_store import get_usage_capture
+
+        return get_usage_capture()
+    except Exception:
+        try:
+            from grok2api.config import USAGE_EVENT_SAMPLE_RATE, USAGE_SLOW_MS
+
+            return {
+                "sample_rate": USAGE_EVENT_SAMPLE_RATE,
+                "all_failures": True,
+                "slow_ms": USAGE_SLOW_MS,
+                "audit_until": 0.0,
+                "audit_key_ids": [],
+            }
+        except Exception:
+            return {
+                "sample_rate": 0.05,
+                "all_failures": True,
+                "slow_ms": 5000,
+                "audit_until": 0.0,
+                "audit_key_ids": [],
+            }
+
+
+def _capture_decision(
+    *,
+    request_id: str,
+    ok: bool,
+    status_code: int | None,
+    latency_ms: int | None,
+    api_key_id: str | None,
+) -> tuple[bool, str]:
+    policy = _capture_policy()
+    if not ok and bool(policy.get("all_failures", True)):
+        return True, "failure"
+    if status_code is not None and int(status_code) >= 400:
+        return True, "http_error"
+    try:
+        if latency_ms is not None and int(latency_ms) >= int(policy.get("slow_ms") or 0) > 0:
+            return True, "slow"
+    except (TypeError, ValueError):
+        pass
+    try:
+        audit_until = float(policy.get("audit_until") or 0)
+    except (TypeError, ValueError):
+        audit_until = 0.0
+    audit_ids = {str(x) for x in (policy.get("audit_key_ids") or [])}
+    if audit_until > time.time() and (not audit_ids or str(api_key_id or "") in audit_ids):
+        return True, "audit"
+    try:
+        from grok2api.store.events_redis import deterministic_sample
+
+        if deterministic_sample(request_id, float(policy.get("sample_rate") or 0.0)):
+            return True, "sample"
+    except Exception:
+        pass
+    return False, "unsampled"
 
 
 def _empty() -> dict[str, int]:
@@ -151,6 +213,7 @@ def record_usage(
     error: str | None = None,
     detail: dict[str, Any] | None = None,
     ts: float | None = None,
+    request_id: str | None = None,
 ) -> None:
     """Record one finished request. Safe to call from any path; never raises."""
     try:
@@ -284,33 +347,6 @@ def record_usage(
                 prompt_tokens=norm["prompt_tokens"],
                 completion_tokens=norm["completion_tokens"],
                 total_tokens=norm["total_tokens"],
-                ok=bool(ok),
-                api_key_id=key_id,
-                account_id=acc_id,
-                model=model_s,
-                ts=ts,
-            )
-        except Exception:
-            pass
-
-        try:
-            from grok2api.store import usage_pg
-
-            usage_pg.record(
-                prompt_tokens=norm["prompt_tokens"],
-                completion_tokens=norm["completion_tokens"],
-                total_tokens=norm["total_tokens"],
-                ok=bool(ok),
-                api_key_id=key_id,
-                account_id=acc_id,
-                model=model_s,
-                ts=ts,
-            )
-            # Per-request detail row (token breakdown, caller key, IP, cache).
-            usage_pg.record_event(
-                prompt_tokens=norm["prompt_tokens"],
-                completion_tokens=norm["completion_tokens"],
-                total_tokens=norm["total_tokens"],
                 cache_read_tokens=norm.get("cache_read_tokens") or 0,
                 cache_creation_tokens=norm.get("cache_creation_tokens") or 0,
                 reasoning_tokens=norm.get("reasoning_tokens") or 0,
@@ -318,20 +354,110 @@ def record_usage(
                 api_key_id=key_id,
                 account_id=acc_id,
                 model=model_s,
-                protocol=proto_s,
-                path=path_s,
-                stream=stream,
-                client_ip=ip_s,
-                user_agent=ua_s,
-                status_code=status_code,
-                latency_ms=latency_ms,
-                ttft_ms=ttft_ms,
-                error=error,
-                detail=detail_out or None,
                 ts=ts,
             )
         except Exception:
             pass
+
+        queued = False
+        try:
+            from grok2api.config import ASYNC_USAGE
+            from grok2api.store import events_redis
+
+            if ASYNC_USAGE and events_redis.redis_enabled():
+                req_id = str(
+                    request_id
+                    or detail_out.get("request_id")
+                    or detail_out.get("req_id")
+                    or uuid.uuid4().hex
+                )
+                capture, capture_reason = _capture_decision(
+                    request_id=req_id,
+                    ok=bool(ok),
+                    status_code=status_code,
+                    latency_ms=latency_ms,
+                    api_key_id=key_id,
+                )
+                payload = {
+                    "api_key_id": key_id,
+                    "account_id": acc_id,
+                    "model": model_s,
+                    "protocol": proto_s,
+                    "path": path_s,
+                    "stream": stream,
+                    "ok": bool(ok),
+                    "prompt_tokens": norm["prompt_tokens"],
+                    "completion_tokens": norm["completion_tokens"],
+                    "total_tokens": norm["total_tokens"],
+                    "cache_read_tokens": norm.get("cache_read_tokens") or 0,
+                    "cache_creation_tokens": norm.get("cache_creation_tokens") or 0,
+                    "reasoning_tokens": norm.get("reasoning_tokens") or 0,
+                    "client_ip": ip_s,
+                    "user_agent": ua_s,
+                    "status_code": status_code,
+                    "latency_ms": latency_ms,
+                    "ttft_ms": ttft_ms,
+                    "error": error,
+                    "detail": detail_out or {},
+                    "capture": capture,
+                    "capture_reason": capture_reason,
+                }
+                queued = bool(
+                    events_redis.publish(
+                        "usage",
+                        payload,
+                        request_id=req_id,
+                        account_id=acc_id,
+                        occurred_at=ts,
+                    )
+                )
+        except Exception:
+            queued = False
+
+        if not queued:
+            # Compatibility/failure fallback: file-mode, async disabled, or a
+            # Redis enqueue failure keeps the durable legacy behavior.
+            try:
+                from grok2api.store import usage_pg
+
+                usage_pg.record(
+                    prompt_tokens=norm["prompt_tokens"],
+                    completion_tokens=norm["completion_tokens"],
+                    total_tokens=norm["total_tokens"],
+                    cache_read_tokens=norm.get("cache_read_tokens") or 0,
+                    cache_creation_tokens=norm.get("cache_creation_tokens") or 0,
+                    reasoning_tokens=norm.get("reasoning_tokens") or 0,
+                    ok=bool(ok),
+                    api_key_id=key_id,
+                    account_id=acc_id,
+                    model=model_s,
+                    ts=ts,
+                )
+                usage_pg.record_event(
+                    prompt_tokens=norm["prompt_tokens"],
+                    completion_tokens=norm["completion_tokens"],
+                    total_tokens=norm["total_tokens"],
+                    cache_read_tokens=norm.get("cache_read_tokens") or 0,
+                    cache_creation_tokens=norm.get("cache_creation_tokens") or 0,
+                    reasoning_tokens=norm.get("reasoning_tokens") or 0,
+                    ok=bool(ok),
+                    api_key_id=key_id,
+                    account_id=acc_id,
+                    model=model_s,
+                    protocol=proto_s,
+                    path=path_s,
+                    stream=stream,
+                    client_ip=ip_s,
+                    user_agent=ua_s,
+                    status_code=status_code,
+                    latency_ms=latency_ms,
+                    ttft_ms=ttft_ms,
+                    error=error,
+                    detail=detail_out or None,
+                    ts=ts,
+                )
+            except Exception:
+                pass
 
         # Invalidate light cache so status picks up quickly.
         global _light_cache, _light_cache_at
