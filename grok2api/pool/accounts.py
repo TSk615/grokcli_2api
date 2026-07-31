@@ -119,6 +119,18 @@ def merge_durable_account_fields(
     return entry
 
 
+def merge_imported_account_fields(
+    entry: dict[str, Any], old_entry: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Merge a repeated import without rolling back its rotated refresh token."""
+    merge_durable_account_fields(entry, old_entry)
+    if isinstance(old_entry, dict):
+        current_refresh = old_entry.get("refresh_token")
+        if current_refresh not in (None, ""):
+            entry["refresh_token"] = current_refresh
+    return entry
+
+
 def _accounts_store_source() -> str:
     """Where list/status currently reads from: postgres | file."""
     try:
@@ -1197,17 +1209,26 @@ def merge_normalized_accounts(
         except Exception:
             pass
         for aid, nent in normalized.items():
-            uid = nent.get("user_id")
-            if not uid:
-                continue
-            for k in list(existing.keys()):
-                v = existing.get(k)
-                if not isinstance(v, dict):
-                    continue
-                if str(v.get("user_id") or v.get("principal_id") or "") == str(uid) and k != aid:
-                    existing.pop(k, None)
-        for aid, nent in normalized.items():
-            merge_durable_account_fields(nent, existing.get(aid))
+            old_entry = existing.get(aid)
+            old_entry = old_entry if isinstance(old_entry, dict) else None
+            uid = nent.get("user_id") or nent.get("principal_id")
+            if uid:
+                for k in list(existing.keys()):
+                    v = existing.get(k)
+                    if not isinstance(v, dict):
+                        continue
+                    old_uid = v.get("user_id") or v.get("principal_id")
+                    if str(old_uid or "") != str(uid):
+                        continue
+                    # Normalization normally makes this the same key. Keep this
+                    # fallback for legacy keys and prefer a row that has the RT.
+                    if old_entry is None or (
+                        not old_entry.get("refresh_token") and v.get("refresh_token")
+                    ):
+                        old_entry = v
+                    if k != aid:
+                        existing.pop(k, None)
+            merge_imported_account_fields(nent, old_entry)
         existing.update(normalized)
         write_auth_map(existing)
         total = len(existing)
