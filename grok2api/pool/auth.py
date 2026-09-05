@@ -259,7 +259,7 @@ def load_credentials(
         data = _read_auth(path)
         name, entry = _pick_entry(data)
     except Exception as e:
-        # Permanent RT failures already delete inside ensure_fresh_entry.
+        # Permanent RT failures are quarantined/recovered by the maintainer.
         # Still surface a clear AuthError for the request path.
         try:
             from grok2api.upstream.oidc_auth import RefreshRevokedError, parse_expires_at as _parse_exp2

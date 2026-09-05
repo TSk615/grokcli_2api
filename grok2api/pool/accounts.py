@@ -122,13 +122,58 @@ def merge_durable_account_fields(
 def merge_imported_account_fields(
     entry: dict[str, Any], old_entry: dict[str, Any] | None
 ) -> dict[str, Any]:
-    """Merge a repeated import without rolling back its rotated refresh token."""
+    """Merge a repeated import without rolling credentials backwards.
+
+    Access/refresh tokens form one credential generation.  Prefer the entry
+    whose access token expires later; this keeps stale backups from replacing a
+    token that was refreshed in the running service, while still allowing a
+    fresh device-flow/SSO import to replace an invalid stored refresh token.
+    When the incoming entry has no refresh token, carry the stored one forward.
+    """
     merge_durable_account_fields(entry, old_entry)
-    if isinstance(old_entry, dict):
-        current_refresh = old_entry.get("refresh_token")
-        if current_refresh not in (None, ""):
-            entry["refresh_token"] = current_refresh
+    if not isinstance(old_entry, dict):
+        return entry
+
+    incoming_token = entry.get("key") or entry.get("access_token") or entry.get("token")
+    current_token = (
+        old_entry.get("key") or old_entry.get("access_token") or old_entry.get("token")
+    )
+    incoming_exp = parse_expires_at(
+        entry.get("expires_at"), incoming_token if isinstance(incoming_token, str) else None
+    )
+    current_exp = parse_expires_at(
+        old_entry.get("expires_at"), current_token if isinstance(current_token, str) else None
+    )
+
+    keep_current_generation = False
+    if current_token and incoming_token and current_token != incoming_token:
+        if current_exp is not None and incoming_exp is not None:
+            keep_current_generation = float(current_exp) > float(incoming_exp)
+        elif current_exp is not None and incoming_exp is None:
+            keep_current_generation = True
+    elif current_token and current_token == incoming_token:
+        # Same access token means the import cannot prove its refresh token is
+        # newer.  Keep the durable value already used by the running service.
+        keep_current_generation = True
+
+    if keep_current_generation:
+        for key in ("key", "access_token", "token", "expires_at", "refresh_token", "id_token"):
+            current_value = old_entry.get(key)
+            if current_value not in (None, ""):
+                entry[key] = current_value
+    elif not entry.get("refresh_token") and old_entry.get("refresh_token"):
+        entry["refresh_token"] = old_entry["refresh_token"]
     return entry
+
+
+def _merge_normalized_duplicate(
+    current: dict[str, Any] | None, incoming: dict[str, Any]
+) -> dict[str, Any]:
+    """Deterministically merge duplicate identities inside one import batch."""
+    if not isinstance(current, dict):
+        return incoming
+    merged = dict(incoming)
+    return merge_imported_account_fields(merged, current)
 
 
 def _accounts_store_source() -> str:
@@ -919,7 +964,7 @@ def collect_normalized_entries(raw: str | dict[str, Any] | list[Any]) -> dict[st
                 aid, nent = _normalize_entry(ent, preferred_id=pref_id)
             except ValueError:
                 continue
-            normalized[aid] = nent
+            normalized[aid] = _merge_normalized_duplicate(normalized.get(aid), nent)
         if not normalized:
             return {"ok": False, "error": "CLIProxyAPI 记录缺少 token"}
         return {
@@ -1053,7 +1098,7 @@ def collect_normalized_entries(raw: str | dict[str, Any] | list[Any]) -> dict[st
             aid, nent = _normalize_entry(ent, preferred_id=pref_id)
         except ValueError:
             continue
-        normalized[aid] = nent
+        normalized[aid] = _merge_normalized_duplicate(normalized.get(aid), nent)
     if not normalized:
         return {"ok": False, "error": "entries missing token"}
     return {"ok": True, "normalized": normalized}
@@ -1286,7 +1331,11 @@ def import_auth_payloads_bulk(
             })
             continue
         entries = dry.get("normalized") or {}
-        normalized.update(entries)
+        for aid, entry in entries.items():
+            if isinstance(entry, dict):
+                normalized[aid] = _merge_normalized_duplicate(
+                    normalized.get(aid), entry
+                )
         file_results.append({
             "index": idx,
             "ok": True,

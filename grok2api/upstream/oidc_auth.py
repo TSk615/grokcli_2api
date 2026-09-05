@@ -8,16 +8,24 @@ so multiple accounts can coexist.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Iterator
 import httpx
 
-from grok2api.pool.auth_store import mutate_auth_map, read_auth_map, upsert_auth_entry, write_auth_map
+from grok2api.pool.auth_store import (
+    mutate_auth_map,
+    read_auth_entry,
+    read_auth_map,
+    upsert_auth_entry,
+    write_auth_map,
+)
 from grok2api.config import GROK_CLI_CLIENT_ID, OIDC_DEVICE_URL, OIDC_SCOPES, OIDC_TOKEN_URL
 
 # In-memory device sessions (server-side poll). When Redis is on, also mirrored
@@ -298,13 +306,19 @@ def normalize_auth_file_keys() -> dict[str, Any]:
         )
         if new_key != old_key:
             changed += 1
-        # Prefer entry that has refresh_token when colliding on same user
+        # Resolve legacy duplicate keys by credential freshness, not database
+        # iteration order. Import lazily to avoid the module-level accounts ↔
+        # oidc_auth dependency cycle.
         if new_key in new_map:
             prev = new_map[new_key]
-            if isinstance(prev, dict) and prev.get("refresh_token") and not entry.get(
-                "refresh_token"
-            ):
-                continue
+            if isinstance(prev, dict):
+                try:
+                    from grok2api.pool.accounts import merge_imported_account_fields
+
+                    entry = merge_imported_account_fields(dict(entry), prev)
+                except Exception:
+                    if prev.get("refresh_token") and not entry.get("refresh_token"):
+                        continue
         new_map[new_key] = entry
 
     if changed or new_map != data:
@@ -314,6 +328,93 @@ def normalize_auth_file_keys() -> dict[str, Any]:
 
 class RefreshRevokedError(ValueError):
     """Refresh token permanently rejected by the IdP (invalid_grant / revoked)."""
+
+
+class RefreshBusyError(RuntimeError):
+    """Another worker is already refreshing this account."""
+
+
+def _credential_generation_changed(
+    snapshot: dict[str, Any], latest: dict[str, Any]
+) -> bool:
+    """Whether another writer replaced the access or refresh credential."""
+    for key in ("key", "refresh_token"):
+        before = str(snapshot.get(key) or "")
+        after = str(latest.get(key) or "")
+        if before != after:
+            return True
+    return False
+
+
+@contextmanager
+def _distributed_refresh_slot(
+    account_id: str,
+    *,
+    wait_seconds: float = 40.0,
+    ttl_seconds: float = 90.0,
+) -> Iterator[bool]:
+    """Serialize one account's refresh across Uvicorn worker processes."""
+    try:
+        from grok2api.store.redis_client import (
+            compare_and_delete,
+            key,
+            redis_enabled,
+            renew_if_owner,
+            set_nx_ex,
+            worker_id,
+        )
+
+        if not redis_enabled():
+            yield True
+            return
+    except Exception:
+        # File/single-worker mode is protected by the process-local lock.
+        yield True
+        return
+
+    digest = hashlib.sha256(str(account_id).encode("utf-8")).hexdigest()[:32]
+    lock_key = key("lock", "token_refresh", digest)
+    token = f"{worker_id()}|{uuid.uuid4().hex}"
+    deadline = time.time() + max(0.0, float(wait_seconds))
+    acquired = False
+    while True:
+        try:
+            acquired = bool(set_nx_ex(lock_key, token, ttl_seconds))
+        except Exception:
+            acquired = False
+        if acquired or time.time() >= deadline:
+            break
+        time.sleep(0.05)
+
+    if not acquired:
+        yield False
+        return
+
+    stop_renew = threading.Event()
+
+    def _renew() -> None:
+        interval = max(1.0, float(ttl_seconds) / 3.0)
+        while not stop_renew.wait(interval):
+            try:
+                if not renew_if_owner(lock_key, token, ttl_seconds):
+                    return
+            except Exception:
+                return
+
+    renewer = threading.Thread(
+        target=_renew,
+        name="g2a-account-refresh-lock",
+        daemon=True,
+    )
+    renewer.start()
+    try:
+        yield True
+    finally:
+        stop_renew.set()
+        try:
+            compare_and_delete(lock_key, token)
+        except Exception:
+            pass
 
 
 def _hard_delete_invalid_refresh_enabled() -> bool:
@@ -638,47 +739,70 @@ def refresh_and_persist(
     Refresh one account under a per-account lock (multi-account safe).
 
     When `persist=False`, only performs the OIDC exchange and returns the new
-    entry — caller is responsible for a single batched write (startup bulk
-    refresh). This avoids rewriting a multi-MB auth.json once per account.
-    `recheck_latest=False` lets a batch caller reuse its already-read snapshot
-    and avoid one full auth-map read per account in large pools.
+    entry; the caller is responsible for durable storage. Production refresh
+    paths keep this True so a rotated refresh token is saved before the
+    distributed account lock is released.
     """
     lock = _account_refresh_lock(account_id)
     with lock:
-        latest = entry
-        if recheck_latest:
-            # re-read latest entry — another thread may have just refreshed
-            latest_map = read_auth_map()
-            latest = latest_map.get(account_id)
-            if not isinstance(latest, dict):
-                # try by user_id
-                uid = entry.get("user_id") or entry.get("principal_id")
-                if uid:
-                    for k, v in latest_map.items():
-                        if isinstance(v, dict) and (
-                            v.get("user_id") == uid or v.get("principal_id") == uid
-                        ):
-                            latest = v
-                            account_id = k
-                            break
-                if not isinstance(latest, dict):
-                    latest = entry
-        token_data = refresh_access_token(latest, client=client)
-        new_id, new_entry = entry_from_token_response(token_data, previous=latest)
-        uid = new_entry.get("user_id")
-        if uid:
-            new_id = account_storage_id(user_id=str(uid))
-        else:
-            new_id = account_id
-        if persist:
-            upsert_entry(new_id, new_entry)
-            try:
-                import grok2api.pool.account_pool as _pool
+        with _distributed_refresh_slot(account_id) as acquired:
+            if not acquired:
+                hit = read_auth_entry(account_id)
+                if hit and _credential_generation_changed(entry, hit[1]):
+                    return {
+                        "account_id": hit[0],
+                        "entry": hit[1],
+                        "performed": False,
+                    }
+                raise RefreshBusyError("another worker is refreshing this account")
 
-                _pool.record_renew_success(new_id, source="refresh_token")
-            except Exception:
-                pass
-        return {"account_id": new_id, "entry": new_entry}
+            latest = entry
+            if recheck_latest:
+                # Re-read after both locks are held. A different worker may have
+                # rotated and persisted this account while we were waiting.
+                hit = read_auth_entry(account_id)
+                if hit:
+                    resolved_id, resolved_entry = hit
+                    if _credential_generation_changed(entry, resolved_entry):
+                        token = resolved_entry.get("key")
+                        exp = parse_expires_at(
+                            resolved_entry.get("expires_at"),
+                            token if isinstance(token, str) else None,
+                        )
+                        if token and (exp is None or float(exp) > time.time() + 30.0):
+                            try:
+                                import grok2api.pool.account_pool as _pool
+
+                                _pool.record_renew_success(
+                                    resolved_id, source="concurrent_refresh"
+                                )
+                            except Exception:
+                                pass
+                            return {
+                                "account_id": resolved_id,
+                                "entry": resolved_entry,
+                                "performed": False,
+                            }
+                    latest = resolved_entry
+                    account_id = resolved_id
+
+            token_data = refresh_access_token(latest, client=client)
+            new_id, new_entry = entry_from_token_response(token_data, previous=latest)
+            uid = new_entry.get("user_id")
+            if uid:
+                new_id = account_storage_id(user_id=str(uid))
+            else:
+                new_id = account_id
+            if persist:
+                # Persist the rotated refresh token before releasing either lock.
+                upsert_entry(new_id, new_entry)
+                try:
+                    import grok2api.pool.account_pool as _pool
+
+                    _pool.record_renew_success(new_id, source="refresh_token")
+                except Exception:
+                    pass
+            return {"account_id": new_id, "entry": new_entry, "performed": True}
 
 
 def ensure_fresh_entry(
@@ -694,8 +818,9 @@ def ensure_fresh_entry(
     ``raise_on_error=True`` when the access token is already expired and the
     caller cannot proceed with a stale token.
 
-    Permanent RT failures soft-expire the account; after two consecutive failures the
-maintainer tries SSO reauth (if present) or removes the account from the pool.
+    Transient failures only soft-expire the account. The maintainer attempts SSO
+    recovery or configured invalidation only for a confirmed permanent rejection
+    of the latest stored refresh token.
     """
     token = entry.get("key")
     exp = parse_expires_at(entry.get("expires_at"), token if isinstance(token, str) else None)
@@ -718,16 +843,28 @@ maintainer tries SSO reauth (if present) or removes the account from the pool.
 
     try:
         result = refresh_and_persist(account_id, entry)
-        try:
-            import grok2api.pool.account_pool as _pool
-
-            _pool.record_renew_success(result.get("account_id") or account_id, source="refresh_token")
-        except Exception:
-            pass
         return result["entry"]
+    except RefreshBusyError:
+        # Lock contention is not a token failure. Use a concurrently-persisted
+        # generation when available and never increment renew_fail_count.
+        hit = read_auth_entry(account_id)
+        if hit and _credential_generation_changed(entry, hit[1]):
+            return hit[1]
+        if raise_on_error or already_expired:
+            raise
+        return entry
     except RefreshRevokedError as e:
         # Soft-expire first so request polling skips this account. Permanent
         # invalidation is owned by the background maintainer (2 fails + SSO/no-SSO).
+        hit = read_auth_entry(account_id)
+        if hit and _credential_generation_changed(entry, hit[1]):
+            try:
+                import grok2api.pool.account_pool as _pool
+
+                _pool.record_renew_success(hit[0], source="concurrent_refresh")
+            except Exception:
+                pass
+            return hit[1]
         try:
             import grok2api.pool.account_pool as _pool
 
@@ -1153,6 +1290,15 @@ def _refresh_sweep_mark(ids: list[str]) -> int:
         return len(cov)
 
 
+def _has_saved_sso(entry: dict[str, Any]) -> bool:
+    try:
+        import grok2api.pool.accounts as _accounts
+
+        return _accounts.has_sso_value(entry)
+    except Exception:
+        return bool(entry.get("sso") or entry.get("sso_cookie") or entry.get("sso_token"))
+
+
 def _try_sso_reauth(account_id: str, entry: dict[str, Any]) -> dict[str, Any]:
     """Try to recover an account by converting its saved SSO cookie to tokens."""
     try:
@@ -1200,7 +1346,7 @@ def refresh_all_accounts(
     Designed for large pools (hundreds of accounts):
       - bounded thread pool (default TOKEN_REFRESH_WORKERS)
       - shared httpx client per worker (no 1-client-per-request storm)
-      - single batched auth.json write at the end (not one rewrite per account)
+      - each rotated refresh token is persisted immediately under an account lock
       - optional max_accounts cap so a cycle never tries all 700 at once
       - optional account_ids to refresh only selected accounts
       - strict_sweep (default on for background batch): each needing-refresh
@@ -1261,12 +1407,15 @@ def refresh_all_accounts(
             except Exception:
                 pass
         if not entry.get("refresh_token"):
-            if is_expired:
+            if is_expired or _has_saved_sso(entry):
                 candidates.append((aid, entry))
             else:
                 results.append({"id": aid, "ok": False, "error": "no refresh_token"})
             continue
         if entry.get("refresh_invalid"):
+            if _has_saved_sso(entry):
+                candidates.append((aid, entry))
+                continue
             results.append(
                 {
                     "id": aid,
@@ -1362,10 +1511,6 @@ def refresh_all_accounts(
                 )
             candidates = candidates[:max_accounts]
 
-    updates: dict[str, dict[str, Any]] = {}
-    remount_deletes: set[str] = set()
-    invalid_marks: dict[str, str] = {}
-    updates_lock = threading.Lock()
     # One shared client per worker thread instead of opening a fresh TCP/TLS
     # session for every account in the batch.
     _tls = threading.local()
@@ -1413,194 +1558,228 @@ def refresh_all_accounts(
     ) -> dict[str, Any]:
         """Handle a failed RT renew.
 
-        Rules (accounts still have RT, but RT is broken):
-          1) always soft-mark expired so request polling skips the account
-          2) first consecutive *transient* failure: wait for next maintainer cycle
-          3) second consecutive failure OR permanent invalid_grant:
-               - if SSO exists: try SSO re-conversion once
-               - if no SSO: HARD-delete credentials + pool row (do not keep in total)
+        Transient failures only remove the account from request rotation and are
+        retried by a later sweep.  Destructive invalidation/SSO recovery is
+        reserved for a confirmed permanent rejection of the *latest* stored RT.
         """
         reason = str(err or "renew_failed")[:300]
-        try:
-            import grok2api.pool.account_pool as _pool
-            import grok2api.pool.accounts as _accounts
+        if not permanent:
+            try:
+                import grok2api.pool.account_pool as _pool
 
-            fail_count = _pool.record_renew_failure(aid, reason, source="refresh_token")
-            sso = _accounts.get_sso_value(entry)
-        except Exception:
-            fail_count = 1
-            sso = ""
-
-        # Permanent IdP rejection (invalid_grant / revoked): do not wait for a
-        # second cycle — RT will never recover. Jump straight to SSO / delete.
-        if permanent and fail_count < 2:
-            fail_count = 2
-
-        # First transient failure: only leave request rotation; keep trying RT next cycle.
-        if fail_count < 2:
+                fail_count = _pool.record_renew_failure(
+                    aid, reason, source="refresh_token"
+                )
+            except Exception:
+                fail_count = 1
             print(
                 f"  [token-refresh] renew fail #{fail_count} account={aid[:48]} "
-                f"(still has RT; skip pool until next cycle) err={reason[:120]}",
+                f"(transient; credentials retained) err={reason[:120]}",
                 flush=True,
             )
             return {
                 "id": aid,
                 "ok": False,
                 "error": reason,
-                "reason": "renew_failed",
-                "permanent": bool(permanent),
+                "reason": "renew_failed_transient",
+                "permanent": False,
                 "renew_fail_count": fail_count,
                 "removed_from_pool": False,
             }
 
-        if sso:
-            try:
-                import grok2api.pool.account_pool as _pool
+        # The failed HTTP exchange released its lock while unwinding. Reacquire
+        # it and compare the stored generation before invalidating anything: a
+        # different worker may already have persisted a rotated RT.
+        with _account_refresh_lock(aid):
+            with _distributed_refresh_slot(aid) as acquired:
+                if not acquired:
+                    return {
+                        "id": aid,
+                        "ok": False,
+                        "skipped": True,
+                        "error": "refresh lock busy while confirming invalid_grant",
+                        "reason": "refresh_confirmation_busy",
+                        "permanent": True,
+                        "removed_from_pool": False,
+                    }
 
-                meta = _pool.get_account_pool_meta(aid) or {}
-                next_at = float(meta.get("sso_reauth_next_at") or 0)
-            except Exception:
-                next_at = 0.0
-            if next_at and next_at > time.time():
+                hit = read_auth_entry(aid)
+                if hit is None:
+                    return {
+                        "id": aid,
+                        "ok": True,
+                        "skipped": True,
+                        "reason": "account_already_removed",
+                        "permanent": True,
+                        "removed_from_pool": True,
+                    }
+                resolved_id, latest = hit
+                if _credential_generation_changed(entry, latest):
+                    try:
+                        import grok2api.pool.account_pool as _pool
+
+                        _pool.record_renew_success(
+                            resolved_id, source="concurrent_refresh"
+                        )
+                    except Exception:
+                        pass
+                    return {
+                        "id": resolved_id,
+                        "ok": True,
+                        "skipped": True,
+                        "reason": "stale_refresh_rejection",
+                        "permanent": False,
+                        "removed_from_pool": False,
+                    }
+
+                aid = resolved_id
+                entry = latest
+                try:
+                    import grok2api.pool.account_pool as _pool
+                    import grok2api.pool.accounts as _accounts
+
+                    fail_count = _pool.record_renew_failure(
+                        aid, reason, source="refresh_token"
+                    )
+                    sso = _accounts.get_sso_value(entry)
+                except Exception:
+                    fail_count = 1
+                    sso = ""
+
+                if sso:
+                    try:
+                        import grok2api.pool.account_pool as _pool
+
+                        meta = _pool.get_account_pool_meta(aid) or {}
+                        next_at = float(meta.get("sso_reauth_next_at") or 0)
+                    except Exception:
+                        next_at = 0.0
+                    if next_at and next_at > time.time():
+                        return {
+                            "id": aid,
+                            "ok": False,
+                            "error": reason,
+                            "reason": "sso_reauth_cooling",
+                            "renew_fail_count": fail_count,
+                            "sso_fallback": False,
+                            "sso_reauth_next_at": next_at,
+                            "removed_from_pool": False,
+                        }
+                    try:
+                        import grok2api.pool.account_pool as _pool
+
+                        _pool.mark_sso_reauth_attempt(aid)
+                    except Exception:
+                        pass
+                    print(
+                        f"  [token-refresh] permanent RT rejection; trying SSO reauth "
+                        f"account={aid[:48]}",
+                        flush=True,
+                    )
+                    sso_res = _try_sso_reauth(aid, entry)
+                    if sso_res.get("ok") and isinstance(
+                        sso_res.get("entry"), dict
+                    ):
+                        new_id = str(sso_res.get("account_id") or aid)
+                        new_entry = dict(sso_res["entry"])
+                        new_entry.pop("refresh_invalid", None)
+                        new_entry.pop("refresh_invalid_at", None)
+                        new_entry.pop("refresh_invalid_reason", None)
+                        # Device flow may rotate the RT. Persist it before the
+                        # distributed account lock is released.
+                        upsert_entry(new_id, new_entry)
+                        try:
+                            import grok2api.pool.account_pool as _pool
+
+                            _pool.record_renew_success(new_id, source="sso")
+                            if new_id != aid:
+                                _pool.remove_from_pool_after_renew_failure(
+                                    aid,
+                                    reason="sso_reauth remounted account id",
+                                    hard_delete=False,
+                                )
+                        except Exception:
+                            pass
+                        print(
+                            f"  [token-refresh] SSO reauth recovered account={new_id[:48]}",
+                            flush=True,
+                        )
+                        return {
+                            "id": new_id,
+                            "ok": True,
+                            "email": new_entry.get("email"),
+                            "expires_at": new_entry.get("expires_at"),
+                            "renew_source": "sso",
+                            "sso_fallback": True,
+                            "renew_fail_count": 0,
+                            "removed_from_pool": False,
+                        }
+                    try:
+                        import grok2api.pool.account_pool as _pool
+
+                        _pool.mark_sso_reauth_failure(
+                            aid, sso_res.get("error") or reason
+                        )
+                    except Exception:
+                        pass
+                    return {
+                        "id": aid,
+                        "ok": False,
+                        "error": sso_res.get("error") or reason,
+                        "reason": "sso_reauth_failed",
+                        "renew_fail_count": fail_count,
+                        "sso_fallback": True,
+                        "removed_from_pool": False,
+                    }
+
+                # Confirmed invalid_grant on the current stored RT. Respect the
+                # configured hard-delete/soft-disable policy instead of forcing
+                # deletion for unrelated transient errors.
+                invalid = mark_refresh_invalid(aid, reason=reason, hard_delete=None)
+                deleted = bool(invalid.get("deleted"))
+                disabled = bool(invalid.get("disabled"))
                 return {
                     "id": aid,
                     "ok": False,
                     "error": reason,
-                    "reason": "sso_reauth_cooling",
+                    "reason": (
+                        "refresh_invalid_deleted" if deleted else "refresh_invalid"
+                    ),
                     "renew_fail_count": fail_count,
                     "sso_fallback": False,
-                    "sso_reauth_next_at": next_at,
-                    "removed_from_pool": False,
+                    "removed_from_pool": bool(deleted or disabled),
+                    "deleted": deleted,
+                    "disabled": disabled,
+                    "permanent": True,
                 }
-            try:
-                import grok2api.pool.account_pool as _pool
-
-                _pool.mark_sso_reauth_attempt(aid)
-            except Exception:
-                pass
-            print(
-                f"  [token-refresh] renew fail #{fail_count}; trying SSO reauth "
-                f"account={aid[:48]}",
-                flush=True,
-            )
-            sso_res = _try_sso_reauth(aid, entry)
-            if sso_res.get("ok") and isinstance(sso_res.get("entry"), dict):
-                new_id = str(sso_res.get("account_id") or aid)
-                new_entry = dict(sso_res["entry"])
-                new_entry.pop("refresh_invalid", None)
-                new_entry.pop("refresh_invalid_at", None)
-                new_entry.pop("refresh_invalid_reason", None)
-                with updates_lock:
-                    updates[new_id] = new_entry
-                    if new_id != aid:
-                        remount_deletes.add(aid)
-                try:
-                    import grok2api.pool.account_pool as _pool
-
-                    _pool.record_renew_success(new_id, source="sso")
-                    if new_id != aid:
-                        # Old id should not remain rotation-eligible.
-                        _pool.remove_from_pool_after_renew_failure(
-                            aid,
-                            reason="sso_reauth remounted account id",
-                        )
-                except Exception:
-                    pass
-                print(
-                    f"  [token-refresh] SSO reauth recovered account={new_id[:48]}",
-                    flush=True,
-                )
-                return {
-                    "id": new_id,
-                    "ok": True,
-                    "email": new_entry.get("email"),
-                    "expires_at": new_entry.get("expires_at"),
-                    "renew_source": "sso",
-                    "sso_fallback": True,
-                    "renew_fail_count": 0,
-                    "removed_from_pool": False,
-                }
-            try:
-                import grok2api.pool.account_pool as _pool
-
-                _pool.mark_sso_reauth_failure(aid, sso_res.get("error") or reason)
-            except Exception:
-                pass
-            # Keep credentials; stay out of rotation until SSO cooldown ends.
-            return {
-                "id": aid,
-                "ok": False,
-                "error": sso_res.get("error") or reason,
-                "reason": "sso_reauth_failed",
-                "renew_fail_count": fail_count,
-                "sso_fallback": True,
-                "removed_from_pool": False,
-            }
-
-        # No SSO after two consecutive RT failures: hard-delete credentials + pool.
-        try:
-            import grok2api.pool.account_pool as _pool
-
-            _pool.remove_from_pool_after_renew_failure(
-                aid,
-                reason="连续续期失败且无 SSO，已删除账号",
-                hard_delete=True,
-            )
-        except TypeError:
-            # Older signature without hard_delete kw.
-            try:
-                import grok2api.pool.account_pool as _pool
-
-                _pool.remove_from_pool_after_renew_failure(
-                    aid,
-                    reason="连续续期失败且无 SSO，已删除账号",
-                )
-            except Exception:
-                pass
-        except Exception:
-            pass
-        print(
-            f"  [token-refresh] renew fail #{fail_count}; no SSO — HARD-deleted "
-            f"account={aid[:48]} err={reason[:120]}",
-            flush=True,
-        )
-        return {
-            "id": aid,
-            "ok": False,
-            "error": reason,
-            "reason": "no_sso_deleted",
-            "renew_fail_count": fail_count,
-            "sso_fallback": False,
-            "removed_from_pool": True,
-            "deleted": True,
-            "permanent": bool(permanent),
-        }
 
     def _refresh_one(item: tuple[str, dict[str, Any]]) -> dict[str, Any]:
         aid, entry = item
         try:
+            if not entry.get("refresh_token"):
+                return _handle_refresh_failure(
+                    aid,
+                    entry,
+                    ValueError("no refresh_token; SSO recovery required"),
+                    permanent=True,
+                )
             r = refresh_and_persist(
                 aid,
                 entry,
                 client=_thread_client(aid),
-                persist=False,
-                recheck_latest=False,
+                persist=True,
+                recheck_latest=True,
             )
-            # Successful refresh clears any previous invalid mark.
             new_entry = dict(r["entry"])
-            new_entry.pop("refresh_invalid", None)
-            new_entry.pop("refresh_invalid_at", None)
-            new_entry.pop("refresh_invalid_reason", None)
-            with updates_lock:
-                updates[r["account_id"]] = new_entry
-                if r["account_id"] != aid:
-                    remount_deletes.add(aid)
-            try:
-                import grok2api.pool.account_pool as _pool
-
-                _pool.record_renew_success(r["account_id"], source="refresh_token")
-            except Exception:
-                pass
+            if not r.get("performed", True):
+                return {
+                    "id": r["account_id"],
+                    "ok": True,
+                    "skipped": True,
+                    "reason": "concurrent_refresh",
+                    "email": new_entry.get("email"),
+                    "expires_at": new_entry.get("expires_at"),
+                }
             return {
                 "id": r["account_id"],
                 "ok": True,
@@ -1610,6 +1789,14 @@ def refresh_all_accounts(
             }
         except RefreshRevokedError as e:
             return _handle_refresh_failure(aid, entry, e, permanent=True)
+        except RefreshBusyError as e:
+            return {
+                "id": aid,
+                "ok": True,
+                "skipped": True,
+                "reason": "refresh_lock_busy",
+                "error": str(e)[:300],
+            }
         except Exception as e:  # noqa: BLE001
             return _handle_refresh_failure(aid, entry, e, permanent=False)
 
@@ -1635,91 +1822,20 @@ def refresh_all_accounts(
                         pass
                 _clients.clear()
 
-    # Failure handling is soft by default: accounts stay stored but are kept out
-    # of request rotation via pool_status=expired until refresh/SSO recovery works.
-    disabled_ids: list[str] = []
-    deleted_ids: list[str] = []
-    deleted_reasons: dict[str, str] = {}
-
-    # Single batched write for successful refreshes (+ optional hard deletes).
-    if updates or deleted_ids or remount_deletes:
-        delete_set = set(deleted_ids) | set(remount_deletes)
-
-        def _apply(m: dict[str, Any]) -> None:
-            for aid, entry in updates.items():
-                if aid == "__delete__" or not isinstance(entry, dict):
-                    continue
-                if aid in delete_set:
-                    continue
-                # Dedupe only exact same storage user_id (never by access token —
-                # colliding JWTs across accounts would wipe good ones).
-                uid = entry.get("user_id") or entry.get("principal_id")
-                for k in list(m.keys()):
-                    if k == aid:
-                        continue
-                    v = m.get(k)
-                    if not isinstance(v, dict):
-                        continue
-                    same_user = bool(
-                        uid
-                        and (v.get("user_id") == uid or v.get("principal_id") == uid)
-                    )
-                    if same_user:
-                        del m[k]
-                m[aid] = entry
-            # Hard-delete path only (opt-in). Soft path already mutated above.
-            for aid in delete_set:
-                if aid in m:
-                    del m[aid]
-
-        try:
-            mutate_auth_map(_apply)
-        except Exception as e:  # noqa: BLE001
-            return {
-                "ok": False,
-                "error": f"batch write failed: {e}"[:400],
-                "results": results,
-                "refreshed": 0,
-                "deferred": deferred,
-                "attempted": len(candidates),
-                "invalidated": len(invalid_marks),
-                "deleted": 0,
-                "disabled": 0,
-            }
-
-        if deleted_ids:
-            try:
-                from grok2api.admin.settings_store import get_account_pool_state, save_account_pool_state
-
-                state = get_account_pool_state()
-                changed = False
-                for aid in deleted_ids:
-                    if aid in state:
-                        state.pop(aid, None)
-                        changed = True
-                if changed:
-                    save_account_pool_state(state)
-            except Exception:
-                pass
-            for aid in deleted_ids:
-                try:
-                    from grok2api.store.pool_redis import clear_cooldown
-
-                    clear_cooldown(aid)
-                except Exception:
-                    pass
-            print(
-                f"  [token-refresh] HARD-deleted {len(deleted_ids)} account(s) "
-                f"with permanently invalid refresh_token "
-                f"(GROK2API_DELETE_INVALID_REFRESH=1)",
-                flush=True,
-            )
-        if disabled_ids:
-            print(
-                f"  [token-refresh] soft-disabled {len(disabled_ids)} account(s) "
-                f"with permanently invalid refresh_token",
-                flush=True,
-            )
+    # Each successful refresh is already persisted while its distributed lock
+    # is held. Summaries are derived from the per-account results.
+    deleted_ids = [str(r.get("id")) for r in results if r.get("deleted")]
+    disabled_ids = [str(r.get("id")) for r in results if r.get("disabled")]
+    invalid_marks = {
+        str(r.get("id")): str(r.get("error") or "")
+        for r in results
+        if r.get("permanent") and not r.get("skipped")
+    }
+    deleted_reasons = {
+        str(r.get("id")): str(r.get("error") or "")
+        for r in results
+        if r.get("deleted") or r.get("disabled")
+    }
 
     # Mark attempted accounts as covered for this sweep generation (success or fail).
     # Permanent invalids are also covered so they don't monopolize every cycle;
@@ -1791,6 +1907,11 @@ def purge_refresh_invalid_accounts(
     now = time.time()
     for aid, entry in list(data.items()):
         if not isinstance(entry, dict):
+            continue
+        # SSO is a durable recovery credential. Never purge it merely because
+        # the access/refresh token generation is absent or expired; the normal
+        # maintainer sweep will run device-flow recovery instead.
+        if _has_saved_sso(entry):
             continue
         if entry.get("refresh_invalid"):
             doomed.append(
