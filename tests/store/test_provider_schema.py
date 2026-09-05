@@ -117,6 +117,9 @@ class _RecordingConnection:
     def cursor(self) -> _RecordingCursor:
         return self._cursor
 
+    def commit(self) -> None:
+        return None
+
     def __enter__(self):
         return self
 
@@ -208,6 +211,90 @@ class ProviderAccountUpsertTests(unittest.TestCase):
             ),
         )
         self.assertEqual(payload, {"email": "web@example.test"})
+
+
+class LegacyBuildIsolationTests(unittest.TestCase):
+    def _patch_store(self, cursor: _RecordingCursor):
+        return (
+            mock.patch.object(accounts_pg, "enabled", return_value=True),
+            mock.patch.object(
+                accounts_pg,
+                "connection",
+                return_value=_RecordingConnection(cursor),
+            ),
+            mock.patch.object(accounts_pg, "_auth_map_cache", None),
+            mock.patch.object(accounts_pg, "_auth_map_cache_at", 0.0),
+        )
+
+    def test_legacy_map_reads_only_build_accounts(self) -> None:
+        cursor = _RecordingCursor()
+        patches = self._patch_store(cursor)
+        with patches[0], patches[1], patches[2], patches[3]:
+            self.assertEqual(accounts_pg.read_auth_map(), {})
+
+        sql, params = cursor.calls[0]
+        self.assertIn("where provider = %s", _compact(sql))
+        self.assertEqual(params, ("grok_build",))
+
+    def test_legacy_entry_lookup_is_build_scoped(self) -> None:
+        cursor = _RecordingCursor()
+        patches = self._patch_store(cursor)
+        with patches[0], patches[1], patches[2], patches[3]:
+            self.assertIsNone(accounts_pg.read_auth_entry("shared-id"))
+
+        self.assertEqual(len(cursor.calls), 2)
+        for sql, params in cursor.calls:
+            self.assertIn("provider = %s", _compact(sql))
+            self.assertEqual(params[0], "grok_build")
+
+    def test_full_map_replace_only_compares_build_rows(self) -> None:
+        cursor = _RecordingCursor()
+        patches = self._patch_store(cursor)
+        with patches[0], patches[1], patches[2], patches[3], mock.patch.object(
+            accounts_pg, "invalidate_auth_map_cache"
+        ):
+            accounts_pg.write_auth_map({})
+
+        sql, params = cursor.calls[0]
+        self.assertIn("where provider = %s", _compact(sql))
+        self.assertEqual(params, ("grok_build",))
+
+    def test_transactional_mutation_locks_only_build_rows(self) -> None:
+        cursor = _RecordingCursor()
+        patches = self._patch_store(cursor)
+        with patches[0], patches[1], patches[2], patches[3], mock.patch.object(
+            accounts_pg, "invalidate_auth_map_cache"
+        ):
+            self.assertEqual(accounts_pg.mutate_auth_map(lambda data: data.clear()), {})
+
+        account_queries = [
+            (sql, params)
+            for sql, params in cursor.calls
+            if "from accounts" in _compact(sql)
+        ]
+        self.assertEqual(len(account_queries), 2)
+        for sql, params in account_queries:
+            self.assertIn("where provider = %s", _compact(sql))
+            self.assertEqual(params, ("grok_build",))
+
+    def test_legacy_merge_dedupe_never_crosses_provider_boundary(self) -> None:
+        cursor = _RecordingCursor()
+        patches = self._patch_store(cursor)
+        with patches[0], patches[1], patches[2], patches[3], mock.patch.object(
+            accounts_pg, "invalidate_auth_map_cache"
+        ), mock.patch.object(accounts_pg, "_sync_ready_account"):
+            accounts_pg.upsert_account_merged(
+                "build-1",
+                {"user_id": "shared-user", "key": "shared-token"},
+            )
+
+        # The merge lookup and collision delete are the first two statements;
+        # later calls belong to the final row upsert and orphan-pool cleanup.
+        account_queries = cursor.calls[:2]
+        self.assertEqual(len(account_queries), 2)
+        for sql, params in account_queries:
+            self.assertIn("provider = %s", _compact(sql))
+            self.assertEqual(params[0], "grok_build")
 
 
 if __name__ == "__main__":

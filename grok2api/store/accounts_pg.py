@@ -128,7 +128,12 @@ def read_auth_map() -> dict[str, Any]:
     out: dict[str, Any] = {}
     with connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, payload FROM accounts")
+            # The legacy auth map is the Build/OAuth pool. Browser-backed
+            # providers use encrypted provider-scoped readers below.
+            cur.execute(
+                "SELECT id, payload FROM accounts WHERE provider = %s",
+                ("grok_build",),
+            )
             for row in cur.fetchall():
                 aid, payload = row[0], row[1]
                 if isinstance(payload, str):
@@ -330,21 +335,28 @@ def read_auth_entry(account_id: str) -> tuple[str, dict[str, Any]] | None:
     with connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, payload FROM accounts WHERE id = %s LIMIT 1",
-                (aid,),
+                """
+                SELECT id, payload FROM accounts
+                WHERE provider = %s AND id = %s
+                LIMIT 1
+                """,
+                ("grok_build", aid),
             )
             row = cur.fetchone()
             if not row:
                 cur.execute(
                     """
                     SELECT id, payload FROM accounts
-                    WHERE user_id = %s
-                       OR payload->>'user_id' = %s
-                       OR payload->>'principal_id' = %s
-                       OR id LIKE %s
+                    WHERE provider = %s
+                      AND (
+                        user_id = %s
+                        OR payload->>'user_id' = %s
+                        OR payload->>'principal_id' = %s
+                        OR id LIKE %s
+                      )
                     LIMIT 1
                     """,
-                    (aid, aid, aid, f"%::{aid}"),
+                    ("grok_build", aid, aid, aid, f"%::{aid}"),
                 )
                 row = cur.fetchone()
     if not row:
@@ -722,20 +734,28 @@ def list_account_summaries(
 
 
 def write_auth_map(data: dict[str, Any]) -> None:
-    """Replace full account set (import/export style)."""
+    """Replace the legacy Build account set without touching other providers."""
     if not enabled():
         return
     data = data if isinstance(data, dict) else {}
     with connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id FROM accounts")
+            cur.execute(
+                "SELECT id FROM accounts WHERE provider = %s", ("grok_build",)
+            )
             existing = {r[0] for r in cur.fetchall()}
             incoming = set(data.keys())
             # upsert all
             for aid, entry in data.items():
                 if not isinstance(entry, dict):
                     continue
-                _upsert_one(cur, str(aid), entry)
+                _upsert_one(
+                    cur,
+                    str(aid),
+                    entry,
+                    provider="grok_build",
+                    auth_type="oauth",
+                )
             # delete removed
             for aid in existing - incoming:
                 cur.execute("DELETE FROM accounts WHERE id = %s", (aid,))
@@ -753,12 +773,19 @@ def write_auth_map(data: dict[str, Any]) -> None:
 
 
 def mutate_auth_map(mutator: Callable[[dict[str, Any]], Any]) -> dict[str, Any]:
-    """Transactional read-modify-write of the full map (compatible with file API)."""
+    """Transactionally mutate Build accounts while preserving provider rows."""
     if not enabled():
         return {}
     with connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, payload FROM accounts FOR UPDATE")
+            cur.execute(
+                """
+                SELECT id, payload FROM accounts
+                WHERE provider = %s
+                FOR UPDATE
+                """,
+                ("grok_build",),
+            )
             data: dict[str, Any] = {}
             for aid, payload in cur.fetchall():
                 if isinstance(payload, str):
@@ -770,12 +797,20 @@ def mutate_auth_map(mutator: Callable[[dict[str, Any]], Any]) -> dict[str, Any]:
                     data[str(aid)] = payload
             mutator(data)
             # rewrite set
-            cur.execute("SELECT id FROM accounts")
+            cur.execute(
+                "SELECT id FROM accounts WHERE provider = %s", ("grok_build",)
+            )
             existing = {r[0] for r in cur.fetchall()}
             incoming = set(data.keys())
             for aid, entry in data.items():
                 if isinstance(entry, dict):
-                    _upsert_one(cur, str(aid), entry)
+                    _upsert_one(
+                        cur,
+                        str(aid),
+                        entry,
+                        provider="grok_build",
+                        auth_type="oauth",
+                    )
             for aid in existing - incoming:
                 cur.execute("DELETE FROM accounts WHERE id = %s", (aid,))
                 cur.execute("DELETE FROM account_pool WHERE account_id = %s", (aid,))
@@ -862,32 +897,46 @@ def upsert_account_merged(
                     cur.execute(
                         """
                         SELECT payload FROM accounts
-                        WHERE id = %s
-                           OR user_id = %s
-                           OR payload->>'user_id' = %s
-                           OR payload->>'principal_id' = %s
-                           OR payload->>'key' = %s
+                        WHERE provider = %s
+                          AND (
+                            id = %s
+                            OR user_id = %s
+                            OR payload->>'user_id' = %s
+                            OR payload->>'principal_id' = %s
+                            OR payload->>'key' = %s
+                          )
                         """,
-                        (account_id, str(uid), str(uid), str(uid), str(token)),
+                        (
+                            "grok_build",
+                            account_id,
+                            str(uid),
+                            str(uid),
+                            str(uid),
+                            str(token),
+                        ),
                     )
                 elif uid:
                     cur.execute(
                         """
                         SELECT payload FROM accounts
-                        WHERE id = %s
-                           OR user_id = %s
-                           OR payload->>'user_id' = %s
-                           OR payload->>'principal_id' = %s
+                        WHERE provider = %s
+                          AND (
+                            id = %s
+                            OR user_id = %s
+                            OR payload->>'user_id' = %s
+                            OR payload->>'principal_id' = %s
+                          )
                         """,
-                        (account_id, str(uid), str(uid), str(uid)),
+                        ("grok_build", account_id, str(uid), str(uid), str(uid)),
                     )
                 else:
                     cur.execute(
                         """
                         SELECT payload FROM accounts
-                        WHERE id = %s OR payload->>'key' = %s
+                        WHERE provider = %s
+                          AND (id = %s OR payload->>'key' = %s)
                         """,
-                        (account_id, str(token)),
+                        ("grok_build", account_id, str(token)),
                     )
                 for old_row in cur.fetchall() or []:
                     old_payload = _decode_payload(old_row[0])
@@ -899,7 +948,8 @@ def upsert_account_merged(
                     cur.execute(
                         """
                         DELETE FROM accounts
-                        WHERE id <> %s
+                        WHERE provider = %s
+                          AND id <> %s
                           AND (
                             user_id = %s
                             OR payload->>'user_id' = %s
@@ -907,28 +957,38 @@ def upsert_account_merged(
                             OR payload->>'key' = %s
                           )
                         """,
-                        (account_id, str(uid), str(uid), str(uid), str(token)),
+                        (
+                            "grok_build",
+                            account_id,
+                            str(uid),
+                            str(uid),
+                            str(uid),
+                            str(token),
+                        ),
                     )
                 elif uid:
                     cur.execute(
                         """
                         DELETE FROM accounts
-                        WHERE id <> %s
+                        WHERE provider = %s
+                          AND id <> %s
                           AND (
                             user_id = %s
                             OR payload->>'user_id' = %s
                             OR payload->>'principal_id' = %s
                           )
                         """,
-                        (account_id, str(uid), str(uid), str(uid)),
+                        ("grok_build", account_id, str(uid), str(uid), str(uid)),
                     )
                 elif token:
                     cur.execute(
                         """
                         DELETE FROM accounts
-                        WHERE id <> %s AND payload->>'key' = %s
+                        WHERE provider = %s
+                          AND id <> %s
+                          AND payload->>'key' = %s
                         """,
-                        (account_id, str(token)),
+                        ("grok_build", account_id, str(token)),
                     )
                 # Clean orphan pool rows for deleted accounts
                 cur.execute(
@@ -937,7 +997,13 @@ def upsert_account_merged(
                     WHERE NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = ap.account_id)
                     """
                 )
-            _upsert_one(cur, account_id, entry)
+            _upsert_one(
+                cur,
+                account_id,
+                entry,
+                provider="grok_build",
+                auth_type="oauth",
+            )
         conn.commit()
     invalidate_auth_map_cache()
     _sync_ready_account(account_id, entry)
