@@ -36,7 +36,7 @@ services:
       TZ: "${TZ:-Asia/Shanghai}"
       PGTZ: "${TZ:-Asia/Shanghai}"
       POSTGRES_USER: grok2api
-      POSTGRES_PASSWORD: grok2api
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-grok2api}"
       POSTGRES_DB: grok2api
     volumes:
       - grok2api_lite_pg:/var/lib/postgresql/data
@@ -81,8 +81,8 @@ services:
       # In-stack service DNS (do not use 127.0.0.1 here)
       REDIS_URL: "redis://redis:6379/0"
       GROK2API_REDIS_URL: "redis://redis:6379/0"
-      DATABASE_URL: "postgresql://grok2api:grok2api@postgres:5432/grok2api"
-      GROK2API_DATABASE_URL: "postgresql://grok2api:grok2api@postgres:5432/grok2api"
+      DATABASE_URL: "postgresql://grok2api:${POSTGRES_PASSWORD:-grok2api}@postgres:5432/grok2api"
+      GROK2API_DATABASE_URL: "postgresql://grok2api:${POSTGRES_PASSWORD:-grok2api}@postgres:5432/grok2api"
     healthcheck:
       # $$ keeps substitution inside the container so override ports work
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${GROK2API_PORT:-3000}/health >/dev/null"]
@@ -120,8 +120,8 @@ services:
       GROK2API_WORKERS: "1"
       REDIS_URL: "redis://redis:6379/0"
       GROK2API_REDIS_URL: "redis://redis:6379/0"
-      DATABASE_URL: "postgresql://grok2api:grok2api@postgres:5432/grok2api"
-      GROK2API_DATABASE_URL: "postgresql://grok2api:grok2api@postgres:5432/grok2api"
+      DATABASE_URL: "postgresql://grok2api:${POSTGRES_PASSWORD:-grok2api}@postgres:5432/grok2api"
+      GROK2API_DATABASE_URL: "postgresql://grok2api:${POSTGRES_PASSWORD:-grok2api}@postgres:5432/grok2api"
       GROK2API_WRITER_BATCH_SIZE: "${GROK2API_WRITER_BATCH_SIZE:-500}"
       GROK2API_WRITER_FLUSH_SEC: "${GROK2API_WRITER_FLUSH_SEC:-1}"
       GROK2API_WRITER_MAX_RETRIES: "${GROK2API_WRITER_MAX_RETRIES:-8}"
