@@ -55,6 +55,7 @@
 | 用量统计 | 代理侧 token / 请求：今日·近 N 天·累计；按 Key / 账号 / 模型；**首字 TTFT / 完成耗时 / 思考强度** |
 | 流式可靠性 | early SSE 信封；**假阳性 client_gone 不再丢中间 tool/text 帧**；错误/断开仍发终态帧 |
 | 容器时区 | 默认 `TZ=Asia/Shanghai`（日志与本地时间） |
+| Provider 路由 | 默认使用 `grok_build`；可选启用独立的 Grok Web / Grok Console 账号池（显式模型前缀） |
 
 ---
 
@@ -71,6 +72,31 @@
 
 默认先以 `GROK2API_READY_INDEX_MODE=shadow` 构建索引，验证后切换 `on`；旧同步路径仍可通过 feature flag 回滚。
 
+
+### Grok Build / Web / Console Provider
+
+Build 是默认且向后兼容的 Provider。Web 和 Console 默认关闭；启用后会以带命名空间的模型出现在目录中，实际调度前仍需管理员导入对应账号。Provider 之间不会因为某一池限流、额度耗尽或认证失败而隐式切换。
+
+模型名使用命名空间来固定路由：
+
+```text
+Build/grok-4.5          # 现有 cli-chat-proxy.grok.com/v1
+Web/grok-chat-fast      # grok.com Web 文本通道
+Web/grok-chat-auto
+Console/grok-4.5        # console.x.ai Responses 通道
+Console/grok-build-0.1
+```
+
+无前缀模型继续走 Build 旧路径；当同名模型同时存在多个已启用 Provider 时，必须使用前缀，避免意外消耗另一 Provider 的额度。`GET /v1/models` 会在功能开关打开时公布带命名空间的 Web/Console 路由；请求实际调度前仍需先导入对应 Provider 账号。
+
+启用步骤（建议先单账号、单 Worker 灰度）：
+
+1. 在 `.env` 设置随机的 `GROK2API_SECRET_KEY`，再将 `GROK2API_WEB_ENABLED=1` 或 `GROK2API_CONSOLE_ENABLED=1`。没有密钥时应用会拒绝启动；Build-only 不需要该密钥。
+2. 重启应用，让数据库迁移创建 Provider 字段和路由表。
+3. 进入管理台「账号」，选择 Grok Web 或 Grok Console，导入对应 SSO/TXT/JSON。SSO、Cookie 和 Console DPoP 材料只保存为加密凭据，不会写入公开 payload 或日志。
+4. 用带前缀的模型发起请求。Console 文本第一版使用 OpenAI Responses API（`/v1/responses`）；Console 的 `/v1/chat/completions` 会返回明确错误，请改用 Responses。Web 当前支持单轮文本和 SSE/连续 JSON 流；图片、视频、工具和多轮历史附件尚未纳入该第一版。
+
+功能开关与地址见 [`.env.example`](./.env.example)：`GROK2API_WEB_ENABLED`、`GROK2API_CONSOLE_ENABLED`、`GROK2API_WEB_BASE_URL`、`GROK2API_CONSOLE_BASE_URL` 和 `GROK2API_CONSOLE_SESSION_BASE_URL`。生产环境还应使用 HTTPS、限制管理台访问并定期轮换密钥；不要把 SSO/Cookie/DPoP 粘贴到 issue、日志或聊天记录中。
 
 ## 快速开始
 
@@ -129,6 +155,8 @@ DATABASE_URL=postgresql://grok2api:grok2api@postgres:5432/grok2api
 | `GROK2API_READY_INDEX_MODE` | `shadow` 先建索引，验证后切 `on` 关闭全量 payload 路径 |
 | `TZ` | 容器时区，默认 `Asia/Shanghai` |
 | `GROK2API_RELOAD` | 开发热更新：`1` 开启（强制单 worker）；生产保持 `0` |
+| `GROK2API_SECRET_KEY` | Web/Console 凭据加密密钥；启用任一浏览器 Provider 时必填，使用高熵随机值 |
+| `GROK2API_WEB_ENABLED` / `GROK2API_CONSOLE_ENABLED` | Web / Console 功能开关，默认 `0`；保持关闭即可继续使用 Build-only |
 
 完整模板见 [`.env.example`](./.env.example)。**生产请修改默认数据库密码。**
 

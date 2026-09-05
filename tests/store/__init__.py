@@ -1,0 +1,1 @@
+"""Store integration tests."""

@@ -229,10 +229,34 @@ def _normalize_model_scope(model: str | None) -> str | None:
     return m[:80]
 
 
-def _fp_parts_base(*, api_key_id: str | None = None, model: str | None = None) -> list[str]:
+def _normalize_provider_scope(provider: str | None) -> str:
+    """Return a stable provider namespace for affinity keys.
+
+    Historical callers omit the provider and therefore keep their exact Build
+    fingerprints.  New Web/Console callers must pass a provider so the same
+    client/model/session cannot bind to an account in another credential pool.
+    """
+    raw = str(provider or "").strip().lower().replace("-", "_")
+    aliases = {
+        "build": "grok_build",
+        "web": "grok_web",
+        "console": "grok_console",
+    }
+    return aliases.get(raw, raw)[:40]
+
+
+def _fp_parts_base(
+    *,
+    api_key_id: str | None = None,
+    model: str | None = None,
+    provider: str | None = None,
+) -> list[str]:
     parts: list[str] = []
     if api_key_id:
         parts.append(f"key:{api_key_id}")
+    provider_scope = _normalize_provider_scope(provider)
+    if provider_scope:
+        parts.append(f"provider:{provider_scope}")
     m = _normalize_model_scope(model)
     if m:
         parts.append(f"model:{m}")
@@ -289,6 +313,7 @@ def messages_content_fingerprint(
     *,
     api_key_id: str | None = None,
     model: str | None = None,
+    provider: str | None = None,
     mode: str | None = None,
 ) -> str | None:
     """Fingerprint from message contents when no explicit session id is present.
@@ -311,7 +336,7 @@ def messages_content_fingerprint(
     digest = _message_hash_material(messages, mode=use_mode)
     if not digest:
         return None
-    parts = _fp_parts_base(api_key_id=api_key_id, model=model)
+    parts = _fp_parts_base(api_key_id=api_key_id, model=model, provider=provider)
     parts.append(f"msg{use_mode}:{digest}")
     return _finalize_fp(parts)
 
@@ -324,6 +349,7 @@ def conversation_fingerprint(
     api_key_id: str | None = None,
     prompt_cache_key: str | None = None,
     model: str | None = None,
+    provider: str | None = None,
 ) -> str | None:
     """
     Stable id for one multi-turn chat. Same sticky identity → same fingerprint
@@ -346,7 +372,7 @@ def conversation_fingerprint(
     if not _enabled():
         return None
 
-    parts = _fp_parts_base(api_key_id=api_key_id, model=model)
+    parts = _fp_parts_base(api_key_id=api_key_id, model=model, provider=provider)
 
     cid = (conversation_id or "").strip()
     if cid:
@@ -379,6 +405,7 @@ def response_chain_fingerprint(
     response_id: str | None,
     *,
     api_key_id: str | None = None,
+    provider: str | None = None,
 ) -> str | None:
     """Sticky key for OpenAI Responses ``previous_response_id`` chains.
 
@@ -395,6 +422,9 @@ def response_chain_fingerprint(
     parts: list[str] = []
     if api_key_id:
         parts.append(f"key:{api_key_id}")
+    provider_scope = _normalize_provider_scope(provider)
+    if provider_scope:
+        parts.append(f"provider:{provider_scope}")
     parts.append(f"resp:{rid}")
     return "fp:" + hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:32]
 

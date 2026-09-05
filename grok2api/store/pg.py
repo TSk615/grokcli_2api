@@ -25,6 +25,12 @@ CREATE TABLE IF NOT EXISTS accounts (
   email TEXT,
   user_id TEXT,
   team_id TEXT,
+  provider TEXT NOT NULL DEFAULT 'grok_build',
+  auth_type TEXT NOT NULL DEFAULT 'oauth',
+  source_key TEXT,
+  credential_enc TEXT,
+  web_tier TEXT,
+  egress_identity TEXT,
   payload JSONB NOT NULL,
   expires_at TIMESTAMPTZ,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -76,6 +82,36 @@ CREATE TABLE IF NOT EXISTS account_pool (
 
 # Columns / tables added after initial deploy — applied idempotently on connect.
 _SCHEMA_MIGRATIONS = (
+    # Provider-aware account metadata. Defaults make every pre-existing account
+    # an explicit Build/OAuth account without rewriting or discarding payloads.
+    "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT 'grok_build'",
+    "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS auth_type TEXT NOT NULL DEFAULT 'oauth'",
+    "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS source_key TEXT",
+    "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS credential_enc TEXT",
+    "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS web_tier TEXT",
+    "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS egress_identity TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_accounts_provider ON accounts (provider)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_provider_source_key ON accounts (provider, source_key) WHERE source_key IS NOT NULL",
+    # A public model may route once per provider/capability. Multiple providers
+    # for the same public model remain explicit, independently prioritized rows.
+    """
+    CREATE TABLE IF NOT EXISTS model_routes (
+      id BIGSERIAL PRIMARY KEY,
+      public_model TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      upstream_model TEXT NOT NULL,
+      capability TEXT NOT NULL,
+      priority INT NOT NULL DEFAULT 1,
+      enabled BOOLEAN NOT NULL DEFAULT true,
+      minimum_tier TEXT,
+      extra JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_model_routes_unique ON model_routes (public_model, provider, capability)",
+    "CREATE INDEX IF NOT EXISTS idx_model_routes_lookup ON model_routes (public_model, capability, enabled, priority)",
+    "CREATE INDEX IF NOT EXISTS idx_model_routes_provider ON model_routes (provider, enabled, priority)",
     "ALTER TABLE account_pool ADD COLUMN IF NOT EXISTS extra JSONB NOT NULL DEFAULT '{}'::jsonb",
     # Durable account status fields (bound to account_id; not recomputed from Redis).
     "ALTER TABLE account_pool ADD COLUMN IF NOT EXISTS pool_status TEXT NOT NULL DEFAULT 'normal'",
@@ -163,6 +199,8 @@ _SCHEMA_MIGRATIONS = (
       api_key_id TEXT,
       account_id TEXT,
       model TEXT,
+      provider TEXT NOT NULL DEFAULT 'grok_build',
+      upstream_model TEXT,
       protocol TEXT,
       path TEXT,
       stream BOOLEAN,
@@ -186,11 +224,15 @@ _SCHEMA_MIGRATIONS = (
     "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS ttft_ms INT",
     "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS event_id TEXT",
     "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS capture_reason TEXT",
+    "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT 'grok_build'",
+    "ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS upstream_model TEXT",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_events_event_id ON usage_events (event_id) WHERE event_id IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS idx_usage_events_created_at ON usage_events (created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_usage_events_api_key ON usage_events (api_key_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_usage_events_account ON usage_events (account_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_usage_events_model ON usage_events (model, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_usage_events_provider ON usage_events (provider, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_usage_events_upstream_model ON usage_events (upstream_model, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_usage_events_protocol ON usage_events (protocol, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_usage_events_client_ip ON usage_events (client_ip, created_at DESC)",
     # New detail writes use a range-partitioned table. The legacy heap remains
@@ -202,6 +244,8 @@ _SCHEMA_MIGRATIONS = (
       api_key_id TEXT,
       account_id TEXT,
       model TEXT,
+      provider TEXT NOT NULL DEFAULT 'grok_build',
+      upstream_model TEXT,
       protocol TEXT,
       path TEXT,
       stream BOOLEAN,
@@ -223,12 +267,16 @@ _SCHEMA_MIGRATIONS = (
       capture_reason TEXT
     ) PARTITION BY RANGE (created_at)
     """,
+    "ALTER TABLE usage_events_partitioned ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT 'grok_build'",
+    "ALTER TABLE usage_events_partitioned ADD COLUMN IF NOT EXISTS upstream_model TEXT",
     "CREATE INDEX IF NOT EXISTS idx_usage_events_part_created ON usage_events_partitioned (created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_usage_events_part_event ON usage_events_partitioned (event_id, created_at) WHERE event_id IS NOT NULL",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_events_part_event_unique ON usage_events_partitioned (event_id, created_at) WHERE event_id IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS idx_usage_events_part_key ON usage_events_partitioned (api_key_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_usage_events_part_account ON usage_events_partitioned (account_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_usage_events_part_model ON usage_events_partitioned (model, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_usage_events_part_provider ON usage_events_partitioned (provider, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_usage_events_part_upstream_model ON usage_events_partitioned (upstream_model, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_usage_events_part_protocol ON usage_events_partitioned (protocol, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_usage_events_part_ip ON usage_events_partitioned (client_ip, created_at DESC)",
     """
@@ -237,14 +285,14 @@ _SCHEMA_MIGRATIONS = (
              stream, ok, prompt_tokens, completion_tokens, total_tokens,
              cache_read_tokens, cache_creation_tokens, reasoning_tokens,
              client_ip, user_agent, status_code, latency_ms, ttft_ms, error,
-             detail, event_id, capture_reason
+             detail, event_id, capture_reason, provider, upstream_model
       FROM usage_events
       UNION ALL
       SELECT id, created_at, api_key_id, account_id, model, protocol, path,
              stream, ok, prompt_tokens, completion_tokens, total_tokens,
              cache_read_tokens, cache_creation_tokens, reasoning_tokens,
              client_ip, user_agent, status_code, latency_ms, ttft_ms, error,
-             detail, event_id, capture_reason
+             detail, event_id, capture_reason, provider, upstream_model
       FROM usage_events_partitioned
     """,
     # Redis Streams consumer inbox. It makes additive rollups idempotent when a

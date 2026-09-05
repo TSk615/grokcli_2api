@@ -1,0 +1,13 @@
+data: {"result":{"conversation":{"conversationId":"conversation-1"}}}
+
+data: {"result":{"response":{"token":"I should check. ","isThinking":true,"messageTag":"analysis"}}}
+
+data: {"result":{"response":{"token":"Hello ","isThinking":false,"messageTag":"final"}}}
+
+data: {"result":{"response":{"webSearchResults":[{"url":"https://example.com/source","title":"Example source"}]}}}
+
+data: {"result":{"response":{"modelResponse":{"message":"Hello world"}}}}
+
+data: {"future":{"unknown":true}}
+
+data: [DONE]

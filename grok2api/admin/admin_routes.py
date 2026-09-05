@@ -179,10 +179,13 @@ class AccountEnabledBody(BaseModel):
 
 class ImportAuthBody(BaseModel):
     """Import token / auth.json content for Linux servers."""
-    payload: str | dict = Field(
+    payload: str | dict | list = Field(
         description="JWT string, single entry JSON, or full auth.json map"
     )
     merge: bool = Field(default=True, description="Merge into existing auth.json")
+    provider: str = Field(default="grok_build", description="grok_build|grok_web|grok_console")
+    web_tier: str | None = Field(default=None, description="basic|super|heavy for grok_web")
+    egress_identity: str | None = Field(default=None, max_length=256)
 
 
 class ImportSsoBody(BaseModel):
@@ -764,6 +767,10 @@ async def list_accounts_route(
     q: str = "",
     sort: str = "newest",
     summary: bool = False,
+    provider: str | None = Query(
+        default=None,
+        description="Filter by grok_build, grok_web, or grok_console",
+    ),
     has_sso: bool | None = Query(
         default=None,
         description="true=only accounts with SSO cookie; false=only without SSO; omit=all",
@@ -779,6 +786,14 @@ async def list_accounts_route(
     - has_sso: filter accounts that keep a non-empty SSO cookie
     """
     require_admin(request, x_admin_token)
+    provider_name: str | None = None
+    if provider:
+        try:
+            from grok2api.providers.types import ProviderName
+
+            provider_name = ProviderName.normalize(provider).value
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
     try:
         _reconcile_saved_sso_to_accounts()
     except Exception:
@@ -793,6 +808,15 @@ async def list_accounts_route(
 
     if summary:
         status = accounts.account_status(include_accounts=False)
+        if provider_name:
+            try:
+                from grok2api.store.accounts_pg import count_accounts
+
+                status["account_count"] = count_accounts(provider=provider_name)
+                status["active_count"] = status["account_count"]
+            except Exception:
+                pass
+            status["provider"] = provider_name
         status["pool"] = account_pool.pool_summary(include_accounts=False)
         status["page"] = 1
         status["page_size"] = 0
@@ -814,7 +838,12 @@ async def list_accounts_route(
         # in registration-session backups that are reconciled just above.
         if pg_on() and has_sso is None:
             paged = list_account_summaries(
-                q=q, page=page, page_size=page_size, sort=sort_key, has_sso=has_sso
+                q=q,
+                page=page,
+                page_size=page_size,
+                sort=sort_key,
+                has_sso=has_sso,
+                provider=provider_name,
             )
             page_items = list(paged.get("accounts") or [])
             ids = [str(a.get("id")) for a in page_items if a.get("id")]
@@ -904,6 +933,7 @@ async def list_accounts_route(
                 "q": (q or "").strip(),
                 "sort": paged.get("sort") or sort_key,
                 "has_sso": has_sso if has_sso is not None else paged.get("has_sso"),
+                "provider": provider_name,
                 "paged": True,
                 "fast_path": True,
             }
@@ -943,6 +973,13 @@ async def list_accounts_route(
             "in_cooldown": p.get("in_cooldown", False),
         }
         rows.append(item)
+
+    if provider_name:
+        rows = [
+            row
+            for row in rows
+            if str(row.get("provider") or "grok_build") == provider_name
+        ]
 
     query = (q or "").strip().lower()
     if query:
@@ -1026,6 +1063,7 @@ async def list_accounts_route(
         "q": (q or "").strip(),
         "sort": sort_key,
         "has_sso": has_sso,
+        "provider": provider_name,
         "paged": True,
         "fast_path": False,
     }
@@ -1072,7 +1110,26 @@ async def import_account(
 ):
     """Import JWT / auth.json JSON body (API / script). Prefer file upload for UI."""
     require_admin(request, x_admin_token)
-    result = accounts.import_auth_payload(body.payload, merge=body.merge)
+    try:
+        from grok2api.providers.types import ProviderName
+
+        provider = ProviderName.normalize(body.provider)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    if provider is ProviderName.BUILD:
+        result = accounts.import_auth_payload(body.payload, merge=body.merge)
+    else:
+        try:
+            from grok2api.admin.provider_accounts import import_provider_accounts
+
+            result = import_provider_accounts(
+                provider,
+                body.payload,
+                web_tier=body.web_tier,
+                egress_identity=body.egress_identity,
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error") or "import failed")
     return result

@@ -76,6 +76,8 @@ _allowed_tool_names_ctx: ContextVar[set[str] | None] = ContextVar(
 _http_client: httpx.AsyncClient | None = None
 _http_clients_by_proxy: OrderedDict[str, httpx.AsyncClient] = OrderedDict()
 _http_client_lock = asyncio.Lock() if hasattr(asyncio, "Lock") else None  # set later
+_console_gateways: OrderedDict[int, Any] = OrderedDict()
+_web_gateways: OrderedDict[int, Any] = OrderedDict()
 
 
 def _proxy_client_cache_limit() -> int:
@@ -399,6 +401,8 @@ async def _close_http_client() -> None:
         _http_client = None
     clients.extend(list(_http_clients_by_proxy.values()))
     _http_clients_by_proxy.clear()
+    _console_gateways.clear()
+    _web_gateways.clear()
     for c in clients:
         if c is not None and not c.is_closed:
             try:
@@ -417,6 +421,10 @@ def _on_startup() -> None:
     Multi-worker: only the elected maintainer leader starts token_maintainer
     and model_health (see store.leader).
     """
+    # Web/Console persist browser credentials and therefore may never start in
+    # plaintext-secret mode. Build-only deployments retain historical behavior.
+    _config.validate_provider_security()
+
     # Fail-closed: multi-worker without Redis must not serve split-brain state.
     try:
         from grok2api.store.redis_client import ensure_redis_or_raise
@@ -4043,7 +4051,19 @@ async def admin_settings_page():
 @app.get("/v1/models", dependencies=[Depends(require_api_key)])
 @app.get("/models", dependencies=[Depends(require_api_key)])
 async def list_models():
-    return {"object": "list", "data": load_models_from_cache()}
+    build_models = load_models_from_cache()
+    if not (_config.WEB_PROVIDER_ENABLED or _config.CONSOLE_PROVIDER_ENABLED):
+        return {"object": "list", "data": build_models}
+    from grok2api.providers import (
+        append_optional_provider_models,
+        create_provider_registry,
+    )
+
+    registry = create_provider_registry()
+    return {
+        "object": "list",
+        "data": append_optional_provider_models(build_models, registry),
+    }
 
 
 def _retryable_status(code: int) -> bool:
@@ -4222,6 +4242,184 @@ def _note_request_metrics(
         pass
 
 
+def _web_chat_chunk(
+    chat_id: str,
+    model: str,
+    created: int,
+    delta: dict[str, Any],
+    *,
+    finish_reason: str | None = None,
+) -> str:
+    payload = {
+        "id": chat_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason,
+            }
+        ],
+    }
+    return f"data: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
+
+
+def _web_citation_annotation(citation: Any) -> dict[str, Any]:
+    return {
+        "type": "url_citation",
+        "url_citation": {
+            "url": citation.url,
+            "title": citation.title or citation.url,
+            "start_index": 0,
+            "end_index": 0,
+        },
+    }
+
+
+async def _web_chat_completions(
+    req: ChatCompletionRequest,
+    request: Request,
+) -> Response:
+    """Run an explicitly namespaced Web chat without touching the Build pool."""
+    from grok2api.providers import create_provider_registry
+    from grok2api.providers.accounts import acquire_provider_sequence
+    from grok2api.providers.types import ProviderName
+    from grok2api.providers.web import GrokWebGateway, WebDeltaKind
+
+    registry = create_provider_registry()
+    route = registry.resolve(req.model or "", capability="chat")
+    accounts = await asyncio.to_thread(
+        acquire_provider_sequence,
+        ProviderName.WEB,
+        minimum_tier=route.minimum_tier,
+    )
+    client = await get_http_client()
+    gateway_key = id(client)
+    gateway = _web_gateways.get(gateway_key)
+    if gateway is None:
+        gateway = GrokWebGateway(client, base_url=_config.WEB_PROVIDER_BASE_URL)
+        _web_gateways[gateway_key] = gateway
+        while len(_web_gateways) > 4:
+            _web_gateways.popitem(last=False)
+
+    body = req.model_dump(exclude_none=True)
+    body["model"] = route.public_model
+    chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = int(time.time())
+    response_model = route.qualified_model
+    headers = {
+        "X-Grok2API-Provider": ProviderName.WEB.value,
+        "X-Grok2API-Accounts": str(len(accounts)),
+    }
+
+    if req.stream:
+        async def _stream_web():
+            yield _web_chat_chunk(chat_id, response_model, created, {"role": "assistant"})
+            started = False
+            last_error: Exception | None = None
+            for account in accounts:
+                try:
+                    async for item in gateway.iter_chat(body, account.credential):
+                        if await request.is_disconnected():
+                            return
+                        started = True
+                        if item.kind is WebDeltaKind.TEXT:
+                            yield _web_chat_chunk(
+                                chat_id, response_model, created, {"content": item.text}
+                            )
+                        elif item.kind is WebDeltaKind.REASONING:
+                            yield _web_chat_chunk(
+                                chat_id,
+                                response_model,
+                                created,
+                                {"reasoning_content": item.text},
+                            )
+                        elif item.kind is WebDeltaKind.CITATION and item.citation:
+                            yield _web_chat_chunk(
+                                chat_id,
+                                response_model,
+                                created,
+                                {"annotations": [_web_citation_annotation(item.citation)]},
+                            )
+                    yield _web_chat_chunk(
+                        chat_id, response_model, created, {}, finish_reason="stop"
+                    )
+                    yield "data: [DONE]\n\n"
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    if started:
+                        break
+                    continue
+            error_payload = {
+                "error": {
+                    "message": "Grok Web request failed",
+                    "type": "upstream_error",
+                }
+            }
+            yield f"data: {json.dumps(error_payload, separators=(',', ':'))}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            _stream_web(),
+            media_type="text/event-stream",
+            headers={
+                **headers,
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    last_error: Exception | None = None
+    for account in accounts:
+        text_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        annotations: list[dict[str, Any]] = []
+        try:
+            async for item in gateway.iter_chat(body, account.credential):
+                if item.kind is WebDeltaKind.TEXT:
+                    text_parts.append(item.text)
+                elif item.kind is WebDeltaKind.REASONING:
+                    reasoning_parts.append(item.text)
+                elif item.kind is WebDeltaKind.CITATION and item.citation:
+                    annotations.append(_web_citation_annotation(item.citation))
+            message: dict[str, Any] = {
+                "role": "assistant",
+                "content": "".join(text_parts),
+            }
+            if reasoning_parts:
+                message["reasoning_content"] = "".join(reasoning_parts)
+            if annotations:
+                message["annotations"] = annotations
+            return JSONResponse(
+                {
+                    "id": chat_id,
+                    "object": "chat.completion",
+                    "created": created,
+                    "model": response_model,
+                    "choices": [
+                        {"index": 0, "message": message, "finish_reason": "stop"}
+                    ],
+                    "usage": {
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "total_tokens": 0,
+                    },
+                },
+                headers=headers,
+            )
+        except Exception as exc:
+            last_error = exc
+            continue
+    return openai_error(
+        "Grok Web request failed",
+        status=502,
+        err_type="upstream_error",
+    )
+
+
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
 async def chat_completions(
@@ -4234,9 +4432,49 @@ async def chat_completions(
             "messages is required", status=400, err_type="invalid_request_error"
         )
 
+    # Keep the legacy unqualified path byte-for-byte compatible while allowing
+    # callers to make the Build namespace explicit.  ``resolve_model`` is an
+    # intentionally small legacy helper and does not know provider prefixes;
+    # strip ``Build/`` before handing the model to it.  Web/Console are handled
+    # above and never fall through into the Build account pool.
+    build_model_ref = req.model
+    if req.model:
+        try:
+            from grok2api.providers.registry import parse_model_reference
+            from grok2api.providers.types import ProviderName
+
+            requested_provider, parsed_model = parse_model_reference(req.model)
+            if requested_provider is ProviderName.BUILD:
+                build_model_ref = parsed_model
+        except ValueError as exc:
+            return openai_error(str(exc), status=400, err_type="invalid_request_error")
+        if requested_provider is ProviderName.WEB:
+            if not _config.WEB_PROVIDER_ENABLED:
+                return openai_error(
+                    "grok_web provider is disabled",
+                    status=400,
+                    err_type="invalid_request_error",
+                )
+            try:
+                return await _web_chat_completions(req, request)
+            except (ValueError, LookupError) as exc:
+                return openai_error(
+                    str(exc), status=400, err_type="invalid_request_error"
+                )
+            except Exception:
+                return openai_error(
+                    "Grok Web request failed", status=502, err_type="upstream_error"
+                )
+        if requested_provider is ProviderName.CONSOLE:
+            return openai_error(
+                "grok_console chat uses /v1/responses",
+                status=400,
+                err_type="invalid_request_error",
+            )
+
     key_id = _api_key_id(api_key)
     timing = RequestTiming(protocol="openai", stream=bool(req.stream))
-    model = resolve_model(req.model)
+    model = resolve_model(build_model_ref)
     timing.model = model
     try:
         _stamp_usage_reasoning_effort(
@@ -5595,6 +5833,7 @@ def _resolve_anthropic_affinity(
             user=anth.metadata_user_id(req),
             messages=oa_msgs,
         )
+
     fp = conversation_affinity.conversation_fingerprint(
         oa_msgs,
         user=anth.metadata_user_id(req),
@@ -6107,8 +6346,101 @@ async def openai_responses(
             err_type="invalid_request_error",
         )
 
+    # Explicit Console namespace selects the isolated Console account pool and
+    # native Responses transport. Unqualified model IDs retain legacy Build
+    # behavior exactly; there is no implicit cross-provider fallback.
+    from grok2api.providers.types import ProviderName
+
+    requested_provider = None
+    build_model_ref = req_body.get("model")
+    if req_body.get("model"):
+        try:
+            from grok2api.providers.registry import parse_model_reference
+
+            requested_provider, parsed_model = parse_model_reference(req_body["model"])
+            if requested_provider is ProviderName.BUILD:
+                build_model_ref = parsed_model
+        except ValueError as exc:
+            return openai_error(str(exc), status=400, err_type="invalid_request_error")
+    if requested_provider is ProviderName.CONSOLE:
+        if not _config.CONSOLE_PROVIDER_ENABLED:
+            return openai_error(
+                "grok_console provider is disabled",
+                status=400,
+                err_type="invalid_request_error",
+            )
+        try:
+            from grok2api.providers import create_provider_registry
+            from grok2api.providers.accounts import acquire_provider_sequence
+            from grok2api.providers.console import (
+                ConsoleDPoPClient,
+                ConsoleDPoPConfig,
+                ConsoleGateway,
+                ConsoleResponsesTransport,
+            )
+
+            registry = create_provider_registry()
+            route = registry.resolve(req_body.get("model"), capability="responses")
+            provider_accounts = await asyncio.to_thread(
+                acquire_provider_sequence, ProviderName.CONSOLE
+            )
+            http_client = await get_http_client()
+            gateway_key = id(http_client)
+            gateway = _console_gateways.get(gateway_key)
+            if gateway is None:
+                dpop = ConsoleDPoPClient(
+                    http_client,
+                    ConsoleDPoPConfig(base_url=_config.CONSOLE_PROVIDER_BASE_URL),
+                )
+                gateway = ConsoleGateway(ConsoleResponsesTransport(dpop))
+                _console_gateways[gateway_key] = gateway
+                while len(_console_gateways) > 4:
+                    _console_gateways.popitem(last=False)
+            result = await gateway.forward(req_body, route, provider_accounts)
+            upstream = result.response
+            response_headers = {
+                "X-Grok2API-Provider": ProviderName.CONSOLE.value,
+                "X-Grok2API-Accounts": str(result.attempts),
+            }
+            content_type = upstream.headers.get("content-type")
+            if content_type:
+                response_headers["Content-Type"] = content_type
+            if bool(req_body.get("stream")):
+                async def _console_bytes():
+                    try:
+                        async for chunk in upstream.aiter_bytes():
+                            yield chunk
+                    finally:
+                        await upstream.aclose()
+
+                return StreamingResponse(
+                    _console_bytes(),
+                    status_code=upstream.status_code,
+                    media_type=None,
+                    headers=response_headers,
+                )
+            content = await upstream.aread()
+            await upstream.aclose()
+            return Response(
+                content=content,
+                status_code=upstream.status_code,
+                media_type=None,
+                headers=response_headers,
+            )
+        except Exception as exc:
+            # Provider errors are deliberately sanitized. Never include request
+            # objects, SSO cookies, DPoP proofs, or chained transport contexts.
+            message = str(exc) if isinstance(exc, (ValueError, LookupError)) else "Grok Console request failed"
+            return openai_error(message, status=502, err_type="upstream_error")
+    if requested_provider is ProviderName.WEB:
+        return openai_error(
+            "grok_web supports chat/completions, not Responses",
+            status=400,
+            err_type="invalid_request_error",
+        )
+
     key_id = _api_key_id(api_key)
-    model = resolve_model(req_body.get("model"))
+    model = resolve_model(build_model_ref)
     want_stream = bool(req_body.get("stream"))
     response_id = oai_resp.new_response_id()
     created_at = int(time.time())

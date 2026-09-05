@@ -144,6 +144,150 @@ def read_auth_map() -> dict[str, Any]:
         return dict(out)
 
 
+def read_provider_auth_map(provider: str) -> dict[str, Any]:
+    """Read account payloads belonging to one provider.
+
+    This deliberately bypasses the legacy whole-map cache: the cache predates
+    provider metadata and contains payloads only, so it cannot safely filter
+    accounts when IDs or payload shapes overlap across provider integrations.
+    """
+    provider_name = str(provider or "").strip().lower()
+    if not enabled() or not provider_name:
+        return {}
+    out: dict[str, Any] = {}
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, payload FROM accounts WHERE provider = %s",
+                (provider_name,),
+            )
+            for account_id, payload in cur.fetchall():
+                decoded = _decode_payload(payload)
+                if isinstance(decoded, dict):
+                    out[str(account_id)] = decoded
+    return out
+
+
+def read_provider_auth_entry(
+    account_id: str, provider: str
+) -> tuple[str, dict[str, Any]] | None:
+    """Resolve an account ID/user ID while enforcing provider isolation."""
+    aid = str(account_id or "").strip()
+    provider_name = str(provider or "").strip().lower()
+    if not enabled() or not aid or not provider_name:
+        return None
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, payload FROM accounts
+                WHERE provider = %s
+                  AND (
+                    id = %s
+                    OR user_id = %s
+                    OR payload->>'user_id' = %s
+                    OR payload->>'principal_id' = %s
+                    OR id LIKE %s
+                  )
+                ORDER BY CASE WHEN id = %s THEN 0 ELSE 1 END
+                LIMIT 1
+                """,
+                (provider_name, aid, aid, aid, aid, f"%::{aid}", aid),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    decoded = _decode_payload(row[1])
+    if not isinstance(decoded, dict):
+        return None
+    return str(row[0]), decoded
+
+
+def find_account_by_source(
+    provider: str, source_key: str
+) -> tuple[str, dict[str, Any]] | None:
+    """Look up a provider account by its stable, provider-scoped source key."""
+    provider_name = str(provider or "").strip().lower()
+    stable_key = str(source_key or "").strip()
+    if not enabled() or not provider_name or not stable_key:
+        return None
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, payload FROM accounts
+                WHERE provider = %s AND source_key = %s
+                LIMIT 1
+                """,
+                (provider_name, stable_key),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    decoded = _decode_payload(row[1])
+    if not isinstance(decoded, dict):
+        return None
+    return str(row[0]), decoded
+
+
+def read_provider_credential_envelope(
+    account_id: str, provider: str
+) -> tuple[str, str | None] | None:
+    """Read an encrypted credential envelope with a provider-scoped lookup.
+
+    The decrypted secret is never handled by this lower-level account module.
+    Plaintext/invalid envelopes are returned as-is so the credential repository
+    can reject them without silently falling back to historical payload fields.
+    """
+    aid = str(account_id or "").strip()
+    provider_name = str(provider or "").strip().lower()
+    if not enabled() or not aid or not provider_name:
+        return None
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT credential_enc, source_key FROM accounts
+                WHERE id = %s AND provider = %s
+                LIMIT 1
+                """,
+                (aid, provider_name),
+            )
+            row = cur.fetchone()
+    if not row or not isinstance(row[0], str) or not row[0]:
+        return None
+    return row[0], (str(row[1]) if row[1] is not None else None)
+
+
+def list_provider_account_refs(provider: str) -> list[dict[str, Any]]:
+    """List non-secret routing metadata for one encrypted Provider pool."""
+    provider_name = str(provider or "").strip().lower()
+    if not enabled() or not provider_name:
+        return []
+    with connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, source_key, web_tier, egress_identity
+                FROM accounts
+                WHERE provider = %s
+                  AND credential_enc LIKE 'enc:v1:%%'
+                ORDER BY updated_at DESC, id ASC
+                """,
+                (provider_name,),
+            )
+            rows = cur.fetchall()
+    return [
+        {
+            "id": str(row[0]),
+            "source_key": str(row[1]) if row[1] is not None else None,
+            "web_tier": str(row[2]) if row[2] is not None else None,
+            "egress_identity": str(row[3]) if row[3] is not None else None,
+        }
+        for row in rows
+    ]
+
+
 def read_auth_entry(account_id: str) -> tuple[str, dict[str, Any]] | None:
     """O(1)-ish single-account read for sticky TTFT path.
 
@@ -228,12 +372,20 @@ def _decode_payload(payload: Any) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def count_accounts() -> int:
+def count_accounts(*, provider: str | None = None) -> int:
+    """Count all accounts, or only accounts owned by one provider."""
     if not enabled():
         return 0
+    provider_name = str(provider or "").strip().lower()
     with connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM accounts")
+            if provider_name:
+                cur.execute(
+                    "SELECT COUNT(*) FROM accounts WHERE provider = %s",
+                    (provider_name,),
+                )
+            else:
+                cur.execute("SELECT COUNT(*) FROM accounts")
             row = cur.fetchone()
     return int(row[0] or 0) if row else 0
 
@@ -292,6 +444,7 @@ def list_account_summaries(
     page_size: int = 25,
     sort: str | None = None,
     has_sso: bool | None = None,
+    provider: str | None = None,
 ) -> dict[str, Any]:
     """Paged account list for admin UI without loading the full auth map.
 
@@ -299,6 +452,7 @@ def list_account_summaries(
     `sort` defaults to newest (updated_at DESC) so fresh registrations appear first.
     `has_sso=True` returns only accounts whose payload keeps a non-empty SSO cookie.
     `has_sso=False` returns only accounts without SSO.
+    `provider` limits results to one provider while preserving the legacy all-provider default.
     """
     sort_key = normalize_account_sort(sort)
     order_sql = _ACCOUNT_SORT_SQL[sort_key]
@@ -320,6 +474,7 @@ def list_account_summaries(
             "q": q,
             "sort": sort_key,
             "has_sso": has_sso,
+            "provider": provider,
         }
 
     query = (q or "").strip().lower()
@@ -338,10 +493,14 @@ def list_account_summaries(
         size_i = max(1, min(200, size_i))
 
     like = f"%{query}%" if query else None
+    provider_name = str(provider or "").strip().lower()
+    provider_clause = " AND provider = %s" if provider_name else ""
     sso_clause = ""
     if has_sso is True:
         sso_clause = (
             " AND ("
+            " lower(COALESCE(auth_type,'')) = 'sso'"
+            " OR"
             " nullif(btrim(COALESCE(payload->>'sso','')), '') IS NOT NULL"
             " OR nullif(btrim(COALESCE(payload->>'sso_cookie','')), '') IS NOT NULL"
             " OR nullif(btrim(COALESCE(payload->>'sso_token','')), '') IS NOT NULL"
@@ -359,6 +518,8 @@ def list_account_summaries(
     elif has_sso is False:
         sso_clause = (
             " AND NOT ("
+            " lower(COALESCE(auth_type,'')) = 'sso'"
+            " OR"
             " nullif(btrim(COALESCE(payload->>'sso','')), '') IS NOT NULL"
             " OR nullif(btrim(COALESCE(payload->>'sso_cookie','')), '') IS NOT NULL"
             " OR nullif(btrim(COALESCE(payload->>'sso_token','')), '') IS NOT NULL"
@@ -383,13 +544,16 @@ def list_account_summaries(
                        lower(COALESCE(email,'')) LIKE %s
                        OR lower(id) LIKE %s
                        OR lower(COALESCE(user_id,'')) LIKE %s
-                    ){sso_clause}
+                    ){sso_clause}{provider_clause}
                     """,
-                    (like, like, like),
+                    ((like, like, like, provider_name) if provider_name else (like, like, like)),
                 )
             else:
-                if sso_clause:
-                    cur.execute(f"SELECT COUNT(*) FROM accounts WHERE TRUE{sso_clause}")
+                if sso_clause or provider_clause:
+                    cur.execute(
+                        f"SELECT COUNT(*) FROM accounts WHERE TRUE{sso_clause}{provider_clause}",
+                        ((provider_name,) if provider_name else ()),
+                    )
                 else:
                     cur.execute("SELECT COUNT(*) FROM accounts")
             total = int((cur.fetchone() or [0])[0] or 0)
@@ -409,18 +573,23 @@ def list_account_summaries(
             if needs_pool:
                 sql = """
                     SELECT a.id, a.email, a.user_id, a.team_id, a.payload, a.expires_at,
-                           a.updated_at
+                           a.updated_at, a.provider, a.auth_type, a.source_key,
+                           a.web_tier, a.egress_identity
                     FROM accounts a
                     LEFT JOIN account_pool ap ON ap.account_id = a.id
                 """
             else:
                 sql = """
                     SELECT a.id, a.email, a.user_id, a.team_id, a.payload, a.expires_at,
-                           a.updated_at
+                           a.updated_at, a.provider, a.auth_type, a.source_key,
+                           a.web_tier, a.egress_identity
                     FROM accounts a
                 """
             params: list[Any] = []
             where_parts: list[str] = []
+            if provider_name:
+                where_parts.append("a.provider = %s")
+                params.append(provider_name)
             if like:
                 where_parts.append(
                     "("
@@ -433,6 +602,8 @@ def list_account_summaries(
             if has_sso is True:
                 where_parts.append(
                     "("
+                    " lower(COALESCE(a.auth_type,'')) = 'sso'"
+                    " OR"
                     " nullif(btrim(COALESCE(a.payload->>'sso','')), '') IS NOT NULL"
                     " OR nullif(btrim(COALESCE(a.payload->>'sso_cookie','')), '') IS NOT NULL"
                     " OR nullif(btrim(COALESCE(a.payload->>'sso_token','')), '') IS NOT NULL"
@@ -450,6 +621,8 @@ def list_account_summaries(
             elif has_sso is False:
                 where_parts.append(
                     "NOT ("
+                    " lower(COALESCE(a.auth_type,'')) = 'sso'"
+                    " OR"
                     " nullif(btrim(COALESCE(a.payload->>'sso','')), '') IS NOT NULL"
                     " OR nullif(btrim(COALESCE(a.payload->>'sso_cookie','')), '') IS NOT NULL"
                     " OR nullif(btrim(COALESCE(a.payload->>'sso_token','')), '') IS NOT NULL"
@@ -482,7 +655,10 @@ def list_account_summaries(
         # Skip empty credential rows (shouldn't happen)
         if not token and not payload.get("refresh_token"):
             # still show if email exists
-            if not (r[1] or payload.get("email")):
+            # Encrypted Web/Console credentials intentionally never appear in
+            # payload; their provider/source metadata is sufficient to list.
+            is_encrypted_provider = (r[7] or "grok_build") != "grok_build" and bool(r[9])
+            if not (r[1] or payload.get("email") or is_encrypted_provider):
                 continue
         exp = _unix(r[5])
         if exp is None:
@@ -517,12 +693,18 @@ def list_account_summaries(
                 "expires_at": exp,
                 "expired": expired,
                 "has_refresh_token": bool(payload.get("refresh_token")),
-                "has_sso": has_sso_value(payload),
+                "has_sso": has_sso_value(payload) or str(r[8] or "").lower() == "sso",
                 "token_hint": hint,
                 "first_name": payload.get("first_name"),
                 "last_name": payload.get("last_name"),
                 "principal_type": payload.get("principal_type"),
                 "source": payload.get("source"),
+                "label": payload.get("label") or payload.get("name"),
+                "provider": r[7] or "grok_build",
+                "auth_type": r[8] or "oauth",
+                "source_key": r[9],
+                "web_tier": r[10],
+                "egress_identity": r[11],
             }
         )
 
@@ -535,6 +717,7 @@ def list_account_summaries(
         "q": (q or "").strip(),
         "sort": sort_key,
         "has_sso": has_sso,
+        "provider": provider_name or None,
     }
 
 
@@ -610,6 +793,54 @@ def upsert_account(account_id: str, entry: dict[str, Any]) -> None:
         conn.commit()
     invalidate_auth_entry_cache(account_id)
     _sync_ready_account(account_id, entry)
+
+
+def upsert_provider_account(
+    account_id: str,
+    entry: dict[str, Any],
+    *,
+    provider: str,
+    auth_type: str,
+    source_key: str | None = None,
+    credential_enc: str | None = None,
+    web_tier: str | None = None,
+    egress_identity: str | None = None,
+) -> None:
+    """Upsert one provider account without changing the legacy payload API.
+
+    ``credential_enc`` is accepted only as an already encrypted envelope. This
+    helper intentionally performs no migration/deletion of existing payload
+    credentials, allowing callers to adopt encrypted storage incrementally.
+    """
+    provider_name = str(provider or "").strip().lower()
+    auth_name = str(auth_type or "").strip().lower()
+    if (
+        not enabled()
+        or not account_id
+        or not isinstance(entry, dict)
+        or not provider_name
+        or not auth_name
+    ):
+        return
+    with connection() as conn:
+        with conn.cursor() as cur:
+            _upsert_one(
+                cur,
+                account_id,
+                entry,
+                provider=provider_name,
+                auth_type=auth_name,
+                source_key=source_key,
+                credential_enc=credential_enc,
+                web_tier=web_tier,
+                egress_identity=egress_identity,
+            )
+        conn.commit()
+    invalidate_auth_entry_cache(account_id)
+    # The current ready index is the Build pool. Future provider pools must opt
+    # into their own indexes rather than mixing Web/Console accounts into it.
+    if provider_name == "grok_build":
+        _sync_ready_account(account_id, entry)
 
 
 def upsert_account_merged(
@@ -733,11 +964,48 @@ def delete_account(account_id: str) -> bool:
     return deleted
 
 
-def _upsert_one(cur, account_id: str, entry: dict[str, Any]) -> None:
+def _upsert_one(
+    cur,
+    account_id: str,
+    entry: dict[str, Any],
+    *,
+    provider: str | None = None,
+    auth_type: str | None = None,
+    source_key: str | None = None,
+    credential_enc: str | None = None,
+    web_tier: str | None = None,
+    egress_identity: str | None = None,
+) -> None:
     email = entry.get("email")
     user_id = entry.get("user_id") or entry.get("principal_id")
     team_id = entry.get("team_id")
     expires_at = _ts(entry.get("expires_at"))
+    # Generic legacy upserts preserve existing provider metadata. New rows use
+    # DB-compatible Build/OAuth defaults unless metadata is explicitly supplied.
+    provider = provider or (
+        str(entry.get("provider") or "").strip().lower()
+        if "provider" in entry
+        else None
+    )
+    auth_type = auth_type or (
+        str(entry.get("auth_type") or "").strip().lower()
+        if "auth_type" in entry
+        else None
+    )
+    if provider is not None:
+        provider = str(provider).strip().lower() or None
+    if auth_type is not None:
+        auth_type = str(auth_type).strip().lower() or None
+    source_key = source_key if source_key is not None else entry.get("source_key")
+    credential_enc = (
+        credential_enc if credential_enc is not None else entry.get("credential_enc")
+    )
+    web_tier = web_tier if web_tier is not None else entry.get("web_tier")
+    egress_identity = (
+        egress_identity
+        if egress_identity is not None
+        else entry.get("egress_identity")
+    )
     # Preserve durable SSO / register password if a later write omits them
     # (e.g. token refresh / re-import without cookie).
     try:
@@ -759,14 +1027,28 @@ def _upsert_one(cur, account_id: str, entry: dict[str, Any]) -> None:
         pass
     cur.execute(
         """
-        INSERT INTO accounts (id, email, user_id, team_id, payload, expires_at, updated_at)
-        VALUES (%s, %s, %s, %s, %s::jsonb, %s, now())
+        INSERT INTO accounts (
+          id, email, user_id, team_id, payload, expires_at,
+          provider, auth_type, source_key, credential_enc, web_tier,
+          egress_identity, updated_at
+        )
+        VALUES (
+          %s, %s, %s, %s, %s::jsonb, %s,
+          COALESCE(%s, 'grok_build'), COALESCE(%s, 'oauth'), %s, %s, %s,
+          %s, now()
+        )
         ON CONFLICT (id) DO UPDATE SET
           email = EXCLUDED.email,
           user_id = EXCLUDED.user_id,
           team_id = EXCLUDED.team_id,
           payload = EXCLUDED.payload,
           expires_at = EXCLUDED.expires_at,
+          provider = COALESCE(%s, accounts.provider),
+          auth_type = COALESCE(%s, accounts.auth_type),
+          source_key = COALESCE(%s, accounts.source_key),
+          credential_enc = COALESCE(%s, accounts.credential_enc),
+          web_tier = COALESCE(%s, accounts.web_tier),
+          egress_identity = COALESCE(%s, accounts.egress_identity),
           updated_at = now()
         """,
         (
@@ -776,6 +1058,18 @@ def _upsert_one(cur, account_id: str, entry: dict[str, Any]) -> None:
             team_id,
             json_dump(entry),
             expires_at,
+            provider,
+            auth_type,
+            source_key,
+            credential_enc,
+            web_tier,
+            egress_identity,
+            provider,
+            auth_type,
+            source_key,
+            credential_enc,
+            web_tier,
+            egress_identity,
         ),
     )
     # Every account must have a durable pool status row in PostgreSQL.

@@ -77,6 +77,59 @@ UPSTREAM_BASE = os.getenv(
     "https://cli-chat-proxy.grok.com/v1",
 ).rstrip("/")
 
+# Multi-provider rollout. Build stays enabled and behavior-compatible; Web and
+# Console remain opt-in until their credential, routing and egress paths are
+# explicitly configured by an operator.
+WEB_PROVIDER_ENABLED = _env_truthy("GROK2API_WEB_ENABLED", "0")
+CONSOLE_PROVIDER_ENABLED = _env_truthy("GROK2API_CONSOLE_ENABLED", "0")
+WEB_PROVIDER_BASE_URL = os.getenv(
+    "GROK2API_WEB_BASE_URL", "https://grok.com"
+).strip().rstrip("/")
+CONSOLE_PROVIDER_BASE_URL = os.getenv(
+    "GROK2API_CONSOLE_BASE_URL", "https://console.x.ai"
+).strip().rstrip("/")
+CONSOLE_SESSION_BASE_URL = os.getenv(
+    "GROK2API_CONSOLE_SESSION_BASE_URL", "https://grok.com"
+).strip().rstrip("/")
+
+
+def validate_provider_security(
+    *,
+    web_enabled: bool | None = None,
+    console_enabled: bool | None = None,
+    secret_key: str | None = None,
+) -> None:
+    """Fail closed before enabling providers backed by browser credentials.
+
+    Build keeps its historical storage behavior. Web and Console credentials
+    include SSO/Cookie/DPoP material and may only be enabled when encrypted
+    credential storage has an explicit key.
+    """
+
+    use_web = WEB_PROVIDER_ENABLED if web_enabled is None else bool(web_enabled)
+    use_console = (
+        CONSOLE_PROVIDER_ENABLED if console_enabled is None else bool(console_enabled)
+    )
+    if not (use_web or use_console):
+        return
+    configured_key = (
+        secret_key
+        if secret_key is not None
+        else os.getenv("GROK2API_SECRET_KEY")
+        or os.getenv("GROK2API_FERNET_KEY")
+        or ""
+    )
+    if not str(configured_key).strip():
+        enabled = ", ".join(
+            name
+            for name, active in (("Web", use_web), ("Console", use_console))
+            if active
+        )
+        raise RuntimeError(
+            f"{enabled} provider requires GROK2API_SECRET_KEY for encrypted "
+            "credential storage"
+        )
+
 # App data — fully self-contained under project (or GROK2API_DATA_DIR).
 # This file lives at grok2api/config.py; repo root is one level up.
 APP_ROOT = Path(__file__).resolve().parent.parent

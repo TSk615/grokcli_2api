@@ -229,6 +229,15 @@
         <option value="0">无 SSO</option>
       </select>
     </label>
+    <label class="g2a-sort-wrap" for="acc-filter-provider" title="按上游 Provider 筛选">
+      <span class="g2a-sort-label">Provider</span>
+      <select id="acc-filter-provider" class="g2a-sort-select" aria-label="Provider 筛选">
+        <option value="" selected>全部</option>
+        <option value="grok_build">Build</option>
+        <option value="grok_web">Web</option>
+        <option value="grok_console">Console</option>
+      </select>
+    </label>
     <label class="g2a-sort-wrap" for="acc-sort" title="账号排序">
       <span class="g2a-sort-label">排序</span>
       <select id="acc-sort" class="g2a-sort-select" aria-label="账号排序">
@@ -279,6 +288,41 @@
       <option value="100">100 / 页</option>
     </select>
   </div>
+</section>
+
+<section class="g2a-card">
+  <div class="g2a-card-head">
+    <div>
+      <h3>Grok Web / Console 凭据导入</h3>
+      <p>粘贴 SSO 或 Cookie。凭据只会加密写入 PostgreSQL；需先开启对应 Provider 并配置 <code>GROK2API_SECRET_KEY</code>。</p>
+    </div>
+  </div>
+  <div class="g2a-form-row">
+    <div class="g2a-field g2a-field-sm">
+      <label>Provider</label>
+      <select id="provider-import-kind">
+        <option value="grok_web">Grok Web</option>
+        <option value="grok_console">Grok Console</option>
+      </select>
+    </div>
+    <div class="g2a-field g2a-field-sm">
+      <label>Web Tier</label>
+      <select id="provider-import-tier">
+        <option value="basic">Basic</option>
+        <option value="super">Super</option>
+        <option value="heavy">Heavy</option>
+      </select>
+    </div>
+    <div class="g2a-field g2a-field-grow">
+      <label>SSO / Cookie</label>
+      <textarea id="provider-import-payload" rows="4" placeholder="每行一个 SSO，或粘贴 Cookie / JSON"></textarea>
+    </div>
+    <div class="g2a-field g2a-field-action">
+      <label>&nbsp;</label>
+      <button type="button" class="g2a-btn g2a-btn-primary" id="btn-import-provider">加密导入</button>
+    </div>
+  </div>
+  <pre id="provider-import-result" class="g2a-log is-empty hidden" hidden>—</pre>
 </section>
 
 <section class="g2a-card">
@@ -368,6 +412,6 @@
   <script src="/static/dist/api.a4a81c4e29.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.5846ce62e4.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.64fa85e43f.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.7cad66dc32.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.57abf532ce.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>
