@@ -61,3 +61,6 @@ install_*_en.sh
 scripts/release_v*.sh
 scripts/_fetch_*.py
 /tmp/
+
+# Local demos / scratchboards (not part of the product tree)
+local_demos/
