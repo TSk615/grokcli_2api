@@ -4295,14 +4295,26 @@ async def _web_chat_completions(
         ProviderName.WEB,
         minimum_tier=route.minimum_tier,
     )
-    client = await get_http_client()
-    gateway_key = id(client)
-    gateway = _web_gateways.get(gateway_key)
-    if gateway is None:
-        gateway = GrokWebGateway(client, base_url=_config.WEB_PROVIDER_BASE_URL)
-        _web_gateways[gateway_key] = gateway
-        while len(_web_gateways) > 4:
-            _web_gateways.popitem(last=False)
+
+    async def _gateway_for(account):
+        from grok2api.upstream.proxy_pool import pick_proxy_for_account
+
+        proxy_url = await asyncio.to_thread(
+            pick_proxy_for_account, account.account_id
+        )
+        client = await get_http_client(account.account_id, proxy=proxy_url)
+        gateway_key = id(client)
+        gateway = _web_gateways.get(gateway_key)
+        if gateway is None:
+            gateway = GrokWebGateway(
+                client,
+                base_url=_config.WEB_PROVIDER_BASE_URL,
+                proxy=proxy_url,
+            )
+            _web_gateways[gateway_key] = gateway
+            while len(_web_gateways) > 4:
+                _web_gateways.popitem(last=False)
+        return gateway
 
     body = req.model_dump(exclude_none=True)
     body["model"] = route.public_model
@@ -4321,6 +4333,7 @@ async def _web_chat_completions(
             last_error: Exception | None = None
             for account in accounts:
                 try:
+                    gateway = await _gateway_for(account)
                     async for item in gateway.iter_chat(body, account.credential):
                         if await request.is_disconnected():
                             return
@@ -4378,6 +4391,7 @@ async def _web_chat_completions(
         reasoning_parts: list[str] = []
         annotations: list[dict[str, Any]] = []
         try:
+            gateway = await _gateway_for(account)
             async for item in gateway.iter_chat(body, account.credential):
                 if item.kind is WebDeltaKind.TEXT:
                     text_parts.append(item.text)
@@ -6378,29 +6392,56 @@ async def openai_responses(
                 ConsoleGateway,
                 ConsoleResponsesTransport,
             )
+            from grok2api.providers.console.adapter import ConsoleProviderAdapter
+            from grok2api.upstream.proxy_pool import pick_proxy_for_account
 
             registry = create_provider_registry()
             route = registry.resolve(req_body.get("model"), capability="responses")
             provider_accounts = await asyncio.to_thread(
                 acquire_provider_sequence, ProviderName.CONSOLE
             )
-            http_client = await get_http_client()
-            gateway_key = id(http_client)
-            gateway = _console_gateways.get(gateway_key)
-            if gateway is None:
-                dpop = ConsoleDPoPClient(
-                    http_client,
-                    ConsoleDPoPConfig(base_url=_config.CONSOLE_PROVIDER_BASE_URL),
+            result = None
+            adapter = ConsoleProviderAdapter()
+            total_attempts = 0
+            for total_attempts, account in enumerate(provider_accounts, 1):
+                proxy_url = await asyncio.to_thread(
+                    pick_proxy_for_account, account.account_id
                 )
-                gateway = ConsoleGateway(ConsoleResponsesTransport(dpop))
-                _console_gateways[gateway_key] = gateway
-                while len(_console_gateways) > 4:
-                    _console_gateways.popitem(last=False)
-            result = await gateway.forward(req_body, route, provider_accounts)
+                http_client = await get_http_client(account.account_id, proxy=proxy_url)
+                gateway_key = id(http_client)
+                gateway = _console_gateways.get(gateway_key)
+                if gateway is None:
+                    dpop = ConsoleDPoPClient(
+                        http_client,
+                        ConsoleDPoPConfig(base_url=_config.CONSOLE_PROVIDER_BASE_URL),
+                    )
+                    gateway = ConsoleGateway(ConsoleResponsesTransport(dpop))
+                    _console_gateways[gateway_key] = gateway
+                    while len(_console_gateways) > 4:
+                        _console_gateways.popitem(last=False)
+                try:
+                    candidate = await gateway.forward(req_body, route, [account])
+                except Exception:
+                    if total_attempts >= len(provider_accounts):
+                        raise
+                    continue
+                if candidate.response.status_code < 400:
+                    result = candidate
+                    break
+                status = adapter.classify_status(
+                    candidate.response.status_code,
+                    headers=dict(candidate.response.headers),
+                )
+                if not status.retryable:
+                    result = candidate
+                    break
+                await candidate.response.aclose()
+            if result is None:
+                raise RuntimeError("No usable Grok Console credentials are available")
             upstream = result.response
             response_headers = {
                 "X-Grok2API-Provider": ProviderName.CONSOLE.value,
-                "X-Grok2API-Accounts": str(result.attempts),
+                "X-Grok2API-Accounts": str(total_attempts),
             }
             content_type = upstream.headers.get("content-type")
             if content_type:

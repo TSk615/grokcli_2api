@@ -55,7 +55,11 @@ WebSocketConnector = Callable[
 
 
 async def _default_websocket_connector(
-    url: str, headers: Mapping[str, str], open_timeout: float
+    url: str,
+    headers: Mapping[str, str],
+    open_timeout: float,
+    *,
+    proxy: str | None = None,
 ) -> WebSocketConnection:
     """Import websockets only when a real Gateway connection is requested."""
 
@@ -67,10 +71,22 @@ async def _default_websocket_connector(
         ) from None
 
     connect = websockets.connect
-    kwargs = {"open_timeout": open_timeout, "max_size": DEFAULT_MAX_FRAME_BYTES}
+    kwargs: dict[str, Any] = {
+        "open_timeout": open_timeout,
+        "max_size": DEFAULT_MAX_FRAME_BYTES,
+    }
+    if proxy:
+        kwargs["proxy"] = proxy
     try:
         return await connect(url, additional_headers=dict(headers), **kwargs)
     except TypeError:
+        if proxy:
+            # Never silently fall back to a direct WebSocket connection when
+            # the selected account is bound to a proxy. Older websockets
+            # releases don't support proxy= and would split HTTP/WS egress.
+            raise WebGatewayError(
+                "installed websockets does not support configured proxy egress"
+            ) from None
         # websockets < 14 names the same argument ``extra_headers``.
         try:
             return await connect(url, extra_headers=dict(headers), **kwargs)
@@ -161,6 +177,7 @@ class GrokWebGateway:
         total_timeout: float = DEFAULT_TOTAL_TIMEOUT,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
         max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES,
+        proxy: str | None = None,
     ) -> None:
         if client is None:
             raise ValueError("an httpx.AsyncClient is required")
@@ -173,6 +190,17 @@ class GrokWebGateway:
         self.total_timeout = max(0.001, float(total_timeout))
         self.heartbeat_interval = max(0.001, float(heartbeat_interval))
         self.max_frame_bytes = max(1024, int(max_frame_bytes))
+        self.proxy = str(proxy or "").strip() or None
+
+    async def _connect(self, endpoint: str, headers: Mapping[str, str]) -> WebSocketConnection:
+        if self._connector is _default_websocket_connector:
+            return await _default_websocket_connector(
+                endpoint,
+                headers,
+                self.handshake_timeout,
+                proxy=self.proxy,
+            )
+        return await self._connector(endpoint, headers, self.handshake_timeout)
 
     async def fetch_user_id(self, credential: WebCredential) -> str:
         """Resolve the stable MGW uid using this instance's HTTP client."""
@@ -218,7 +246,7 @@ class GrokWebGateway:
         )
         try:
             connection = await asyncio.wait_for(
-                self._connector(endpoint, headers, self.handshake_timeout),
+                self._connect(endpoint, headers),
                 timeout=self.handshake_timeout,
             )
         except WebGatewayError:

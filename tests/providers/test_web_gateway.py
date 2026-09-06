@@ -4,6 +4,7 @@ import asyncio
 import json
 import unittest
 from collections.abc import Mapping
+from unittest import mock
 
 import httpx
 
@@ -12,6 +13,7 @@ from grok2api.providers.web.gateway import (
     GrokWebGateway,
     WebGatewayAuthError,
     WebGatewayError,
+    _default_websocket_connector,
 )
 from grok2api.providers.web.stream import WebDeltaKind
 
@@ -147,6 +149,34 @@ class WebGatewayTests(unittest.IsolatedAsyncioTestCase):
         )
         citation = next(item.citation for item in deltas if item.kind is WebDeltaKind.CITATION)
         self.assertEqual(citation.url, "https://example.com/source")
+
+    async def test_default_connector_forwards_selected_proxy(self) -> None:
+        socket = object()
+        connect = mock.AsyncMock(return_value=socket)
+        with mock.patch("websockets.connect", connect):
+            result = await _default_websocket_connector(
+                "wss://grok.com/ws/mgw/?uid=test",
+                {"Cookie": "sso=secret"},
+                2.0,
+                proxy="http://proxy.example:8080",
+            )
+
+        self.assertIs(result, socket)
+        self.assertEqual(connect.await_args.kwargs["proxy"], "http://proxy.example:8080")
+        self.assertIn("additional_headers", connect.await_args.kwargs)
+
+    async def test_proxy_never_falls_back_to_direct_on_unsupported_client(self) -> None:
+        connect = mock.AsyncMock(side_effect=TypeError("unsupported proxy"))
+        with mock.patch("websockets.connect", connect), self.assertRaisesRegex(
+            WebGatewayError, "does not support configured proxy egress"
+        ):
+            await _default_websocket_connector(
+                "wss://grok.com/ws/mgw/?uid=test",
+                {},
+                2.0,
+                proxy="http://proxy.example:8080",
+            )
+        self.assertEqual(connect.await_count, 1)
 
     async def test_auth_and_gateway_errors_do_not_echo_sensitive_context(self) -> None:
         secret = "secret-sso"
