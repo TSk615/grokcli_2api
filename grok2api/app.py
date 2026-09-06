@@ -590,9 +590,9 @@ def _on_startup() -> None:
         start_maintainers = True
 
     if start_maintainers:
-        # One-shot cleanup: permanently invalid refresh tokens leave the pool.
-        # Default is hard-delete; set GROK2API_DELETE_INVALID_REFRESH=0 to
-        # soft-disable instead.
+        # One-shot cleanup: permanently invalid refresh tokens leave rotation.
+        # Credentials are retained by default; destructive cleanup requires
+        # GROK2API_DELETE_INVALID_REFRESH=1.
         try:
             from grok2api.upstream.oidc_auth import purge_refresh_invalid_accounts
 

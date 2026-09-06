@@ -340,11 +340,12 @@ def rebuild_ready_index(*, page_size: int = 1000) -> int:
                            ap.extra->>'last_probe_fail_at'
                     FROM accounts a
                     LEFT JOIN account_pool ap ON ap.account_id = a.id
-                    WHERE a.id > %s
+                    WHERE a.provider = %s
+                      AND a.id > %s
                     ORDER BY a.id
                     LIMIT %s
                     """,
-                    (last_id, int(page_size)),
+                    ("grok_build", last_id, int(page_size)),
                 )
                 rows = cur.fetchall() or []
         if not rows:

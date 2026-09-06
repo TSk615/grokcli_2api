@@ -8,15 +8,15 @@ Supports:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
 import sys
 import time
-import uuid
 from typing import Any
 
-from grok2api.pool.auth_store import read_auth_map, write_auth_map
+from grok2api.pool.auth_store import mutate_auth_map, read_auth_map, write_auth_map
 from grok2api.config import AUTH_FILE
 from grok2api.upstream.oidc_auth import (
     account_storage_id,
@@ -40,6 +40,51 @@ def _mask_token(token: str | None) -> str:
 
 
 _SSO_COOKIE_RE = re.compile(r"(?:^|[;,\s])sso(?:-rw)?=([^;,\s]+)", re.IGNORECASE)
+_SSO_AS_ACCESS_TOKEN_ERROR = (
+    "检测到 SSO Cookie，不能将它作为 access token 导入；"
+    "请使用 SSO 导入或设备授权流程。"
+)
+
+
+def _looks_like_sso_cookie_token(token: str | None) -> bool:
+    """Reject only unambiguous cookie-shaped values in access-token fields."""
+    if not isinstance(token, str):
+        return False
+    text = token.strip()
+    if not text:
+        return False
+    return bool(_SSO_COOKIE_RE.search(text))
+
+
+def _anonymous_storage_id(
+    token: str,
+    entry: dict[str, Any],
+    *,
+    preferred_id: str | None = None,
+) -> str:
+    """Build a stable, non-secret ID when the token has no user identity.
+
+    OAuth client IDs identify the application, not the human account, so they
+    must never be the sole dedupe key. Prefer normalized email, then an explicit
+    caller-provided ID that is not the legacy client slot, and finally a token
+    fingerprint. Only a one-way digest is stored in the account ID.
+    """
+    email = str(entry.get("email") or "").strip().casefold()
+    client_id = str(entry.get("oidc_client_id") or "").strip()
+    preferred = str(preferred_id or "").strip()
+    legacy_client_slots = {
+        client_id,
+        f"https://auth.x.ai::{client_id}" if client_id else "",
+        f"https://accounts.x.ai::{client_id}" if client_id else "",
+    }
+    if email:
+        kind, value = "email", email
+    elif preferred and preferred not in legacy_client_slots:
+        kind, value = "id", preferred
+    else:
+        kind, value = "token", token.strip()
+    digest = hashlib.sha256(f"{kind}\0{value}".encode("utf-8")).hexdigest()[:32]
+    return f"https://auth.x.ai::imported-{kind}-{digest}"
 
 
 def get_sso_value(entry: dict[str, Any] | None) -> str:
@@ -596,6 +641,8 @@ def _normalize_entry(
     tok = entry.get("key") or entry.get("access_token") or entry.get("token")
     if not tok or not isinstance(tok, str):
         raise ValueError("missing token")
+    if _looks_like_sso_cookie_token(tok):
+        raise ValueError(_SSO_AS_ACCESS_TOKEN_ERROR)
     entry = dict(entry)
     entry["key"] = tok
     claims = decode_jwt_claims(tok)
@@ -640,14 +687,10 @@ def _normalize_entry(
     if isinstance(pwd_val, str) and pwd_val.strip():
         entry["password"] = pwd_val.strip()
 
-    aid = account_storage_id(
-        user_id=str(uid) if uid else None,
-        client_id=str(entry.get("oidc_client_id"))
-        if entry.get("oidc_client_id")
-        else None,
-        fallback=preferred_id
-        or f"https://auth.x.ai::imported-{uuid.uuid4().hex[:10]}",
-    )
+    if uid:
+        aid = account_storage_id(user_id=str(uid))
+    else:
+        aid = _anonymous_storage_id(tok, entry, preferred_id=preferred_id)
     return aid, entry
 
 
@@ -959,14 +1002,21 @@ def collect_normalized_entries(raw: str | dict[str, Any] | list[Any]) -> dict[st
         if not raw_entries:
             return {"ok": False, "error": "CLIProxyAPI 记录无法解析为账号"}
         normalized: dict[str, dict[str, Any]] = {}
+        normalize_errors: list[str] = []
         for pref_id, ent in raw_entries:
             try:
                 aid, nent = _normalize_entry(ent, preferred_id=pref_id)
-            except ValueError:
+            except ValueError as exc:
+                normalize_errors.append(str(exc))
                 continue
             normalized[aid] = _merge_normalized_duplicate(normalized.get(aid), nent)
         if not normalized:
-            return {"ok": False, "error": "CLIProxyAPI 记录缺少 token"}
+            return {
+                "ok": False,
+                "error": normalize_errors[0]
+                if normalize_errors
+                else "CLIProxyAPI 记录缺少 token",
+            }
         return {
             "ok": True,
             "normalized": normalized,
@@ -1093,14 +1143,19 @@ def collect_normalized_entries(raw: str | dict[str, Any] | list[Any]) -> dict[st
         return {"ok": False, "error": "no valid account entries found"}
 
     normalized = {}
+    normalize_errors: list[str] = []
     for pref_id, ent in raw_entries:
         try:
             aid, nent = _normalize_entry(ent, preferred_id=pref_id)
-        except ValueError:
+        except ValueError as exc:
+            normalize_errors.append(str(exc))
             continue
         normalized[aid] = _merge_normalized_duplicate(normalized.get(aid), nent)
     if not normalized:
-        return {"ok": False, "error": "entries missing token"}
+        return {
+            "ok": False,
+            "error": normalize_errors[0] if normalize_errors else "entries missing token",
+        }
     return {"ok": True, "normalized": normalized}
 
 
@@ -1246,36 +1301,36 @@ def merge_normalized_accounts(
 
     existing: dict[str, Any] = {}
     if merge:
-        existing = read_auth_map()
         _backup_auth_file()
-        try:
-            normalize_auth_file_keys()
-            existing = read_auth_map()
-        except Exception:
-            pass
-        for aid, nent in normalized.items():
-            old_entry = existing.get(aid)
-            old_entry = old_entry if isinstance(old_entry, dict) else None
-            uid = nent.get("user_id") or nent.get("principal_id")
-            if uid:
-                for k in list(existing.keys()):
-                    v = existing.get(k)
-                    if not isinstance(v, dict):
-                        continue
-                    old_uid = v.get("user_id") or v.get("principal_id")
-                    if str(old_uid or "") != str(uid):
-                        continue
-                    # Normalization normally makes this the same key. Keep this
-                    # fallback for legacy keys and prefer a row that has the RT.
-                    if old_entry is None or (
-                        not old_entry.get("refresh_token") and v.get("refresh_token")
-                    ):
-                        old_entry = v
-                    if k != aid:
-                        existing.pop(k, None)
-            merge_imported_account_fields(nent, old_entry)
-        existing.update(normalized)
-        write_auth_map(existing)
+        def _merge_latest(existing_map: dict[str, Any]) -> None:
+            # mutate_auth_map holds the file lock / PostgreSQL row locks while
+            # this merge examines the latest credential generation. A refresh
+            # committed after import parsing therefore cannot be rolled back by
+            # a stale read-then-write snapshot.
+            for aid, nent in normalized.items():
+                old_entry = existing_map.get(aid)
+                old_entry = old_entry if isinstance(old_entry, dict) else None
+                uid = nent.get("user_id") or nent.get("principal_id")
+                if uid:
+                    for k in list(existing_map.keys()):
+                        v = existing_map.get(k)
+                        if not isinstance(v, dict):
+                            continue
+                        old_uid = v.get("user_id") or v.get("principal_id")
+                        if str(old_uid or "") != str(uid):
+                            continue
+                        # Prefer an existing credential generation that carries
+                        # a refresh token, and collapse legacy same-user keys.
+                        if old_entry is None or (
+                            not old_entry.get("refresh_token") and v.get("refresh_token")
+                        ):
+                            old_entry = v
+                        if k != aid:
+                            existing_map.pop(k, None)
+                merge_imported_account_fields(nent, old_entry)
+                existing_map[aid] = nent
+
+        existing = mutate_auth_map(_merge_latest)
         total = len(existing)
     else:
         write_auth_map(normalized)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from grok2api.store import accounts_pg, pg
+from grok2api.store import accounts_pg, pg, ready_redis
 
 
 def _compact(sql: str) -> str:
@@ -93,9 +93,11 @@ class ProviderSchemaTests(unittest.TestCase):
 class _RecordingCursor:
     def __init__(self) -> None:
         self.calls: list[tuple[str, object]] = []
+        self.rowcount = -1
 
     def execute(self, sql: str, params=None) -> None:
         self.calls.append((sql, params))
+        self.rowcount = 1 if "INSERT INTO accounts" in sql else -1
 
     def fetchone(self):
         return None
@@ -211,6 +213,62 @@ class ProviderAccountUpsertTests(unittest.TestCase):
             ),
         )
         self.assertEqual(payload, {"email": "web@example.test"})
+
+    def test_account_upsert_rejects_cross_provider_id_conflict(self) -> None:
+        class _ConflictingCursor(_RecordingCursor):
+            def execute(self, sql: str, params=None) -> None:
+                super().execute(sql, params)
+                if "INSERT INTO accounts" in sql:
+                    self.rowcount = 0
+
+        cursor = _ConflictingCursor()
+        with self.assertRaisesRegex(ValueError, "different provider"):
+            accounts_pg._upsert_one(
+                cursor,
+                "grok_web::shared-id",
+                {"key": "build-token"},
+                provider="grok_build",
+                auth_type="oauth",
+            )
+
+        account_sql, params = next(
+            (sql, values)
+            for sql, values in cursor.calls
+            if "INSERT INTO accounts" in sql
+        )
+        self.assertIn(
+            "where accounts.provider = coalesce(%s, 'grok_build')",
+            _compact(account_sql),
+        )
+        self.assertEqual(params[-1], "grok_build")
+        self.assertFalse(
+            any("INSERT INTO account_pool" in sql for sql, _ in cursor.calls)
+        )
+
+
+class _ReadyIndexRedis:
+    def delete(self, *keys) -> None:
+        return None
+
+    def zcard(self, key) -> int:
+        return 0
+
+    def set(self, key, value) -> None:
+        return None
+
+
+class ReadyIndexIsolationTests(unittest.TestCase):
+    def test_rebuild_indexes_only_build_accounts(self) -> None:
+        cursor = _RecordingCursor()
+        connection = _RecordingConnection(cursor)
+        with mock.patch.object(ready_redis, "redis_enabled", return_value=True), \
+             mock.patch.object(ready_redis, "get_client", return_value=_ReadyIndexRedis()), \
+             mock.patch("grok2api.store.pg.connection", return_value=connection):
+            self.assertEqual(ready_redis.rebuild_ready_index(), 0)
+
+        sql, params = cursor.calls[0]
+        self.assertIn("where a.provider = %s", _compact(sql))
+        self.assertEqual(params, ("grok_build", "", 1000))
 
 
 class LegacyBuildIsolationTests(unittest.TestCase):

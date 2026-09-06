@@ -1116,6 +1116,7 @@ def _upsert_one(
           web_tier = COALESCE(%s, accounts.web_tier),
           egress_identity = COALESCE(%s, accounts.egress_identity),
           updated_at = now()
+        WHERE accounts.provider = COALESCE(%s, 'grok_build')
         """,
         (
             account_id,
@@ -1136,8 +1137,15 @@ def _upsert_one(
             credential_enc,
             web_tier,
             egress_identity,
+            provider,
         ),
     )
+    # Account IDs are globally unique in the current schema.  Never let a
+    # legacy Build import (or any other provider write) silently take ownership
+    # of an ID that already belongs to a different provider.  PostgreSQL reports
+    # zero affected rows when the ON CONFLICT ... WHERE guard rejects the update.
+    if getattr(cur, "rowcount", -1) == 0:
+        raise ValueError("account id belongs to a different provider")
     # Every account must have a durable pool status row in PostgreSQL.
     # Do not overwrite existing cooldown/status — only create defaults for new ids.
     cur.execute(

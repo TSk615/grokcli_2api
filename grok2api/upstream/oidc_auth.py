@@ -420,17 +420,17 @@ def _distributed_refresh_slot(
 def _hard_delete_invalid_refresh_enabled() -> bool:
     """Whether permanent RT failures hard-delete accounts from the pool.
 
-    Default ON: permanently invalid refresh tokens (invalid_grant / revoked)
-    are deleted from auth store + pool state so they never re-enter rotation.
-    Soft-disable only when explicitly opted out:
-      GROK2API_DELETE_INVALID_REFRESH=0
+    Default OFF: a confirmed invalid_grant is recoverable operator state, so
+    credentials are retained and the account is merely removed from rotation.
+    Operators that deliberately prefer destructive cleanup can opt in with:
+      GROK2API_DELETE_INVALID_REFRESH=1
     """
     raw = (
         os.environ.get("GROK2API_DELETE_INVALID_REFRESH")
         or os.environ.get("DELETE_INVALID_REFRESH")
-        or "1"
+        or "0"
     ).strip().lower()
-    return raw not in {"0", "false", "no", "off"}
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _summarize_refresh_error_body(status_code: int, body: str) -> str:
@@ -482,10 +482,10 @@ def mark_refresh_invalid(
 ) -> dict[str, Any]:
     """Remove a permanently invalid refresh account from the pool.
 
-    Default (GROK2API_DELETE_INVALID_REFRESH=1): hard-delete credentials +
-    pool state so the account never re-enters rotation.
+    Default: retain credentials and soft-disable the account.  Hard deletion
+    requires ``hard_delete=True`` or ``GROK2API_DELETE_INVALID_REFRESH=1``.
 
-    Soft path only when hard_delete=False or env is explicitly 0:
+    Soft path:
       - set ``refresh_invalid`` / reason on the durable account entry
       - disable pool rotation (enabled=False)
       - keep credentials
@@ -639,8 +639,8 @@ def delete_account_for_refresh_failure(
     *,
     reason: str = "refresh_token permanently invalid",
 ) -> dict[str, Any]:
-    """Back-compat wrapper: hard-delete by default (see mark_refresh_invalid)."""
-    return mark_refresh_invalid(account_id, reason=reason)
+    """Back-compat wrapper whose destructive intent remains explicit."""
+    return mark_refresh_invalid(account_id, reason=reason, hard_delete=True)
 
 
 def refresh_access_token(
@@ -727,6 +727,40 @@ def _account_refresh_lock(account_id: str) -> threading.Lock:
         return lock
 
 
+def _refresh_persist_retry_policy() -> tuple[int, float]:
+    """Return bounded attempts and initial delay for rotated-token storage.
+
+    The token endpoint may rotate a refresh token on every successful exchange.
+    Retrying the exchange after a transient database failure can therefore lose
+    the only valid generation.  Retry only the idempotent durable UPSERT while
+    the per-account and distributed refresh locks are still held.
+    """
+    try:
+        attempts = int(os.environ.get("GROK2API_REFRESH_PERSIST_ATTEMPTS", "3"))
+    except (TypeError, ValueError):
+        attempts = 3
+    try:
+        delay = float(os.environ.get("GROK2API_REFRESH_PERSIST_RETRY_DELAY", "0.1"))
+    except (TypeError, ValueError):
+        delay = 0.1
+    return max(1, min(6, attempts)), max(0.0, min(2.0, delay))
+
+
+def _persist_refreshed_entry(account_id: str, entry: dict[str, Any]) -> str:
+    """Persist one refreshed generation with bounded idempotent retries."""
+    attempts, initial_delay = _refresh_persist_retry_policy()
+    for attempt in range(attempts):
+        try:
+            return upsert_entry(account_id, entry)
+        except Exception:
+            if attempt + 1 >= attempts:
+                raise
+            # Small exponential backoff covers brief PG connection/failover
+            # faults without holding the distributed refresh lock for long.
+            time.sleep(initial_delay * (2**attempt))
+    raise RuntimeError("unreachable refresh persistence retry state")
+
+
 def refresh_and_persist(
     account_id: str,
     entry: dict[str, Any],
@@ -795,7 +829,9 @@ def refresh_and_persist(
                 new_id = account_id
             if persist:
                 # Persist the rotated refresh token before releasing either lock.
-                upsert_entry(new_id, new_entry)
+                persisted_id = _persist_refreshed_entry(new_id, new_entry)
+                if persisted_id:
+                    new_id = str(persisted_id)
                 try:
                     import grok2api.pool.account_pool as _pool
 
@@ -1889,10 +1925,10 @@ def purge_refresh_invalid_accounts(
 ) -> dict[str, Any]:
     """Remove permanently unusable accounts from the pool.
 
-    Default (GROK2API_DELETE_INVALID_REFRESH=1): hard-delete credentials +
-    pool state.
+    Default: retain credentials and soft-disable. Hard deletion requires
+    ``hard_delete=True`` or ``GROK2API_DELETE_INVALID_REFRESH=1``.
 
-    Soft-disable only when ``hard_delete=False`` or env is explicitly 0:
+    Soft-disable:
       - mark ``refresh_invalid``
       - remove from rotation (enabled=False)
       - keep credentials
