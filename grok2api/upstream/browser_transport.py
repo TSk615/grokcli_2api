@@ -235,23 +235,34 @@ class BrowserAsyncClient:
         self,
         *,
         proxy: str | None = None,
+        proxy_auth: tuple[str, str] | None = None,
         impersonate: str = DEFAULT_BROWSER_IMPERSONATE,
         max_clients: int = 16,
     ) -> None:
         if AsyncSession is None:
             raise BrowserTransportError("browser transport dependency is unavailable")
         self._proxy = str(proxy or "").strip() or None
+        if proxy_auth is not None:
+            if len(proxy_auth) != 2 or not all(
+                isinstance(part, str) and part and not any(c in part for c in ("\r", "\n", "\x00"))
+                for part in proxy_auth
+            ):
+                raise ValueError("proxy_auth is invalid")
+        self._proxy_auth = proxy_auth
         self._impersonate = str(impersonate or DEFAULT_BROWSER_IMPERSONATE).strip()
         self._closed = False
         try:
-            self._session = AsyncSession(
-                proxy=self._proxy,
-                impersonate=self._impersonate,
-                default_headers=False,
-                allow_redirects=False,
-                trust_env=False,
-                max_clients=max(1, int(max_clients)),
-            )
+            session_kwargs: dict[str, Any] = {
+                "proxy": self._proxy,
+                "impersonate": self._impersonate,
+                "default_headers": False,
+                "allow_redirects": False,
+                "trust_env": False,
+                "max_clients": max(1, int(max_clients)),
+            }
+            if self._proxy_auth is not None:
+                session_kwargs["proxy_auth"] = self._proxy_auth
+            self._session = AsyncSession(**session_kwargs)
         except Exception:
             raise BrowserTransportError("browser transport initialization failed") from None
 
@@ -260,7 +271,10 @@ class BrowserAsyncClient:
         return self._closed
 
     def build_request(self, method: str, url: str, **kwargs: Any) -> BrowserRequest:
-        if "proxy" in kwargs or "proxies" in kwargs or "impersonate" in kwargs:
+        if any(
+            key in kwargs
+            for key in ("proxy", "proxies", "proxy_auth", "impersonate")
+        ):
             raise ValueError("request cannot override the bound browser egress")
         return BrowserRequest(str(method).upper(), str(url), dict(kwargs))
 
@@ -280,7 +294,10 @@ class BrowserAsyncClient:
     async def request(self, method: str, url: str, **kwargs: Any) -> BrowserResponse:
         if self._closed:
             raise BrowserTransportError("browser transport is closed")
-        if "proxy" in kwargs or "proxies" in kwargs or "impersonate" in kwargs:
+        if any(
+            key in kwargs
+            for key in ("proxy", "proxies", "proxy_auth", "impersonate")
+        ):
             raise ValueError("request cannot override the bound browser egress")
         stream = bool(kwargs.pop("stream", False))
         if "timeout" in kwargs:
@@ -318,6 +335,8 @@ class BrowserAsyncClient:
                 headers=dict(headers),
                 timeout=float(open_timeout),
                 autoclose=True,
+                proxy=self._proxy,
+                proxy_auth=self._proxy_auth,
             )
             raw = await context
         except Exception:

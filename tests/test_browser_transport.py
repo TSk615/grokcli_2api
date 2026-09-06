@@ -45,6 +45,7 @@ class _FakeCurlSession:
         self.requests: list[tuple[str, str, dict]] = []
         self.response = _FakeCurlResponse()
         self.error: Exception | None = None
+        self.ws_calls: list[tuple[str, dict]] = []
         type(self).instances.append(self)
 
     async def request(self, method, url, **kwargs):
@@ -53,7 +54,26 @@ class _FakeCurlSession:
             raise self.error
         return self.response
 
+    async def ws_connect(self, url, **kwargs):
+        self.ws_calls.append((url, kwargs))
+        return _FakeCurlWebSocket()
+
     async def close(self):
+        self.closed = True
+
+
+class _FakeCurlWebSocket:
+    def __init__(self) -> None:
+        self.messages: list[str | bytes] = []
+        self.closed = False
+
+    async def send_str(self, message: str):
+        self.messages.append(message)
+
+    async def recv(self):
+        return b"reply", 1
+
+    def close(self):
         self.closed = True
 
 
@@ -158,6 +178,57 @@ class BrowserTransportTests(unittest.IsolatedAsyncioTestCase):
             rendered = f"{caught.exception!s} {caught.exception!r}"
             self.assertNotIn(proxy_password, rendered)
             self.assertNotIn(sso, rendered)
+
+    async def test_http_and_websocket_share_bound_proxy_auth(self) -> None:
+        from grok2api.upstream import browser_transport
+
+        with mock.patch.object(browser_transport, "AsyncSession", _FakeCurlSession):
+            client = browser_transport.BrowserAsyncClient(
+                proxy="http://resin:2260",
+                proxy_auth=("platform.g2a-account", "resin-token"),
+            )
+            await client.get("https://grok.com/api/auth/session")
+            ws = await client.websocket_connector(
+                "wss://grok.com/ws/mgw/",
+                {"Origin": "https://grok.com"},
+                10,
+            )
+            await ws.send("hello")
+            self.assertEqual(await ws.recv(), "reply")
+            session = _FakeCurlSession.instances[0]
+            self.assertEqual(
+                session.kwargs.get("proxy_auth"),
+                ("platform.g2a-account", "resin-token"),
+            )
+            self.assertEqual(len(session.ws_calls), 1)
+            self.assertEqual(session.ws_calls[0][1].get("proxy"), "http://resin:2260")
+            self.assertEqual(
+                session.ws_calls[0][1].get("proxy_auth"),
+                ("platform.g2a-account", "resin-token"),
+            )
+            self.assertNotIn("resin-token", session.ws_calls[0][1].get("headers", {}).__repr__())
+            await client.aclose()
+
+    async def test_per_request_proxy_auth_override_is_rejected(self) -> None:
+        from grok2api.upstream import browser_transport
+
+        with mock.patch.object(browser_transport, "AsyncSession", _FakeCurlSession):
+            client = browser_transport.BrowserAsyncClient(
+                proxy="http://resin:2260",
+                proxy_auth=("platform.g2a-account", "resin-token"),
+            )
+            with self.assertRaisesRegex(ValueError, "cannot override"):
+                await client.get(
+                    "https://grok.com/api/auth/session",
+                    proxy_auth=("other", "other"),
+                )
+            with self.assertRaisesRegex(ValueError, "cannot override"):
+                client.build_request(
+                    "GET",
+                    "https://grok.com/api/auth/session",
+                    proxy_auth=("other", "other"),
+                )
+            await client.aclose()
 
 
 if __name__ == "__main__":

@@ -83,7 +83,9 @@ _http_client_lock = asyncio.Lock() if hasattr(asyncio, "Lock") else None  # set 
 _console_gateways: OrderedDict[int, Any] = OrderedDict()
 _web_gateways: OrderedDict[int, Any] = OrderedDict()
 _browser_clients_by_account: OrderedDict[str, BrowserAsyncClient] = OrderedDict()
-_active_provider_transport: ContextVar[str | None] = ContextVar(
+_active_provider_transport: ContextVar[
+    tuple[str, tuple[str, str] | None, str | None, str | None] | None
+] = ContextVar(
     "grok2api_active_provider_transport", default=None
 )
 
@@ -290,9 +292,18 @@ async def get_http_client(
     and multi-worker recycle races that surface as Event loop is closed).
     """
     global _http_client
-    provider = _active_provider_transport.get()
-    if provider in {"grok_web", "grok_console"}:
-        return await get_browser_http_client(provider, account_id, proxy=proxy)
+    provider_context = _active_provider_transport.get()
+    if provider_context is not None:
+        provider, proxy_auth, proxy_identity, resin_account = provider_context
+        if provider in {"grok_web", "grok_console"}:
+            return await get_browser_http_client(
+                provider,
+                account_id,
+                proxy=proxy,
+                proxy_auth=proxy_auth,
+                proxy_identity=proxy_identity,
+                resin_account=resin_account,
+            )
     proxy_url = (proxy or "").strip() or None
     if proxy_url is None and account_id:
         try:
@@ -366,6 +377,9 @@ async def get_browser_http_client(
     account_id: str | None,
     *,
     proxy: str | None = None,
+    proxy_auth: tuple[str, str] | None = None,
+    proxy_identity: str | None = None,
+    resin_account: str | None = None,
 ) -> BrowserAsyncClient:
     """Return an account-isolated browser transport for Web/Console.
 
@@ -376,13 +390,18 @@ async def get_browser_http_client(
 
     proxy_url = (proxy or "").strip() or None
     account_key = str(account_id or "anonymous").strip() or "anonymous"
-    key = "|".join((provider, account_key, proxy_url or "direct", DEFAULT_BROWSER_IMPERSONATE))
+    identity_key = str(proxy_identity or proxy_url or "direct")
+    resin_key = str(resin_account or "non-resin")
+    key = "|".join(
+        (provider, account_key, resin_key, identity_key, DEFAULT_BROWSER_IMPERSONATE)
+    )
     client = _browser_clients_by_account.get(key)
     if client is not None and not client.is_closed:
         _browser_clients_by_account.move_to_end(key)
         return client
     client = BrowserAsyncClient(
         proxy=proxy_url,
+        proxy_auth=proxy_auth,
         impersonate=DEFAULT_BROWSER_IMPERSONATE,
     )
     _browser_clients_by_account[key] = client
@@ -403,8 +422,13 @@ async def _get_provider_http_client(
     account_id: str | None,
     *,
     proxy: str | None,
+    proxy_auth: tuple[str, str] | None = None,
+    proxy_identity: str | None = None,
+    resin_account: str | None = None,
 ) -> Any:
-    token = _active_provider_transport.set(provider)
+    token = _active_provider_transport.set(
+        (provider, proxy_auth, proxy_identity, resin_account)
+    )
     try:
         # Keep this call boundary stable for existing integrations/tests while
         # get_http_client selects the provider-only browser transport above.
@@ -491,6 +515,19 @@ def _on_startup() -> None:
     # Web/Console persist browser credentials and therefore may never start in
     # plaintext-secret mode. Build-only deployments retain historical behavior.
     _config.validate_provider_security()
+    try:
+        from grok2api.upstream.resin_proxy import ResinConfigError, resin_public_status
+
+        resin_status = resin_public_status()
+        if resin_status["enabled"] and not resin_status["valid"]:
+            raise ResinConfigError("Resin proxy configuration is incomplete")
+        print(
+            "  resin proxy: "
+            f"mode={resin_status['mode']} enabled={resin_status['enabled']} "
+            f"valid={resin_status['valid']} direct_fallback={resin_status['direct_fallback']}"
+        )
+    except ImportError:
+        pass
 
     # Fail-closed: multi-worker without Redis must not serve split-brain state.
     try:
@@ -4365,18 +4402,29 @@ async def _web_chat_completions(
 
     async def _gateway_for(account):
         from grok2api.upstream.proxy_pool import pick_proxy_for_account
+        from grok2api.upstream.resin_proxy import resin_binding_for_account
 
         egress_key = (
             str(getattr(account, "egress_identity", "") or "").strip()
             or account.account_id
         )
-        proxy_url = await asyncio.to_thread(
+        binding = resin_binding_for_account(
+            ProviderName.WEB.value,
+            account.account_id,
+            egress_identity=egress_key,
+        )
+        proxy_url = binding.gateway_url if binding is not None else await asyncio.to_thread(
             pick_proxy_for_account, egress_key
         )
         client = await _get_provider_http_client(
             # Proxy affinity may be shared by an explicit egress identity,
             # but browser cookie/session state must remain account-isolated.
-            ProviderName.WEB.value, account.account_id, proxy=proxy_url
+            ProviderName.WEB.value,
+            account.account_id,
+            proxy=proxy_url,
+            proxy_auth=binding.proxy_auth if binding is not None else None,
+            proxy_identity=binding.cache_key if binding is not None else None,
+            resin_account=binding.account if binding is not None else None,
         )
         gateway_key = id(client)
         gateway = _web_gateways.get(gateway_key)
@@ -4388,6 +4436,12 @@ async def _web_chat_completions(
             connector = getattr(client, "websocket_connector", None)
             if callable(connector):
                 gateway_kwargs["connector"] = connector
+            elif binding is not None:
+                # Resin auth is held separately from the gateway URL. A legacy
+                # websockets fallback cannot safely inherit it, so fail closed.
+                from grok2api.upstream.resin_proxy import ResinConfigError
+
+                raise ResinConfigError("Resin WebSocket transport is unavailable")
             gateway = GrokWebGateway(client, **gateway_kwargs)
             _web_gateways[gateway_key] = gateway
             while len(_web_gateways) > 4:
@@ -6472,6 +6526,7 @@ async def openai_responses(
             )
             from grok2api.providers.console.adapter import ConsoleProviderAdapter
             from grok2api.upstream.proxy_pool import pick_proxy_for_account
+            from grok2api.upstream.resin_proxy import resin_binding_for_account
 
             registry = create_provider_registry()
             route = registry.resolve(req_body.get("model"), capability="responses")
@@ -6486,13 +6541,23 @@ async def openai_responses(
                     str(getattr(account, "egress_identity", "") or "").strip()
                     or account.account_id
                 )
-                proxy_url = await asyncio.to_thread(
+                binding = resin_binding_for_account(
+                    ProviderName.CONSOLE.value,
+                    account.account_id,
+                    egress_identity=egress_key,
+                )
+                proxy_url = binding.gateway_url if binding is not None else await asyncio.to_thread(
                     pick_proxy_for_account, egress_key
                 )
                 http_client = await _get_provider_http_client(
                     # Keep DPoP/browser state isolated per account even when
                     # several accounts intentionally share one egress identity.
-                    ProviderName.CONSOLE.value, account.account_id, proxy=proxy_url
+                    ProviderName.CONSOLE.value,
+                    account.account_id,
+                    proxy=proxy_url,
+                    proxy_auth=binding.proxy_auth if binding is not None else None,
+                    proxy_identity=binding.cache_key if binding is not None else None,
+                    resin_account=binding.account if binding is not None else None,
                 )
                 gateway_key = id(http_client)
                 gateway = _console_gateways.get(gateway_key)
