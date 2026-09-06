@@ -48,6 +48,11 @@ _mem_dirty = False
 _flush_timer: threading.Timer | None = None
 _FLUSH_DELAY_SEC = 1.0
 
+# Residential proxy lists commonly contain several thousand short entries.
+# Keep a bounded upper limit while allowing the full list to be persisted from
+# the admin API instead of silently truncating it at the old 64 KiB cap.
+MAX_OUTBOUND_PROXY_TEXT = 1_048_576
+
 
 def _ensure() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -3063,7 +3068,7 @@ def _normalize_outbound_proxy_config(
     else:
         cfg["enabled"] = bool(env.get("enabled", True))
     # Multi-line pool text — same cap as registration.
-    cfg["proxy"] = _pick("proxy", 64_000)
+    cfg["proxy"] = _pick("proxy", MAX_OUTBOUND_PROXY_TEXT)
     cfg["proxy_username"] = _pick("proxy_username", 256)
     cfg["proxy_password"] = _pick("proxy_password", 512)
     strat = _pick("proxy_strategy", 32).lower().replace("-", "_")

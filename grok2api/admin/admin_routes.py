@@ -35,6 +35,7 @@ from grok2api.config import (
 )
 from grok2api.upstream.models import load_models_from_cache, resolve_model, sync_models_from_upstream
 from grok2api.admin.settings_store import (
+    MAX_OUTBOUND_PROXY_TEXT,
     VALID_ACCOUNT_MODES,
     change_admin_password,
     create_session_token,
@@ -155,7 +156,7 @@ class RuntimeSettingsBody(BaseModel):
     outbound_proxy_enabled: bool | None = None
     outbound_proxy: str | None = Field(
         default=None,
-        max_length=64_000,
+        max_length=MAX_OUTBOUND_PROXY_TEXT,
         description="Multi-line proxy pool for account egress",
     )
     outbound_proxy_username: str | None = Field(default=None, max_length=256)
