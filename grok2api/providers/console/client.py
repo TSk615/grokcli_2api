@@ -12,6 +12,8 @@ from urllib.parse import urlsplit
 import httpx
 from cryptography.hazmat.primitives.asymmetric import ec
 
+from grok2api.upstream.browser_transport import is_cloudflare_challenge
+
 from .dpop import (
     MAX_TOKEN_LIFETIME,
     REFRESH_SKEW,
@@ -24,7 +26,7 @@ from .dpop import (
     public_jwk,
     session_cache_key,
 )
-from .errors import ConsoleTokenError
+from .errors import ConsoleEgressChallengeError, ConsoleTokenError
 from .headers import DEFAULT_USER_AGENT, browser_headers
 
 
@@ -127,6 +129,13 @@ class ConsoleDPoPClient:
             headers=headers,
         )
         local_after = self._now().astimezone(timezone.utc)
+        if is_cloudflare_challenge(
+            response.status_code,
+            response.headers,
+            response.content,
+        ):
+            await response.aclose()
+            raise ConsoleEgressChallengeError(response.status_code)
         if not 200 <= response.status_code < 300:
             await response.aclose()
             raise ConsoleTokenError(response.status_code)
@@ -238,7 +247,14 @@ class ConsoleDPoPClient:
     ) -> httpx.Response:
 
         endpoint = self._endpoint(path_or_url)
-        cache_key = session_cache_key(self.config.base_url, account_id, egress_identity, sso_token)
+        cache_key = session_cache_key(
+            self.config.base_url,
+            account_id,
+            egress_identity,
+            sso_token,
+            user_agent=user_agent,
+            cloudflare_cookies=cloudflare_cookies,
+        )
         for attempt in range(2):
             session = await self._get_session(
                 cache_key,

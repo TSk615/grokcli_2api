@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import re
 
+from grok2api.upstream.browser_transport import DEFAULT_BROWSER_USER_AGENT
 
-DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
-)
+DEFAULT_USER_AGENT = DEFAULT_BROWSER_USER_AGENT
 
 
 def _clean_cookie_fragment(value: str) -> str:

@@ -55,6 +55,10 @@ from grok2api.config import (
 import grok2api.config as _config
 import grok2api.protocol.history_compact as history_compact
 from grok2api.upstream.models import load_models_from_cache, resolve_model
+from grok2api.upstream.browser_transport import (
+    BrowserAsyncClient,
+    DEFAULT_BROWSER_IMPERSONATE,
+)
 
 APP_VERSION = "1.9.93"
 
@@ -78,6 +82,10 @@ _http_clients_by_proxy: OrderedDict[str, httpx.AsyncClient] = OrderedDict()
 _http_client_lock = asyncio.Lock() if hasattr(asyncio, "Lock") else None  # set later
 _console_gateways: OrderedDict[int, Any] = OrderedDict()
 _web_gateways: OrderedDict[int, Any] = OrderedDict()
+_browser_clients_by_account: OrderedDict[str, BrowserAsyncClient] = OrderedDict()
+_active_provider_transport: ContextVar[str | None] = ContextVar(
+    "grok2api_active_provider_transport", default=None
+)
 
 
 def _proxy_client_cache_limit() -> int:
@@ -282,6 +290,9 @@ async def get_http_client(
     and multi-worker recycle races that surface as Event loop is closed).
     """
     global _http_client
+    provider = _active_provider_transport.get()
+    if provider in {"grok_web", "grok_console"}:
+        return await get_browser_http_client(provider, account_id, proxy=proxy)
     proxy_url = (proxy or "").strip() or None
     if proxy_url is None and account_id:
         try:
@@ -350,6 +361,58 @@ async def get_http_client(
         return client
 
 
+async def get_browser_http_client(
+    provider: str,
+    account_id: str | None,
+    *,
+    proxy: str | None = None,
+) -> BrowserAsyncClient:
+    """Return an account-isolated browser transport for Web/Console.
+
+    curl_cffi owns a CookieJar, so sharing one client by proxy would allow one
+    SSO account's Set-Cookie state to bleed into another account. The cache key
+    therefore includes provider, account, proxy, and the concrete profile.
+    """
+
+    proxy_url = (proxy or "").strip() or None
+    account_key = str(account_id or "anonymous").strip() or "anonymous"
+    key = "|".join((provider, account_key, proxy_url or "direct", DEFAULT_BROWSER_IMPERSONATE))
+    client = _browser_clients_by_account.get(key)
+    if client is not None and not client.is_closed:
+        _browser_clients_by_account.move_to_end(key)
+        return client
+    client = BrowserAsyncClient(
+        proxy=proxy_url,
+        impersonate=DEFAULT_BROWSER_IMPERSONATE,
+    )
+    _browser_clients_by_account[key] = client
+    while len(_browser_clients_by_account) > _proxy_client_cache_limit():
+        old_key, old = _browser_clients_by_account.popitem(last=False)
+        if old_key == key:
+            _browser_clients_by_account[old_key] = old
+            break
+        try:
+            await old.aclose()
+        except Exception:
+            pass
+    return client
+
+
+async def _get_provider_http_client(
+    provider: str,
+    account_id: str | None,
+    *,
+    proxy: str | None,
+) -> Any:
+    token = _active_provider_transport.set(provider)
+    try:
+        # Keep this call boundary stable for existing integrations/tests while
+        # get_http_client selects the provider-only browser transport above.
+        return await get_http_client(account_id, proxy=proxy)
+    finally:
+        _active_provider_transport.reset(token)
+
+
 def invalidate_http_clients() -> None:
     """Mark cached clients for rebuild (proxy config / dead-loop recovery).
 
@@ -364,16 +427,18 @@ def invalidate_http_clients() -> None:
         invalidate_outbound_proxy_cache()
     except Exception:
         pass
-    clients: list[httpx.AsyncClient] = []
+    clients: list[Any] = []
     if _http_client is not None:
         clients.append(_http_client)
         _http_client = None
     clients.extend(list(_http_clients_by_proxy.values()))
     _http_clients_by_proxy.clear()
+    clients.extend(list(_browser_clients_by_account.values()))
+    _browser_clients_by_account.clear()
 
     async def _close_all() -> None:
         for c in clients:
-            if c is not None and not c.is_closed:
+            if c is not None and not getattr(c, "is_closed", False):
                 try:
                     await c.aclose()
                 except Exception:
@@ -395,16 +460,18 @@ def invalidate_http_clients() -> None:
 
 async def _close_http_client() -> None:
     global _http_client
-    clients: list[httpx.AsyncClient] = []
+    clients: list[Any] = []
     if _http_client is not None:
         clients.append(_http_client)
         _http_client = None
     clients.extend(list(_http_clients_by_proxy.values()))
     _http_clients_by_proxy.clear()
+    clients.extend(list(_browser_clients_by_account.values()))
+    _browser_clients_by_account.clear()
     _console_gateways.clear()
     _web_gateways.clear()
     for c in clients:
-        if c is not None and not c.is_closed:
+        if c is not None and not getattr(c, "is_closed", False):
             try:
                 await c.aclose()
             except Exception:
@@ -4299,18 +4366,29 @@ async def _web_chat_completions(
     async def _gateway_for(account):
         from grok2api.upstream.proxy_pool import pick_proxy_for_account
 
-        proxy_url = await asyncio.to_thread(
-            pick_proxy_for_account, account.account_id
+        egress_key = (
+            str(getattr(account, "egress_identity", "") or "").strip()
+            or account.account_id
         )
-        client = await get_http_client(account.account_id, proxy=proxy_url)
+        proxy_url = await asyncio.to_thread(
+            pick_proxy_for_account, egress_key
+        )
+        client = await _get_provider_http_client(
+            # Proxy affinity may be shared by an explicit egress identity,
+            # but browser cookie/session state must remain account-isolated.
+            ProviderName.WEB.value, account.account_id, proxy=proxy_url
+        )
         gateway_key = id(client)
         gateway = _web_gateways.get(gateway_key)
         if gateway is None:
-            gateway = GrokWebGateway(
-                client,
-                base_url=_config.WEB_PROVIDER_BASE_URL,
-                proxy=proxy_url,
-            )
+            gateway_kwargs: dict[str, Any] = {
+                "base_url": _config.WEB_PROVIDER_BASE_URL,
+                "proxy": proxy_url,
+            }
+            connector = getattr(client, "websocket_connector", None)
+            if callable(connector):
+                gateway_kwargs["connector"] = connector
+            gateway = GrokWebGateway(client, **gateway_kwargs)
             _web_gateways[gateway_key] = gateway
             while len(_web_gateways) > 4:
                 _web_gateways.popitem(last=False)
@@ -6404,10 +6482,18 @@ async def openai_responses(
             adapter = ConsoleProviderAdapter()
             total_attempts = 0
             for total_attempts, account in enumerate(provider_accounts, 1):
-                proxy_url = await asyncio.to_thread(
-                    pick_proxy_for_account, account.account_id
+                egress_key = (
+                    str(getattr(account, "egress_identity", "") or "").strip()
+                    or account.account_id
                 )
-                http_client = await get_http_client(account.account_id, proxy=proxy_url)
+                proxy_url = await asyncio.to_thread(
+                    pick_proxy_for_account, egress_key
+                )
+                http_client = await _get_provider_http_client(
+                    # Keep DPoP/browser state isolated per account even when
+                    # several accounts intentionally share one egress identity.
+                    ProviderName.CONSOLE.value, account.account_id, proxy=proxy_url
+                )
                 gateway_key = id(http_client)
                 gateway = _console_gateways.get(gateway_key)
                 if gateway is None:

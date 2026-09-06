@@ -195,6 +195,22 @@ class DPoPSessionCache:
             return len(self._entries)
 
 
-def session_cache_key(base_url: str, account_id: str | int, egress_identity: str, sso_token: str) -> str:
-    fingerprint = hashlib.sha256(sso_token.encode("utf-8")).hexdigest()
+def session_cache_key(
+    base_url: str,
+    account_id: str | int,
+    egress_identity: str,
+    sso_token: str,
+    *,
+    user_agent: str = "",
+    cloudflare_cookies: str = "",
+) -> str:
+    """Bind a DPoP session to the complete browser/egress identity.
+
+    A clearance or User-Agent change represents a new browser session even if
+    the SSO account and proxy identity are unchanged. Only one-way digests are
+    retained in the key.
+    """
+
+    secret = "\x00".join((sso_token, user_agent, cloudflare_cookies))
+    fingerprint = hashlib.sha256(secret.encode("utf-8")).hexdigest()
     return f"{base_url.rstrip('/')}|{account_id}|{egress_identity}|{fingerprint}"

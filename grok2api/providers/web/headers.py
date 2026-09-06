@@ -4,14 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from grok2api.upstream.browser_transport import DEFAULT_BROWSER_USER_AGENT
+
 from .auth import WebCredential
 
 
-DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
-)
+DEFAULT_USER_AGENT = DEFAULT_BROWSER_USER_AGENT
 
 _PROTECTED_HEADERS = {"cookie", "host", "content-length", "transfer-encoding"}
 

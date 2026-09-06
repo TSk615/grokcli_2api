@@ -99,3 +99,10 @@ class ConsoleTokenError(RuntimeError):
     def __init__(self, status_code: int, message: str = "Console DPoP token request failed") -> None:
         self.status_code = status_code
         super().__init__(f"{message} ({status_code})")
+
+
+class ConsoleEgressChallengeError(ConsoleTokenError):
+    """Cloudflare/browser challenge; never marks the SSO credential invalid."""
+
+    def __init__(self, status_code: int) -> None:
+        super().__init__(status_code, "Console browser session was challenged")

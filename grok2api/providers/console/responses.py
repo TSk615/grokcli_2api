@@ -7,6 +7,8 @@ from typing import Any
 
 import httpx
 
+from grok2api.upstream.browser_transport import BrowserTransportError
+
 from ..types import Capability, ModelRoute, ProviderName
 from .auth import ConsoleCredential
 from .client import ConsoleDPoPClient
@@ -73,11 +75,21 @@ class ConsoleResponsesTransport:
                 headers={"Content-Type": "application/json", "Accept": "*/*"},
                 json=payload,
             )
-        except (httpx.HTTPError, ConsoleTokenError, TypeError, ValueError):
+        except (
+            httpx.HTTPError,
+            BrowserTransportError,
+            ConsoleTokenError,
+            TypeError,
+            ValueError,
+        ):
             # Leave the exception scope before raising. This avoids retaining
             # even a suppressed __context__: an HTTPX request object contains
             # Cookie, Authorization and DPoP headers.
             failed = True
         if failed:
             raise ConsoleResponsesError("Grok Console Responses request failed")
+        content_type = str(response.headers.get("content-type") or "").lower()
+        if "text/html" in content_type:
+            await response.aclose()
+            raise ConsoleResponsesError("Grok Console browser session was challenged")
         return response

@@ -88,7 +88,11 @@ class AppProviderRoutingTests(unittest.IsolatedAsyncioTestCase):
             model="Web/grok-chat-fast",
             messages=[ChatMessage(role="user", content="hi")],
         )
-        account = SimpleNamespace(account_id="web-account", credential=object())
+        account = SimpleNamespace(
+            account_id="web-account",
+            credential=object(),
+            egress_identity="shared-edge-a",
+        )
         client = object()
         gateway = _Gateway()
         route = SimpleNamespace(
@@ -114,7 +118,9 @@ class AppProviderRoutingTests(unittest.IsolatedAsyncioTestCase):
             response = await app._web_chat_completions(req, _request())
 
         self.assertEqual(response.status_code, 200)
-        pick_proxy.assert_called_once_with("web-account")
+        pick_proxy.assert_called_once_with("shared-edge-a")
+        # The proxy affinity key may be shared, but the browser client owns
+        # cookie/session state and therefore remains keyed by the real account.
         get_client.assert_awaited_once_with(
             "web-account", proxy="http://proxy.example:8080"
         )
@@ -196,7 +202,11 @@ class AppProviderRoutingTests(unittest.IsolatedAsyncioTestCase):
             async def json(self):
                 return {"model": "Console/grok-4.3", "input": "hi"}
 
-        account = SimpleNamespace(account_id="console-account", credential=object())
+        account = SimpleNamespace(
+            account_id="console-account",
+            credential=object(),
+            egress_identity="shared-edge-a",
+        )
         upstream = httpx.Response(
             200,
             json={"id": "response-test"},
@@ -232,7 +242,7 @@ class AppProviderRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["x-grok2api-provider"], "grok_console")
-        pick_proxy.assert_called_once_with("console-account")
+        pick_proxy.assert_called_once_with("shared-edge-a")
         get_client.assert_awaited_once_with(
             "console-account", proxy="http://proxy.example:8080"
         )

@@ -18,6 +18,8 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import httpx
 
+from grok2api.upstream.browser_transport import is_cloudflare_challenge
+
 from .auth import WebCredential
 from .headers import DEFAULT_USER_AGENT, build_cookie_header, build_web_headers
 from .protocol import WebProtocolError, convert_chat_completion
@@ -38,6 +40,10 @@ class WebGatewayError(RuntimeError):
 
 
 class WebGatewayAuthError(WebGatewayError):
+    pass
+
+
+class WebGatewayEgressError(WebGatewayError):
     pass
 
 
@@ -217,13 +223,15 @@ class GrokWebGateway:
             )
         except Exception:
             raise WebGatewayError("Grok Web session lookup failed") from None
+        body = response.content
+        if len(body) > SESSION_BODY_LIMIT:
+            raise WebGatewayError("Grok Web session response exceeds the safety limit")
+        if is_cloudflare_challenge(response.status_code, response.headers, body):
+            raise WebGatewayEgressError("Grok Web browser session was challenged")
         if response.status_code == 401:
             raise WebGatewayAuthError("Grok Web session is not authenticated")
         if response.status_code < 200 or response.status_code >= 300:
             raise WebGatewayError("Grok Web session lookup was rejected")
-        body = response.content
-        if len(body) > SESSION_BODY_LIMIT:
-            raise WebGatewayError("Grok Web session response exceeds the safety limit")
         try:
             value = json.loads(body)
         except (json.JSONDecodeError, UnicodeDecodeError):
