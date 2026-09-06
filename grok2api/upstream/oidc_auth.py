@@ -674,18 +674,49 @@ def refresh_access_token(
         "client_id": str(client_id),
     }
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    if client is not None:
+    # Resin mode is authoritative even when a caller supplied a shared client:
+    # only a client tagged for this exact account binding may be reused.
+    proxy_url = None
+    binding = None
+    aid = str(
+        entry.get("id") or entry.get("user_id") or entry.get("email") or ""
+    ).strip()
+    try:
+        from grok2api.upstream.resin_proxy import resin_binding_for_account
+
+        # Build credentials, refreshes, and probes share one provider-scoped
+        # Resin identity so the same account keeps one residential egress.
+        binding = resin_binding_for_account("grok_build", aid or "unknown")
+    except Exception:
+        from grok2api.upstream.resin_proxy import resin_enabled
+        if resin_enabled():
+            raise
+    if binding is not None:
+        owns_client = not (
+            client is not None
+            and getattr(client, "_g2a_resin_cache_key", None) == binding.cache_key
+        )
+        c = client
+        if owns_client:
+            c = httpx.Client(
+                timeout=30.0,
+                proxy=httpx.Proxy(binding.gateway_url, auth=binding.proxy_auth),
+            )
+        assert c is not None
+        try:
+            resp = c.post(OIDC_TOKEN_URL, data=form, headers=headers)
+        finally:
+            if owns_client:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+    elif client is not None:
         resp = client.post(OIDC_TOKEN_URL, data=form, headers=headers)
     else:
-        # Prefer outbound proxy pool when configured (single-account refresh path).
-        proxy_url = None
         try:
             from grok2api.upstream.proxy_pool import pick_proxy_for_account
 
-            aid = (
-                str(entry.get("id") or entry.get("user_id") or entry.get("email") or "")
-                .strip()
-            )
             proxy_url = pick_proxy_for_account(aid or None)
         except Exception:
             proxy_url = None
@@ -1349,7 +1380,11 @@ def _try_sso_reauth(account_id: str, entry: dict[str, Any]) -> dict[str, Any]:
         import sso_to_auth_json as _sso
         import grok2api.pool.accounts as _accounts
 
-        token = _sso.sso_to_token(sso, quiet=True)
+        token = _sso.sso_to_token(
+            sso,
+            quiet=True,
+            egress_identity=account_id,
+        )
         if not isinstance(token, dict) or not (token.get("access_token") or token.get("key")):
             return {"ok": False, "reason": "sso_failed", "error": "SSO conversion returned no token"}
         _sso_key, new_entry = _sso.token_to_auth_entry(
@@ -1556,21 +1591,36 @@ def refresh_all_accounts(
     def _thread_client(account_id: str | None = None) -> httpx.Client:
         # Cache one client per thread+proxy so refresh batches reuse TLS.
         proxy_url = None
+        proxy_obj = None
+        resin_key = None
         if account_id:
             try:
-                from grok2api.upstream.proxy_pool import pick_proxy_for_account
+                from grok2api.upstream.resin_proxy import resin_binding_for_account
 
-                proxy_url = pick_proxy_for_account(account_id)
+                binding = resin_binding_for_account("grok_build", account_id)
+                if binding is not None:
+                    proxy_obj = httpx.Proxy(binding.gateway_url, auth=binding.proxy_auth)
+                    resin_key = binding.cache_key
+                else:
+                    from grok2api.upstream.proxy_pool import pick_proxy_for_account
+
+                    proxy_url = pick_proxy_for_account(account_id)
             except Exception:
+                from grok2api.upstream.resin_proxy import resin_enabled
+                if resin_enabled():
+                    raise
                 proxy_url = None
-        cache_key = proxy_url or ""
+        cache_key = resin_key or proxy_url or ""
         bucket = getattr(_tls, "clients", None)
         if not isinstance(bucket, dict):
             bucket = {}
             _tls.clients = bucket
         client = bucket.get(cache_key)
         if client is None or client.is_closed:
-            if proxy_url:
+            if proxy_obj is not None:
+                client = httpx.Client(timeout=30.0, proxy=proxy_obj)
+                setattr(client, "_g2a_resin_cache_key", resin_key)
+            elif proxy_url:
                 try:
                     client = httpx.Client(timeout=30.0, proxy=proxy_url)
                 except TypeError:

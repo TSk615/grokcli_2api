@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import secrets
@@ -120,8 +121,32 @@ def _is_rate_limited_payload(text: str | None = None, url: str | None = None, st
 
 
 
-def _proxy_kwargs() -> dict:
-    """Return curl_cffi compatible proxy kwargs from env / proxy pool."""
+def _proxy_kwargs(account_identity: str | None = None) -> dict:
+    """Return secret-safe curl_cffi proxy kwargs for one account.
+
+    Resin mode is deliberately fail-closed: an incomplete Resin configuration
+    or missing account identity must never fall through to the legacy/direct
+    proxy pool.  Credentials stay separate from the proxy URL so exceptions and
+    request diagnostics cannot accidentally expose the Resin token.
+    """
+    from grok2api.upstream.resin_proxy import (
+        ResinConfigError,
+        resin_binding_for_account,
+        resin_enabled,
+    )
+
+    if resin_enabled():
+        identity = str(account_identity or "").strip()
+        if not identity:
+            raise ResinConfigError("Resin account identity is unavailable")
+        binding = resin_binding_for_account("grok_build", identity)
+        if binding is None:  # defensive: enabled mode must always yield a binding
+            raise ResinConfigError("Resin proxy binding is unavailable")
+        return {
+            "proxy": binding.gateway_url,
+            "proxy_auth": binding.proxy_auth,
+        }
+
     try:
         from proxy_pool import resolve_proxy_for_request, curl_proxies_arg
 
@@ -200,12 +225,20 @@ def _poll_interval_sec(raw: Any = None) -> float:
     return max(0.4, min(hinted, 1.5))
 
 
-def request_device_code(session: Any | None = None) -> dict | None:
+def request_device_code(
+    session: Any | None = None,
+    *,
+    proxy_kwargs: dict[str, Any] | None = None,
+) -> dict | None:
     """Request OIDC device code. Prefer shared curl_cffi session when given.
 
     Retries on xAI rate limits (HTTP 429 / slow_down) — common when several
     registration workers enter device-flow together.
     """
+    proxy_kw = _proxy_kwargs() if proxy_kwargs is None else proxy_kwargs
+    if session is None and proxy_kw:
+        # urllib does not support Resin's separate proxy authentication safely.
+        session = requests.Session()
     form = {"client_id": GROK_CLI_CLIENT_ID, "scope": OIDC_SCOPES}
     timeout = _http_timeout()
     retries = _device_flow_retries()
@@ -220,7 +253,7 @@ def request_device_code(session: Any | None = None) -> dict | None:
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
                     impersonate="chrome",
                     timeout=timeout,
-                    **_proxy_kwargs(),
+                    **proxy_kw,
                 )
                 code = int(getattr(r, "status_code", 0) or 0)
                 body = (getattr(r, "text", None) or "")[:300]
@@ -279,6 +312,7 @@ def poll_token(
     *,
     session: Any | None = None,
     immediate: bool = True,
+    proxy_kwargs: dict[str, Any] | None = None,
 ) -> dict | None:
     """Exchange an approved device_code for tokens.
 
@@ -287,6 +321,10 @@ def poll_token(
     - Use a short interval (default ~1s) instead of the upstream 5s hint.
     - Prefer curl_cffi session when provided (same TLS fingerprint path).
     """
+    proxy_kw = _proxy_kwargs() if proxy_kwargs is None else proxy_kwargs
+    if session is None and proxy_kw:
+        # Keep proxy authentication outside URLs and avoid a direct urllib path.
+        session = requests.Session()
     interval_f = _poll_interval_sec(interval)
     deadline = time.time() + min(float(expires_in or 1800), float(timeout or 45))
     form = {
@@ -309,7 +347,7 @@ def poll_token(
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
                     impersonate="chrome",
                     timeout=http_timeout,
-                    **_proxy_kwargs(),
+                    **proxy_kw,
                 )
                 code = int(getattr(r, "status_code", 0) or 0)
                 if code < 400:
@@ -366,7 +404,12 @@ def poll_token(
     return None
 
 
-def sso_to_token(sso_cookie: str, *, quiet: bool = False) -> dict | None:
+def sso_to_token(
+    sso_cookie: str,
+    *,
+    quiet: bool = False,
+    egress_identity: str | None = None,
+) -> dict | None:
     """SSO cookie → token dict (access/refresh/expires_in).
 
     ``quiet=True`` reduces per-account stdout (faster under high concurrency).
@@ -376,10 +419,23 @@ def sso_to_token(sso_cookie: str, *, quiet: bool = False) -> dict | None:
     produce consecutive conversion failures after SSO was already obtained.
     """
     log = (lambda *a, **k: None) if quiet else print
+    # A caller with a persisted account id should pass it so SSO recovery shares
+    # the account's normal Build egress.  Fresh imports use only a one-way digest
+    # of the SSO value, yielding stable retries without exposing the credential.
+    identity = str(egress_identity or "").strip()
+    if not identity:
+        identity = "sso-" + hashlib.sha256(sso_cookie.encode("utf-8")).hexdigest()
+    try:
+        proxy_kw = _proxy_kwargs(identity)
+    except Exception:
+        # Configuration details are intentionally not echoed here.  Most
+        # importantly, do not retry through the legacy/direct path.
+        log("  ❌ Resin proxy unavailable")
+        return None
+
     s = requests.Session()
     s.cookies.set("sso", sso_cookie, domain=".x.ai")
     timeout = _http_timeout()
-    proxy_kw = _proxy_kwargs()
 
     try:
         r = s.get(
@@ -399,7 +455,7 @@ def sso_to_token(sso_cookie: str, *, quiet: bool = False) -> dict | None:
     retries = _device_flow_retries()
     for attempt in range(1, retries + 1):
         log(f"  🔑 Device Flow... (try {attempt}/{retries})")
-        dc = request_device_code(session=s)
+        dc = request_device_code(session=s, proxy_kwargs=proxy_kw)
         if not dc:
             if attempt < retries:
                 time.sleep(_device_flow_backoff_sec(attempt))
@@ -480,6 +536,7 @@ def sso_to_token(sso_cookie: str, *, quiet: bool = False) -> dict | None:
             timeout=float(os.getenv("GROK2API_SSO_POLL_TIMEOUT", "45") or 45),
             session=s,
             immediate=True,
+            proxy_kwargs=proxy_kw,
         )
         if not token:
             if attempt < retries:

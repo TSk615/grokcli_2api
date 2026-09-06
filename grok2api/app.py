@@ -131,7 +131,9 @@ def _http_timeouts() -> tuple[httpx.Timeout, httpx.Limits]:
     return timeout, limits
 
 
-def _new_async_client(*, proxy: str | None = None) -> httpx.AsyncClient:
+def _new_async_client(
+    *, proxy: str | None = None, proxy_auth: tuple[str, str] | None = None
+) -> httpx.AsyncClient:
     timeout, limits = _http_timeouts()
     kwargs: dict[str, Any] = {
         "timeout": timeout,
@@ -139,7 +141,12 @@ def _new_async_client(*, proxy: str | None = None) -> httpx.AsyncClient:
         "http2": False,
     }
     proxy_url = (proxy or "").strip()
-    if proxy_url:
+    if proxy_auth and proxy_url:
+        # Resin credentials remain in proxy authentication, never in the URL.
+        client = httpx.AsyncClient(
+            proxy=httpx.Proxy(proxy_url, auth=proxy_auth), **kwargs
+        )
+    elif proxy_url:
         # httpx>=0.28 uses `proxy=`; older used `proxies=`. Try modern first.
         try:
             client = httpx.AsyncClient(proxy=proxy_url, **kwargs)
@@ -305,13 +312,28 @@ async def get_http_client(
                 resin_account=resin_account,
             )
     proxy_url = (proxy or "").strip() or None
+    proxy_auth: tuple[str, str] | None = None
+    proxy_cache_key: str | None = proxy_url
     if proxy_url is None and account_id:
         try:
-            from grok2api.upstream.proxy_pool import pick_proxy_for_account
+            from grok2api.upstream.resin_proxy import resin_binding_for_account
 
-            proxy_url = pick_proxy_for_account(account_id)
+            binding = resin_binding_for_account("grok_build", account_id)
+            if binding is not None:
+                proxy_url = binding.gateway_url
+                proxy_auth = binding.proxy_auth
+                proxy_cache_key = binding.cache_key
+            else:
+                from grok2api.upstream.proxy_pool import pick_proxy_for_account
+
+                proxy_url = pick_proxy_for_account(account_id)
+                proxy_cache_key = proxy_url
         except Exception:
+            from grok2api.upstream.resin_proxy import resin_enabled
+            if resin_enabled():
+                raise
             proxy_url = None
+            proxy_cache_key = None
 
     if not proxy_url:
         if _client_loop_ok(_http_client):
@@ -326,41 +348,42 @@ async def get_http_client(
             _http_client = _new_async_client()
             return _http_client
 
-    client = _http_clients_by_proxy.get(proxy_url)
+    cache_key = proxy_cache_key or proxy_url
+    client = _http_clients_by_proxy.get(cache_key)
     if _client_loop_ok(client):
         # LRU: keep active proxy clients hot in large residential pools.
         try:
-            _http_clients_by_proxy.move_to_end(proxy_url)
+            _http_clients_by_proxy.move_to_end(cache_key)
         except Exception:
             pass
         return client  # type: ignore[return-value]
 
     if _http_client_lock is None:
         if client is not None:
-            _http_clients_by_proxy.pop(proxy_url, None)
-        client = _new_async_client(proxy=proxy_url)
-        _http_clients_by_proxy[proxy_url] = client
+            _http_clients_by_proxy.pop(cache_key, None)
+        client = _new_async_client(proxy=proxy_url, proxy_auth=proxy_auth)
+        _http_clients_by_proxy[cache_key] = client
         return client
 
     async with _http_client_lock:
-        client = _http_clients_by_proxy.get(proxy_url)
+        client = _http_clients_by_proxy.get(cache_key)
         if _client_loop_ok(client):
             try:
-                _http_clients_by_proxy.move_to_end(proxy_url)
+                _http_clients_by_proxy.move_to_end(cache_key)
             except Exception:
                 pass
             return client  # type: ignore[return-value]
         if client is not None:
-            _http_clients_by_proxy.pop(proxy_url, None)
-        client = _new_async_client(proxy=proxy_url)
-        _http_clients_by_proxy[proxy_url] = client
+            _http_clients_by_proxy.pop(cache_key, None)
+        client = _new_async_client(proxy=proxy_url, proxy_auth=proxy_auth)
+        _http_clients_by_proxy[cache_key] = client
         # Bound the map so a huge residential pool cannot retain thousands of clients.
         # Use LRU eviction instead of arbitrary deletion to avoid constantly rebuilding
         # the same active proxy connections under account-sticky routing.
         limit = _proxy_client_cache_limit()
         while len(_http_clients_by_proxy) > limit:
             old_key, old = _http_clients_by_proxy.popitem(last=False)
-            if old_key == proxy_url:
+            if old_key == cache_key:
                 _http_clients_by_proxy[old_key] = old
                 break
             if old is not None and not old.is_closed:

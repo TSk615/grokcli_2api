@@ -71,7 +71,9 @@ _http_clients_by_proxy: dict[str, httpx.Client] = {}
 _http_client_lock = threading.Lock()
 
 
-def _new_probe_client(*, proxy: str | None = None) -> httpx.Client:
+def _new_probe_client(
+    *, proxy: str | None = None, proxy_auth: tuple[str, str] | None = None
+) -> httpx.Client:
     limits = httpx.Limits(
         max_connections=max(8, int(MODEL_PROBE_WORKERS) * 4),
         max_keepalive_connections=max(4, int(MODEL_PROBE_WORKERS) * 2),
@@ -83,6 +85,10 @@ def _new_probe_client(*, proxy: str | None = None) -> httpx.Client:
         "http2": False,
     }
     proxy_url = (proxy or "").strip()
+    if proxy_auth and proxy_url:
+        # Keep Resin credentials out of proxy URLs and repr/log output.
+        proxy_obj = httpx.Proxy(proxy_url, auth=proxy_auth)
+        return httpx.Client(proxy=proxy_obj, **kwargs)
     if proxy_url:
         try:
             return httpx.Client(proxy=proxy_url, **kwargs)
@@ -102,13 +108,30 @@ def _probe_http_client(account_id: str | None = None) -> httpx.Client:
     """
     global _http_client
     proxy_url: str | None = None
+    proxy_auth: tuple[str, str] | None = None
+    cache_key = ""
     if account_id:
         try:
-            from grok2api.upstream.proxy_pool import pick_proxy_for_account
+            from grok2api.upstream.resin_proxy import resin_binding_for_account
 
-            proxy_url = pick_proxy_for_account(account_id)
+            # Health checks must observe the same sticky egress as live Build
+            # traffic and OIDC refresh for this account.
+            binding = resin_binding_for_account("grok_build", account_id)
+            if binding is not None:
+                proxy_url = binding.gateway_url
+                proxy_auth = binding.proxy_auth
+                cache_key = binding.cache_key
+            else:
+                from grok2api.upstream.proxy_pool import pick_proxy_for_account
+
+                proxy_url = pick_proxy_for_account(account_id)
+                cache_key = proxy_url or ""
         except Exception:
+            from grok2api.upstream.resin_proxy import resin_enabled
+            if resin_enabled():
+                raise
             proxy_url = None
+            cache_key = ""
 
     if not proxy_url:
         with _http_client_lock:
@@ -117,13 +140,13 @@ def _probe_http_client(account_id: str | None = None) -> httpx.Client:
             return _http_client
 
     with _http_client_lock:
-        client = _http_clients_by_proxy.get(proxy_url)
+        client = _http_clients_by_proxy.get(cache_key)
         if client is None or client.is_closed:
-            client = _new_probe_client(proxy=proxy_url)
-            _http_clients_by_proxy[proxy_url] = client
+            client = _new_probe_client(proxy=proxy_url, proxy_auth=proxy_auth)
+            _http_clients_by_proxy[cache_key] = client
             if len(_http_clients_by_proxy) > 32:
                 for old_key in list(_http_clients_by_proxy.keys()):
-                    if old_key == proxy_url:
+                    if old_key == cache_key:
                         continue
                     old = _http_clients_by_proxy.pop(old_key, None)
                     if old is not None and not old.is_closed:
