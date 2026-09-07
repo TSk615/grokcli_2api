@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import base64
+import json
 import unittest
 from datetime import date
 
+from grok2api.providers.web.auth import WebCredential
 from grok2api.providers.web.account_settings import (
     ACCEPT_TERMS_FRAME,
     CURRENT_TERMS_VERSION,
@@ -10,8 +13,22 @@ from grok2api.providers.web.account_settings import (
     _VerificationMetaParser,
     _classification,
     _grpc_status,
+    WebAccountSettingsClient,
     random_adult_birth_date,
 )
+
+
+class _Response:
+    def __init__(self, status_code: int, body: bytes) -> None:
+        self.status_code = status_code
+        self._body = body
+        self.headers: dict[str, str] = {}
+
+    async def aread(self) -> bytes:
+        return self._body
+
+    async def aclose(self) -> None:
+        return None
 
 
 class WebAccountSettingsTests(unittest.TestCase):
@@ -52,6 +69,29 @@ class WebAccountSettingsTests(unittest.TestCase):
             age = today.year - value.year - ((today.month, today.day) < (value.month, value.day))
             self.assertGreaterEqual(age, 20)
             self.assertLessEqual(age, 40)
+
+
+class WebAccountSettingsAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_statsig_signer_uses_bound_client_without_account_secrets(self) -> None:
+        signature = base64.b64encode(b"x" * 70).decode()
+
+        class Client:
+            async def get(self, url: str, **kwargs):
+                return _Response(200, b'<meta name="grok-site-verification" content="meta-value">')
+
+            async def post(self, url: str, **kwargs):
+                self.url = url
+                self.kwargs = kwargs
+                return _Response(200, json.dumps({"x-statsig-id": signature}).encode())
+
+        client = Client()
+        worker = WebAccountSettingsClient(client)
+        value = await worker._signed_statsig(WebCredential("secret-sso", "secret-rw"), "/rest/test")
+        self.assertEqual(value, signature)
+        self.assertEqual(client.url, "https://grok.wodf.de/sign")
+        self.assertNotIn("Cookie", client.kwargs["headers"])
+        self.assertNotIn("Authorization", client.kwargs["headers"])
+        self.assertNotIn("secret-sso", repr(client.kwargs))
 
 
 if __name__ == "__main__":

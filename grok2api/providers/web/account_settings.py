@@ -18,8 +18,6 @@ from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urlsplit
 
-import httpx
-
 from .auth import WebCredential
 from .headers import DEFAULT_USER_AGENT, build_cookie_header
 
@@ -227,20 +225,28 @@ class WebAccountSettingsClient:
         parser.feed(body.decode("utf-8", errors="ignore"))
         if not parser.value:
             raise WebAccountSettingError("statsig_meta", "verification_meta_missing", status)
-        async with httpx.AsyncClient(timeout=15.0, trust_env=False) as signer:
-            signed = await signer.post(
-                self.signer_url,
-                json={"method": "POST", "path": path, "environment": {"metaContent": parser.value}},
-            )
-        if not 200 <= signed.status_code < 300:
-            raise WebAccountSettingError("statsig_signer", "signer_unavailable", signed.status_code)
+        signed = await self._client.post(
+            self.signer_url,
+            json={"method": "POST", "path": path, "environment": {"metaContent": parser.value}},
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+            timeout=15.0,
+        )
         try:
-            value = str(signed.json()["x-statsig-id"]).strip()
+            signed_body = await signed.aread()
+            signed_status = int(signed.status_code)
+        finally:
+            await signed.aclose()
+        if not 200 <= signed_status < 300:
+            raise WebAccountSettingError("statsig_signer", "signer_unavailable", signed_status)
+        if len(signed_body) > BODY_LIMIT:
+            raise WebAccountSettingError("statsig_signer", "response_too_large", signed_status)
+        try:
+            value = str(json.loads(signed_body)["x-statsig-id"]).strip()
             padding = "=" * (-len(value) % 4)
             if len(base64.b64decode(value + padding)) != 70:
                 raise ValueError
         except (KeyError, TypeError, ValueError):
-            raise WebAccountSettingError("statsig_signer", "invalid_signature", signed.status_code) from None
+            raise WebAccountSettingError("statsig_signer", "invalid_signature", signed_status) from None
         self._statsig_cache[path] = value
         return value
 
