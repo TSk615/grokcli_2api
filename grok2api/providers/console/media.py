@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any, Mapping
@@ -27,7 +26,25 @@ TRUSTED_ASSET_HOSTS = frozenset({"assets.grok.com", "imagine-public.x.ai", "imge
 
 
 class ConsoleMediaError(RuntimeError):
-    """Sanitized Console media failure."""
+    """Sanitized Console media failure with an upstream classification."""
+
+    def __init__(self, message: str, *, status_code: int | None = None, phase: str = "") -> None:
+        super().__init__(message)
+        self.status_code = int(status_code) if status_code is not None else None
+        self.phase = str(phase or "")
+
+    @property
+    def classification(self) -> str:
+        status = self.status_code
+        if status == 429:
+            return "quota_or_rate_limit"
+        if status in {401, 403}:
+            return "auth_or_challenge"
+        if status is not None and status >= 500:
+            return "upstream_network"
+        if status is not None:
+            return "upstream_rejected"
+        return "client_or_protocol"
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,7 +113,7 @@ class ConsoleMediaGateway:
         finally:
             await response.aclose()
         if status < 200 or status >= 300:
-            raise ConsoleMediaError(f"Console image generation returned {status}")
+            raise ConsoleMediaError(f"Console image generation returned {status}", status_code=status, phase="image_create")
         try:
             payload = json.loads(raw)
             items = payload.get("data") if isinstance(payload, Mapping) else None
@@ -153,7 +170,7 @@ class ConsoleMediaGateway:
         finally:
             await response.aclose()
         if status < 200 or status >= 300:
-            raise ConsoleMediaError(f"Console video creation returned {status}")
+            raise ConsoleMediaError(f"Console video creation returned {status}", status_code=status, phase="video_create")
         try:
             created = json.loads(raw)
             request_id = str(created.get("request_id") or created.get("id") or "").strip()
@@ -181,7 +198,7 @@ class ConsoleMediaGateway:
             finally:
                 await status_response.aclose()
             if status_code < 200 or status_code >= 300:
-                raise ConsoleMediaError(f"Console video status returned {status_code}")
+                raise ConsoleMediaError(f"Console video status returned {status_code}", status_code=status_code, phase="video_poll")
             try:
                 state = json.loads(status_raw)
             except (ValueError, TypeError):
@@ -214,7 +231,7 @@ class ConsoleMediaGateway:
         )
         try:
             if response.status_code < 200 or response.status_code >= 300:
-                raise ConsoleMediaError(f"Console {media} download returned {response.status_code}")
+                raise ConsoleMediaError(f"Console {media} download returned {response.status_code}", status_code=response.status_code, phase=f"{media}_download")
             limit = MAX_IMAGE_BYTES if media == "image" else MAX_VIDEO_BYTES
             data = await response.aread()
             if not data or len(data) > limit:

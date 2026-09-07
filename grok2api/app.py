@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 import uuid
@@ -62,6 +63,7 @@ from grok2api.upstream.browser_transport import (
 )
 
 APP_VERSION = "1.9.94"
+_logger = logging.getLogger(__name__)
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -4502,7 +4504,7 @@ async def _web_image_generations(
                 _web_gateways.popitem(last=False)
         return gateway
 
-    for account in attempts:
+    for attempt_index, account in enumerate(attempts, 1):
         try:
             gateway = await _gateway_for(account)
             images = await gateway.generate_image(body, account.credential)
@@ -4598,7 +4600,8 @@ async def _console_image_generations(req: Any, request: Request) -> Response:
     body["model"] = route.upstream_model
     store = ImageMediaStore()
     attempts = accounts[: max(1, min(10, int(os.getenv("GROK2API_CONSOLE_MEDIA_MAX_ATTEMPTS", "3") or 3)))]
-    for account in attempts:
+    failures: dict[str, int] = {}
+    for attempt_index, account in enumerate(attempts, 1):
         try:
             gateway, egress_key = await _console_media_gateway_for(account)
             images = await gateway.generate_image(
@@ -4619,9 +4622,22 @@ async def _console_image_generations(req: Any, request: Request) -> Response:
                 data.append(stored.as_openai(req.response_format, base_url=_request_public_origin(request)))
             if len(data) == req.n:
                 return JSONResponse({"created": int(time.time()), "data": data}, headers={"X-Grok2API-Provider": ProviderName.CONSOLE.value})
-        except Exception:
+        except Exception as exc:
+            from grok2api.providers.console import ConsoleMediaError
+            classification = exc.classification if isinstance(exc, ConsoleMediaError) else "internal_or_transport"
+            failures[classification] = failures.get(classification, 0) + 1
+            _logger.warning(
+                "console_media_failure media=image class=%s status=%s phase=%s attempt=%s",
+                classification,
+                getattr(exc, "status_code", None),
+                getattr(exc, "phase", ""),
+                attempt_index,
+            )
             continue
-    return openai_error("Grok Console image generation failed", status=502, err_type="upstream_error", code="console_image_generation_failed")
+    if failures and set(failures) == {"quota_or_rate_limit"}:
+        return openai_error("Console image quota or rate limit reached", status=429, err_type="rate_limit_error", code="console_image_quota_or_rate_limit")
+    dominant = max(failures, key=failures.get) if failures else "unknown"
+    return openai_error(f"Grok Console image generation failed ({dominant})", status=502, err_type="upstream_error", code=f"console_image_{dominant}")
 
 
 async def _console_video_generations(payload: dict[str, Any], request: Request) -> Response:
@@ -4645,7 +4661,8 @@ async def _console_video_generations(payload: dict[str, Any], request: Request) 
     accounts = await asyncio.to_thread(acquire_provider_sequence, ProviderName.CONSOLE)
     attempts = accounts[: max(1, min(10, int(os.getenv("GROK2API_CONSOLE_MEDIA_MAX_ATTEMPTS", "3") or 3)))]
     video_store_root = DATA_DIR / "media" / "videos"
-    for account in attempts:
+    failures: dict[str, int] = {}
+    for attempt_index, account in enumerate(attempts, 1):
         try:
             gateway, egress_key = await _console_media_gateway_for(account)
             video = await gateway.generate_video(body, account.credential, account_id=account.account_id, egress_identity=egress_key)
@@ -4654,9 +4671,22 @@ async def _console_video_generations(payload: dict[str, Any], request: Request) 
             filename, size = VideoMediaStore(video_store_root).store(raw, content_type=content_type)
             public_path = f"/v1/media/videos/{filename}"
             return JSONResponse({"id": video.request_id, "object": "video", "status": "completed", "model": route.qualified_model, "url": f"{_request_public_origin(request)}{public_path}", "bytes": size, "content_type": content_type}, headers={"X-Grok2API-Provider": ProviderName.CONSOLE.value})
-        except Exception:
+        except Exception as exc:
+            from grok2api.providers.console import ConsoleMediaError
+            classification = exc.classification if isinstance(exc, ConsoleMediaError) else "internal_or_transport"
+            failures[classification] = failures.get(classification, 0) + 1
+            _logger.warning(
+                "console_media_failure media=video class=%s status=%s phase=%s attempt=%s",
+                classification,
+                getattr(exc, "status_code", None),
+                getattr(exc, "phase", ""),
+                attempt_index,
+            )
             continue
-    return openai_error("Grok Console video generation failed", status=502, err_type="upstream_error", code="console_video_generation_failed")
+    if failures and set(failures) == {"quota_or_rate_limit"}:
+        return openai_error("Console video quota or rate limit reached", status=429, err_type="rate_limit_error", code="console_video_quota_or_rate_limit")
+    dominant = max(failures, key=failures.get) if failures else "unknown"
+    return openai_error(f"Grok Console video generation failed ({dominant})", status=502, err_type="upstream_error", code=f"console_video_{dominant}")
 
 
 async def _web_chat_completions(

@@ -103,6 +103,8 @@ Console/grok-build-0.1
 3. 进入管理台「账号」，选择 Grok Web 或 Grok Console，导入对应 SSO/TXT/JSON。SSO、Cookie 和 Console DPoP 材料只保存为加密凭据，不会写入公开 payload 或日志。
 4. 用带前缀的模型发起请求。Console 文本使用 OpenAI Responses API（`/v1/responses`）；Console 的 `/v1/chat/completions` 会返回明确错误，请改用 Responses。Web 支持单轮文本、SSE/连续 JSON 流和非流式文生图；图片编辑、视频、工具和多轮历史附件暂未纳入。
 
+Console 媒体失败会做脱敏分类：仅当所有候选账号都返回 429 时透传 429（`console_*_quota_or_rate_limit`）；网络/会话类失败保持 502，并在日志中记录媒体类型、阶段、状态码和分类，不记录 SSO、Cookie、DPoP 或账号标识。
+
 Web 文生图调用 `POST /v1/images/generations`，首版支持 `n=1..10`、`size` / `aspect_ratio` 以及 `response_format=url|b64_json`。生成结果会安全保存到 `GROK2API_DATA_DIR/media/images`；`url` 模式返回本应用的内容寻址媒体地址。
 单个请求最多尝试 3 个 Web 账号，避免额度不足时扫完整个大号池；可通过 `GROK2API_WEB_IMAGE_MAX_ATTEMPTS` 在 1–10 之间调整。
 
