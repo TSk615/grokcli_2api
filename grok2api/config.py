@@ -88,6 +88,8 @@ WEB_IMAGES_ENABLED = _env_truthy(
     "GROK2API_WEB_IMAGES_ENABLED", "0"
 )
 CONSOLE_PROVIDER_ENABLED = _env_truthy("GROK2API_CONSOLE_ENABLED", "0")
+# Console image/video endpoints are separately gated from text Responses.
+CONSOLE_MEDIA_ENABLED = _env_truthy("GROK2API_CONSOLE_MEDIA_ENABLED", "0")
 WEB_PROVIDER_BASE_URL = os.getenv(
     "GROK2API_WEB_BASE_URL", "https://grok.com"
 ).strip().rstrip("/")

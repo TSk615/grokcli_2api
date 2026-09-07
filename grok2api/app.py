@@ -82,6 +82,7 @@ _http_client: httpx.AsyncClient | None = None
 _http_clients_by_proxy: OrderedDict[str, httpx.AsyncClient] = OrderedDict()
 _http_client_lock = asyncio.Lock() if hasattr(asyncio, "Lock") else None  # set later
 _console_gateways: OrderedDict[int, Any] = OrderedDict()
+_console_media_gateways: OrderedDict[int, Any] = OrderedDict()
 _web_gateways: OrderedDict[int, Any] = OrderedDict()
 _browser_clients_by_account: OrderedDict[str, BrowserAsyncClient] = OrderedDict()
 _active_provider_transport: ContextVar[
@@ -517,6 +518,7 @@ async def _close_http_client() -> None:
     clients.extend(list(_browser_clients_by_account.values()))
     _browser_clients_by_account.clear()
     _console_gateways.clear()
+    _console_media_gateways.clear()
     _web_gateways.clear()
     for c in clients:
         if c is not None and not getattr(c, "is_closed", False):
@@ -4538,6 +4540,125 @@ async def _web_image_generations(
     )
 
 
+async def _console_media_gateway_for(account: Any) -> tuple[Any, str]:
+    """Build an account-isolated Console media gateway using Resin egress."""
+
+    from grok2api.providers.console import (
+        ConsoleDPoPClient,
+        ConsoleDPoPConfig,
+        ConsoleMediaGateway,
+    )
+    from grok2api.providers.types import ProviderName
+    from grok2api.upstream.proxy_pool import pick_proxy_for_account
+    from grok2api.upstream.resin_proxy import resin_binding_for_account
+
+    egress_key = str(getattr(account, "egress_identity", "") or "").strip() or account.account_id
+    binding = resin_binding_for_account(
+        ProviderName.CONSOLE.value, account.account_id, egress_identity=egress_key
+    )
+    proxy_url = binding.gateway_url if binding is not None else await asyncio.to_thread(
+        pick_proxy_for_account, egress_key
+    )
+    client = await _get_provider_http_client(
+        ProviderName.CONSOLE.value,
+        account.account_id,
+        proxy=proxy_url,
+        proxy_auth=binding.proxy_auth if binding is not None else None,
+        proxy_identity=binding.cache_key if binding is not None else None,
+        resin_account=binding.account if binding is not None else None,
+    )
+    key = id(client)
+    gateway = _console_media_gateways.get(key)
+    if gateway is None:
+        gateway = ConsoleMediaGateway(
+            ConsoleDPoPClient(
+                client,
+                ConsoleDPoPConfig(base_url=_config.CONSOLE_PROVIDER_BASE_URL),
+            ),
+            client,
+            video_timeout=float(os.getenv("GROK2API_CONSOLE_VIDEO_TIMEOUT", "300") or 300),
+        )
+        _console_media_gateways[key] = gateway
+        while len(_console_media_gateways) > 4:
+            _console_media_gateways.popitem(last=False)
+    return gateway, egress_key
+
+
+async def _console_image_generations(req: Any, request: Request) -> Response:
+    from grok2api.providers import create_provider_registry
+    from grok2api.providers.accounts import acquire_provider_sequence
+    from grok2api.providers.types import Capability, ProviderName
+    from grok2api.media import ImageMediaError, ImageMediaStore
+
+    route = create_provider_registry().resolve(
+        req.model, capability=Capability.IMAGE, provider=ProviderName.CONSOLE
+    )
+    accounts = await asyncio.to_thread(acquire_provider_sequence, ProviderName.CONSOLE)
+    body = req.model_dump(exclude_none=True)
+    body["model"] = route.upstream_model
+    store = ImageMediaStore()
+    attempts = accounts[: max(1, min(10, int(os.getenv("GROK2API_CONSOLE_MEDIA_MAX_ATTEMPTS", "3") or 3)))]
+    for account in attempts:
+        try:
+            gateway, egress_key = await _console_media_gateway_for(account)
+            images = await gateway.generate_image(
+                body, account.credential, account_id=account.account_id, egress_identity=egress_key
+            )
+            data: list[dict[str, Any]] = []
+            for image in images[: req.n]:
+                if image.b64_json:
+                    import base64
+                    raw = base64.b64decode(image.b64_json, validate=False)
+                    content_type = image.mime_type
+                else:
+                    raw, content_type = await gateway.download_asset(image.url, account.credential, media="image")
+                try:
+                    stored = store.store(raw, declared_content_type=content_type)
+                except ImageMediaError as exc:
+                    raise RuntimeError("generated image failed media validation") from exc
+                data.append(stored.as_openai(req.response_format, base_url=_request_public_origin(request)))
+            if len(data) == req.n:
+                return JSONResponse({"created": int(time.time()), "data": data}, headers={"X-Grok2API-Provider": ProviderName.CONSOLE.value})
+        except Exception:
+            continue
+    return openai_error("Grok Console image generation failed", status=502, err_type="upstream_error", code="console_image_generation_failed")
+
+
+async def _console_video_generations(payload: dict[str, Any], request: Request) -> Response:
+    from grok2api.providers import create_provider_registry
+    from grok2api.providers.accounts import acquire_provider_sequence
+    from grok2api.providers.types import Capability, ProviderName
+    from grok2api.config import DATA_DIR
+
+    model = str(payload.get("model") or "Console/grok-imagine-video").strip()
+    route = create_provider_registry().resolve(model, capability=Capability.VIDEO, provider=ProviderName.CONSOLE)
+    duration = payload.get("duration", 6)
+    try:
+        duration = int(duration)
+    except (TypeError, ValueError):
+        return openai_error("duration must be an integer", status=400, err_type="invalid_request_error")
+    if duration < 1 or duration > 15:
+        return openai_error("duration must be between 1 and 15 seconds", status=400, err_type="invalid_request_error")
+    body = dict(payload)
+    body["model"] = route.upstream_model
+    body["duration"] = duration
+    accounts = await asyncio.to_thread(acquire_provider_sequence, ProviderName.CONSOLE)
+    attempts = accounts[: max(1, min(10, int(os.getenv("GROK2API_CONSOLE_MEDIA_MAX_ATTEMPTS", "3") or 3)))]
+    video_store_root = DATA_DIR / "media" / "videos"
+    for account in attempts:
+        try:
+            gateway, egress_key = await _console_media_gateway_for(account)
+            video = await gateway.generate_video(body, account.credential, account_id=account.account_id, egress_identity=egress_key)
+            raw, content_type = await gateway.download_asset(video.url, account.credential, media="video")
+            from grok2api.media.video_store import VideoMediaStore
+            filename, size = VideoMediaStore(video_store_root).store(raw, content_type=content_type)
+            public_path = f"/v1/media/videos/{filename}"
+            return JSONResponse({"id": video.request_id, "object": "video", "status": "completed", "model": route.qualified_model, "url": f"{_request_public_origin(request)}{public_path}", "bytes": size, "content_type": content_type}, headers={"X-Grok2API-Provider": ProviderName.CONSOLE.value})
+        except Exception:
+            continue
+    return openai_error("Grok Console video generation failed", status=502, err_type="upstream_error", code="console_video_generation_failed")
+
+
 async def _web_chat_completions(
     req: ChatCompletionRequest,
     request: Request,
@@ -4728,7 +4849,7 @@ async def image_generations(
     request: Request,
     api_key: apikeys.ApiKeyRecord | None = Depends(require_api_key),
 ):
-    """OpenAI-compatible, Web-only non-streaming image generation."""
+    """OpenAI-compatible image generation for explicitly selected providers."""
 
     del api_key
     if not _config.WEB_PROVIDER_ENABLED or not getattr(
@@ -4748,6 +4869,25 @@ async def image_generations(
             status=400,
             err_type="invalid_request_error",
         )
+    try:
+        from grok2api.providers.registry import parse_model_reference
+        from grok2api.providers.types import ProviderName
+        selected_provider, _ = parse_model_reference(str(payload.get("model") or ""))
+    except Exception:
+        selected_provider = None
+    if selected_provider is ProviderName.CONSOLE:
+        if not _config.CONSOLE_PROVIDER_ENABLED or not getattr(_config, "CONSOLE_MEDIA_ENABLED", False):
+            return openai_error("Grok Console image generation is disabled", status=400, err_type="invalid_request_error", code="console_media_disabled")
+        from grok2api.protocol.image_generation import ImageGenerationRequest, ImageRequestValidationError
+        try:
+            req = ImageGenerationRequest.from_payload(payload)
+            return await _console_image_generations(req, request)
+        except ImageRequestValidationError as exc:
+            return openai_error(exc.message, status=400, err_type="invalid_request_error", code=exc.code)
+        except (ValueError, LookupError) as exc:
+            return openai_error(str(exc), status=400, err_type="invalid_request_error")
+        except Exception:
+            return openai_error("Grok Console image generation failed", status=502, err_type="upstream_error", code="console_image_generation_failed")
     from grok2api.protocol.image_generation import (
         ImageGenerationRequest,
         ImageRequestValidationError,
@@ -4774,6 +4914,27 @@ async def image_generations(
             err_type="upstream_error",
             code="image_generation_failed",
         )
+
+
+@app.post("/v1/videos/generations")
+@app.post("/videos/generations")
+async def video_generations(
+    request: Request,
+    api_key: apikeys.ApiKeyRecord | None = Depends(require_api_key),
+):
+    del api_key
+    if not _config.CONSOLE_PROVIDER_ENABLED or not getattr(_config, "CONSOLE_MEDIA_ENABLED", False):
+        return openai_error("Grok Console video generation is disabled", status=400, err_type="invalid_request_error", code="console_media_disabled")
+    try:
+        payload = await request.json()
+    except Exception:
+        return openai_error("request body must be valid JSON", status=400, err_type="invalid_request_error")
+    if not isinstance(payload, dict):
+        return openai_error("request body must be a JSON object", status=400, err_type="invalid_request_error")
+    model = str(payload.get("model") or "")
+    if not model.lower().startswith("console/"):
+        return openai_error("video generation requires a Console/ model", status=400, err_type="invalid_request_error")
+    return await _console_video_generations(payload, request)
 
 
 @app.post("/v1/chat/completions")
@@ -8585,6 +8746,36 @@ async def generated_image(image_path: str):
             "Cache-Control": "public, max-age=3600, immutable",
             "X-Content-Type-Options": "nosniff",
             "Content-Length": str(stored.size),
+            "Accept-Ranges": "none",
+        },
+    )
+
+
+@app.get("/v1/media/videos/{video_path:path}", include_in_schema=False)
+@app.get("/media/videos/{video_path:path}", include_in_schema=False)
+async def generated_video(video_path: str):
+    """Serve a stored Console video by its content-addressed filename."""
+
+    import re
+    from grok2api.config import DATA_DIR
+
+    if not re.fullmatch(r"[0-9a-f]{64}\.(?:mp4|webm)", video_path or ""):
+        return JSONResponse({"detail": "not found"}, status_code=404)
+    target = (DATA_DIR / "media" / "videos" / video_path).resolve()
+    root = (DATA_DIR / "media" / "videos").resolve()
+    try:
+        target.relative_to(root)
+    except Exception:
+        return JSONResponse({"detail": "not found"}, status_code=404)
+    if not target.is_file():
+        return JSONResponse({"detail": "not found"}, status_code=404)
+    media_type = "video/webm" if target.suffix.lower() == ".webm" else "video/mp4"
+    return FileResponse(
+        target,
+        media_type=media_type,
+        headers={
+            "Cache-Control": "public, max-age=3600, immutable",
+            "X-Content-Type-Options": "nosniff",
             "Accept-Ranges": "none",
         },
     )

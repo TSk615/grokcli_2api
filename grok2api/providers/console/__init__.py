@@ -27,6 +27,10 @@ __all__ = [
     "ConsoleResponsesTransport",
     "ConsoleGateway",
     "ConsoleGatewayResult",
+    "ConsoleImage",
+    "ConsoleVideo",
+    "ConsoleMediaGateway",
+    "ConsoleMediaError",
     "CredentialImportError",
     "DPoPSession",
     "DPoPSessionCache",
@@ -68,5 +72,14 @@ def __getattr__(name: str):
         return {
             "ConsoleGateway": ConsoleGateway,
             "ConsoleGatewayResult": ConsoleGatewayResult,
+        }[name]
+    if name in {"ConsoleImage", "ConsoleVideo", "ConsoleMediaGateway", "ConsoleMediaError"}:
+        from .media import ConsoleImage, ConsoleMediaError, ConsoleMediaGateway, ConsoleVideo
+
+        return {
+            "ConsoleImage": ConsoleImage,
+            "ConsoleVideo": ConsoleVideo,
+            "ConsoleMediaGateway": ConsoleMediaGateway,
+            "ConsoleMediaError": ConsoleMediaError,
         }[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
