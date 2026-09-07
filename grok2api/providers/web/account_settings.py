@@ -32,6 +32,7 @@ ENABLE_NSFW_FRAME = bytes.fromhex(
     "00000000200a021001121a0a18616c776179735f73686f775f6e7366775f636f6e74656e74"
 )
 BODY_LIMIT = 64 * 1024
+_META_DASH_TRANSLATION = str.maketrans({char: "-" for char in "‐‑‒–—―"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,8 +60,13 @@ class _VerificationMetaParser(HTMLParser):
         if tag.lower() != "meta" or self.value:
             return
         values = {str(key).lower(): str(value or "").strip() for key, value in attrs}
-        if values.get("name", "").lower() == "grok-site-verification":
+        meta_name = values.get("name", "").lower().translate(_META_DASH_TRANSLATION)
+        if meta_name == "grok-site-verification":
             self.value = values.get("content", "")
+
+
+def _error_result(exc: WebAccountSettingError) -> AccountSettingResult:
+    return AccountSettingResult(exc.phase, False, exc.status_code, exc.classification)
 
 
 def random_adult_birth_date(*, today: date | None = None) -> date:
@@ -258,7 +264,10 @@ class WebAccountSettingsClient:
         if not first.success:
             return [first]
         path = "/rest/auth/set-tos-accepted"
-        signature = await self._signed_statsig(credential, path)
+        try:
+            signature = await self._signed_statsig(credential, path)
+        except WebAccountSettingError as exc:
+            return [first, _error_result(exc)]
         response = await self._client.post(
             self.base_url + path,
             json={"tosVersion": CURRENT_TERMS_VERSION},
@@ -315,11 +324,18 @@ class WebAccountSettingsClient:
         results = await self.accept_terms(credential)
         if not results or not results[-1].success:
             return results
-        birth = await self.set_birth_date(credential, random_adult_birth_date())
+        try:
+            birth = await self.set_birth_date(credential, random_adult_birth_date())
+        except WebAccountSettingError as exc:
+            results.append(_error_result(exc))
+            return results
         results.append(birth)
         if not birth.success:
             return results
-        results.append(await self.enable_nsfw(credential))
+        try:
+            results.append(await self.enable_nsfw(credential))
+        except WebAccountSettingError as exc:
+            results.append(_error_result(exc))
         return results
 
 

@@ -7,6 +7,7 @@ from grok2api.providers.web.account_settings import (
     ACCEPT_TERMS_FRAME,
     CURRENT_TERMS_VERSION,
     ENABLE_NSFW_FRAME,
+    _VerificationMetaParser,
     _classification,
     _grpc_status,
     random_adult_birth_date,
@@ -37,6 +38,12 @@ class WebAccountSettingsTests(unittest.TestCase):
         payload = b"grpc-status: 7\r\n"
         frame = bytes([0x80]) + len(payload).to_bytes(4, "big") + payload
         self.assertEqual(_grpc_status({}, frame), "7")
+
+    def test_statsig_meta_parser_normalizes_current_unicode_dash(self) -> None:
+        for name in ("grok-site-verification", "grok-site―verification"):
+            parser = _VerificationMetaParser()
+            parser.feed(f'<html><head><meta name="{name}" content="meta-value"></head></html>')
+            self.assertEqual(parser.value, "meta-value")
 
     def test_birth_date_is_adult_range(self) -> None:
         today = date(2026, 9, 7)
