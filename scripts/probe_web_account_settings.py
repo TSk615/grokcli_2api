@@ -11,10 +11,23 @@ import argparse
 import asyncio
 import hashlib
 import json
+import sys
+from pathlib import Path
 from typing import Any
 
+# Allow ``python scripts/probe_web_account_settings.py`` to work in the image
+# without requiring callers to set PYTHONPATH manually.
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 from grok2api.providers.accounts import ProviderAccount, acquire_provider_sequence
-from grok2api.providers.console import ConsoleDPoPClient, ConsoleDPoPConfig, ConsoleMediaError, ConsoleMediaGateway
+from grok2api.providers.console import (
+    ConsoleDPoPClient,
+    ConsoleDPoPConfig,
+    ConsoleMediaGateway,
+    classify_console_media_failure,
+)
 from grok2api.providers.types import ProviderName
 from grok2api.providers.web.account_settings import WebAccountSettingError, WebAccountSettingsClient
 from grok2api.store import accounts_pg
@@ -70,17 +83,23 @@ async def _probe_console(ref: dict[str, Any] | None) -> dict[str, Any]:
                 egress_identity=egress_key,
             )
             return {"classification": "success", "status": 200, "items": len(images)}
-        except ConsoleMediaError as exc:
-            return {"classification": exc.classification, "status": exc.status_code}
-        except Exception:
-            return {"classification": "transport_or_session", "status": None}
+        except Exception as exc:
+            classification, status, _ = classify_console_media_failure(exc)
+            return {"classification": classification, "status": status}
     finally:
         await client.aclose()
 
 
-async def _one(index: int, account: ProviderAccount, *, apply: bool) -> dict[str, Any]:
+async def _one(index: int, account: ProviderAccount, *, apply: bool, probe_only: bool) -> dict[str, Any]:
     linked = _console_ref_for(account)
-    before = await _probe_console(linked) if apply else {"classification": "not_run", "status": None}
+    before = await _probe_console(linked) if apply or probe_only else {"classification": "not_run", "status": None}
+    if probe_only:
+        return {
+            "sample": index,
+            "before": before,
+            "settings": [{"phase": "account_settings", "success": False, "status": None, "classification": "skipped"}],
+            "after": {"classification": "not_run", "status": None},
+        }
     if not apply:
         return {"sample": index, "before": before, "settings": [], "after": {"classification": "not_run", "status": None}}
 
@@ -118,10 +137,21 @@ async def _main(args: argparse.Namespace) -> int:
 
     async def run(index: int, account: ProviderAccount) -> dict[str, Any]:
         async with semaphore:
-            return await _one(index, account, apply=args.apply)
+            return await _one(index, account, apply=args.apply, probe_only=args.probe_only)
 
     results = await asyncio.gather(*(run(i, account) for i, account in enumerate(accounts, 1)))
-    print(json.dumps({"apply": args.apply, "limit": len(results), "concurrency": args.concurrency, "results": results}, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                "apply": args.apply,
+                "probe_only": args.probe_only,
+                "limit": len(results),
+                "concurrency": args.concurrency,
+                "results": results,
+            },
+            ensure_ascii=False,
+        )
+    )
     return 0
 
 
@@ -129,7 +159,13 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=2)
     parser.add_argument("--concurrency", type=int, default=1)
-    parser.add_argument("--apply", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true")
+    mode.add_argument(
+        "--probe-only",
+        action="store_true",
+        help="probe linked Console image status without changing Web account settings",
+    )
     args = parser.parse_args()
     if not 1 <= args.limit <= 5:
         parser.error("--limit must be between 1 and 5")

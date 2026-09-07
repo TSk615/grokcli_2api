@@ -4623,14 +4623,14 @@ async def _console_image_generations(req: Any, request: Request) -> Response:
             if len(data) == req.n:
                 return JSONResponse({"created": int(time.time()), "data": data}, headers={"X-Grok2API-Provider": ProviderName.CONSOLE.value})
         except Exception as exc:
-            from grok2api.providers.console import ConsoleMediaError
-            classification = exc.classification if isinstance(exc, ConsoleMediaError) else "internal_or_transport"
+            from grok2api.providers.console import classify_console_media_failure
+            classification, safe_status, safe_phase = classify_console_media_failure(exc)
             failures[classification] = failures.get(classification, 0) + 1
             _logger.warning(
                 "console_media_failure media=image class=%s status=%s phase=%s attempt=%s",
                 classification,
-                getattr(exc, "status_code", None),
-                getattr(exc, "phase", ""),
+                safe_status,
+                safe_phase,
                 attempt_index,
             )
             continue
@@ -4672,14 +4672,14 @@ async def _console_video_generations(payload: dict[str, Any], request: Request) 
             public_path = f"/v1/media/videos/{filename}"
             return JSONResponse({"id": video.request_id, "object": "video", "status": "completed", "model": route.qualified_model, "url": f"{_request_public_origin(request)}{public_path}", "bytes": size, "content_type": content_type}, headers={"X-Grok2API-Provider": ProviderName.CONSOLE.value})
         except Exception as exc:
-            from grok2api.providers.console import ConsoleMediaError
-            classification = exc.classification if isinstance(exc, ConsoleMediaError) else "internal_or_transport"
+            from grok2api.providers.console import classify_console_media_failure
+            classification, safe_status, safe_phase = classify_console_media_failure(exc)
             failures[classification] = failures.get(classification, 0) + 1
             _logger.warning(
                 "console_media_failure media=video class=%s status=%s phase=%s attempt=%s",
                 classification,
-                getattr(exc, "status_code", None),
-                getattr(exc, "phase", ""),
+                safe_status,
+                safe_phase,
                 attempt_index,
             )
             continue

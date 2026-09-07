@@ -27,9 +27,16 @@ from grok2api.providers.console.dpop import (
     normalized_htu,
     public_jwk,
 )
-from grok2api.providers.console.errors import ConsoleErrorKind, classify_error
+from grok2api.providers.console.errors import (
+    ConsoleEgressChallengeError,
+    ConsoleErrorKind,
+    ConsoleTokenError,
+    classify_error,
+)
 from grok2api.providers.console.headers import browser_headers
+from grok2api.providers.console.media import ConsoleMediaError, classify_console_media_failure
 from grok2api.providers.console.models import IMAGE_EDIT, RESPONSES, list_models, resolve_model
+from grok2api.upstream.browser_transport import BrowserTransportError
 
 
 def _decode_segment(value: str) -> dict:
@@ -306,6 +313,36 @@ class ImportAndErrorsTests(unittest.TestCase):
         self.assertEqual(limited.kind, ConsoleErrorKind.RATE_LIMIT)
         self.assertEqual(limited.retry_after_seconds, 17)
         self.assertTrue(classify_error(503).retryable)
+
+    def test_media_failure_classification_keeps_quota_network_and_session_distinct(self) -> None:
+        self.assertEqual(
+            classify_console_media_failure(ConsoleMediaError("safe", status_code=429, phase="image_create")),
+            ("quota_or_rate_limit", 429, "image_create"),
+        )
+        self.assertEqual(
+            classify_console_media_failure(ConsoleMediaError("safe", status_code=502, phase="image_create")),
+            ("upstream_network", 502, "image_create"),
+        )
+        self.assertEqual(
+            classify_console_media_failure(ConsoleTokenError(429)),
+            ("quota_or_rate_limit", 429, "dpop_session"),
+        )
+        self.assertEqual(
+            classify_console_media_failure(ConsoleTokenError(401)),
+            ("auth_or_challenge", 401, "dpop_session"),
+        )
+        self.assertEqual(
+            classify_console_media_failure(ConsoleEgressChallengeError(403)),
+            ("auth_or_challenge", 403, "dpop_session"),
+        )
+        self.assertEqual(
+            classify_console_media_failure(BrowserTransportError("safe")),
+            ("upstream_network", None, "transport"),
+        )
+        self.assertEqual(
+            classify_console_media_failure(RuntimeError("safe")),
+            ("internal_error", None, ""),
+        )
 
     def test_catalog_exposes_conversation_and_future_media_capabilities(self) -> None:
         self.assertIn(RESPONSES, resolve_model("grok-4.5").capabilities)

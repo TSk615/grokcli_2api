@@ -16,7 +16,9 @@ from urllib.parse import urlparse
 
 from .auth import ConsoleCredential
 from .client import ConsoleDPoPClient
+from .errors import ConsoleEgressChallengeError, ConsoleTokenError
 from .headers import DEFAULT_USER_AGENT, browser_headers
+from grok2api.upstream.browser_transport import BrowserTransportError
 
 
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
@@ -45,6 +47,29 @@ class ConsoleMediaError(RuntimeError):
         if status is not None:
             return "upstream_rejected"
         return "client_or_protocol"
+
+
+def classify_console_media_failure(exc: BaseException) -> tuple[str, int | None, str]:
+    """Return a credential-free category, status, and phase for media failures."""
+
+    status = getattr(exc, "status_code", None)
+    safe_status = int(status) if isinstance(status, int) else None
+    phase = str(getattr(exc, "phase", "") or "")
+    if isinstance(exc, ConsoleMediaError):
+        return exc.classification, safe_status, phase
+    if isinstance(exc, ConsoleEgressChallengeError):
+        return "auth_or_challenge", safe_status, "dpop_session"
+    if isinstance(exc, ConsoleTokenError):
+        if safe_status == 429:
+            return "quota_or_rate_limit", safe_status, "dpop_session"
+        if safe_status in {401, 403}:
+            return "auth_or_challenge", safe_status, "dpop_session"
+        if safe_status is not None and safe_status >= 500:
+            return "upstream_network", safe_status, "dpop_session"
+        return "auth_or_session", safe_status, "dpop_session"
+    if isinstance(exc, (BrowserTransportError, TimeoutError)):
+        return "upstream_network", None, "transport"
+    return "internal_error", safe_status, phase
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,4 +268,10 @@ class ConsoleMediaGateway:
             await response.aclose()
 
 
-__all__ = ["ConsoleImage", "ConsoleMediaError", "ConsoleMediaGateway", "ConsoleVideo"]
+__all__ = [
+    "ConsoleImage",
+    "ConsoleMediaError",
+    "ConsoleMediaGateway",
+    "ConsoleVideo",
+    "classify_console_media_failure",
+]
