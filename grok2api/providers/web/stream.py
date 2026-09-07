@@ -14,6 +14,7 @@ class WebDeltaKind(str, Enum):
     TEXT = "text"
     REASONING = "reasoning"
     CITATION = "citation"
+    IMAGE = "image"
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,11 +179,19 @@ class GrokWebStreamParser:
             return self._text_delta(event.get("text"))
         if event_type == "response.search.result":
             return self._citation_delta(event.get("result"))
+        if event_type == "response.grok.output":
+            output = event.get("output")
+            if isinstance(output, Mapping):
+                return self._image_delta(output.get("card_attachment"))
+            return []
         if event_type != "response.chunk":
             return []
         chunk = event.get("chunk")
         if not isinstance(chunk, Mapping):
             return []
+        image = self._image_delta(chunk)
+        if image:
+            return image
         citation = chunk.get("render_citation")
         if isinstance(citation, Mapping):
             return self._citation_delta(citation)
@@ -199,6 +208,7 @@ class GrokWebStreamParser:
 
     def _parse_legacy_response(self, response: Mapping[str, Any]) -> list[WebDelta]:
         output = self._legacy_citations(response)
+        output.extend(self._image_delta(response))
         token = response.get("token")
         tag = str(response.get("messageTag") or "")
         if tag == "tool_usage_card":
@@ -215,6 +225,54 @@ class GrokWebStreamParser:
             if isinstance(message, str) and message.startswith(self._text_so_far):
                 output.extend(self._text_delta(message[len(self._text_so_far) :]))
         return output
+
+    def _image_delta(self, value: Any) -> list[WebDelta]:
+        """Find one completed, unmoderated generated-image card."""
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                return []
+        if isinstance(value, list):
+            for item in value:
+                result = self._image_delta(item)
+                if result:
+                    return result
+            return []
+        if not isinstance(value, Mapping):
+            return []
+        if value.get("moderated") is True:
+            return []
+        progress = value.get("progress", value.get("percentage_complete"))
+        try:
+            if progress is not None and int(progress) < 100:
+                return []
+        except (TypeError, ValueError):
+            return []
+        for key in ("imageUrl", "image_url"):
+            raw = value.get(key)
+            if isinstance(raw, str) and raw.strip():
+                url = raw.strip()
+                if not url.startswith(("http://", "https://")):
+                    url = "https://assets.grok.com/" + url.lstrip("/")
+                safe = _safe_url(url)
+                if safe:
+                    return [WebDelta(WebDeltaKind.IMAGE, text=safe)]
+        for key in ("generatedImageUrls", "generated_image_urls"):
+            urls = value.get(key)
+            if isinstance(urls, list):
+                for raw in urls:
+                    if isinstance(raw, str):
+                        url = raw if raw.startswith(("http://", "https://")) else "https://assets.grok.com/" + raw.lstrip("/")
+                        safe = _safe_url(url)
+                        if safe:
+                            return [WebDelta(WebDeltaKind.IMAGE, text=safe)]
+        for key in ("card_attachment", "cardAttachment", "cardAttachmentsJson", "jsonData", "image_chunk", "imageChunk", "modelResponse", "streamingImageGenerationResponse"):
+            if key in value:
+                result = self._image_delta(value[key])
+                if result:
+                    return result
+        return []
 
     def _legacy_citations(self, response: Mapping[str, Any]) -> list[WebDelta]:
         output: list[WebDelta] = []

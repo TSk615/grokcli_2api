@@ -81,6 +81,12 @@ UPSTREAM_BASE = os.getenv(
 # Console remain opt-in until their credential, routing and egress paths are
 # explicitly configured by an operator.
 WEB_PROVIDER_ENABLED = _env_truthy("GROK2API_WEB_ENABLED", "0")
+# Image generation is independently switchable so enabling the Web text
+# provider cannot unexpectedly expose a new media endpoint.  Operators can
+# opt in with GROK2API_WEB_IMAGES_ENABLED=1 after a canary succeeds.
+WEB_IMAGES_ENABLED = _env_truthy(
+    "GROK2API_WEB_IMAGES_ENABLED", "0"
+)
 CONSOLE_PROVIDER_ENABLED = _env_truthy("GROK2API_CONSOLE_ENABLED", "0")
 WEB_PROVIDER_BASE_URL = os.getenv(
     "GROK2API_WEB_BASE_URL", "https://grok.com"

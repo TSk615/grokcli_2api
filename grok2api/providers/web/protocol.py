@@ -41,7 +41,7 @@ def _resolve_model(raw_model: Any) -> WebModel:
     if model_id.lower().startswith("web/"):
         model_id = model_id.split("/", 1)[1].strip()
     model = get_web_model(model_id)
-    if model is None:
+    if model is None or not model.supports("chat"):
         raise WebProtocolError("unsupported Grok Web chat model")
     return model
 

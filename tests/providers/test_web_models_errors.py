@@ -11,9 +11,13 @@ class WebModelsAndErrorsTests(unittest.TestCase):
         basic = list_web_models(WebTier.BASIC)
         heavy = list_web_models("heavy")
         self.assertEqual(
-            [item["id"] for item in basic], ["grok-chat-fast", "grok-chat-auto"]
+            [item["id"] for item in basic],
+            [
+                "grok-chat-fast", "grok-chat-auto", "grok-imagine-image-lite",
+                "grok-imagine-image", "grok-imagine-image-2.0",
+            ],
         )
-        self.assertEqual(len(heavy), 4)
+        self.assertEqual(len(heavy), 7)
         self.assertIn(WebCapability.STREAMING.value, heavy[0]["capabilities"])
         self.assertTrue(all(item["provider"] == "grok_web" for item in heavy))
 

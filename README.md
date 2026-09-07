@@ -2,7 +2,7 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / SSO / JSON 导入导出。
 
-**当前版本：v1.9.93** · Redis 索引型账号池 · Streams 异步批量写 · 用量采样与月分区
+**当前版本：v1.9.94** · Web Imagine 文生图 · Resin 账号粘性出站 · 安全媒体存储
 
 > 本仓库当前不提供预构建容器镜像；请从源码使用 `docker compose up -d --build` 构建。
 
@@ -19,7 +19,7 @@
 
 ```
 客户端 (OpenAI / Anthropic SDK · new-api · Claude Code / sub2api)
-        │  /v1/chat/completions  ·  /v1/responses  ·  /v1/messages
+        │  /v1/chat/completions  ·  /v1/responses  ·  /v1/messages · /v1/images/generations
         ▼
   grokcli-2api  (FastAPI · multi-worker · TZ=Asia/Shanghai)
         │  管理台 /admin
@@ -39,7 +39,7 @@
 
 | 功能 | 说明 |
 |------|------|
-| OpenAI 兼容 | `/v1/models` · `/v1/chat/completions` · `/v1/responses` · SSE |
+| OpenAI 兼容 | `/v1/models` · `/v1/chat/completions` · `/v1/responses` · `/v1/images/generations` · SSE |
 | Anthropic 兼容 | `/v1/messages` · tools / tool_use · `count_tokens` |
 | Claude Code 工具 | Grok `Update`/`StrReplace` → 客户端 `Edit`；**后到完整参数覆盖错误路径（含 both-complete）**；`target_file` 等别名归一；残缺编辑不下发 |
 | 管理台 | 账号、Key、测活、续期、任务日志、用量、**系统设置（维护/压缩/探测/sub2api · CLIProxyAPI）** |
@@ -59,10 +59,14 @@
 
 ---
 
-## 本版本重点（v1.9.93）
+## 本版本重点（v1.9.94）
 
 | 能力 | 行为 |
 |------|------|
+| **Web Imagine 文生图** | Lite 走 MGW 图片流；标准版/2.0 走独立 Imagine WebSocket；Provider 额度严格隔离 |
+| **OpenAI 图片接口** | `/v1/images/generations` 支持 `url` / `b64_json`、比例映射及每次最多 10 张 |
+| **安全媒体输出** | 可信域下载、MIME/大小校验、SHA-256 内容寻址、持久卷原子写入与防路径穿越 |
+| **有界账号切换** | 图片请求默认最多尝试 3 个 Web 账号，HTTP/WS/图片下载全程复用账号 Resin 出站 |
 | **Gateway 零 PG 写** | 成功、失败、状态和用量事件进入 Redis Streams；独立 writer 每 1 秒或 500 条批量提交 PostgreSQL |
 | **可靠异步写入** | `writer_inbox` 幂等去重、pending 重领、重试/DLQ、状态序号防乱序，并暴露 lag/pending/提交耗时指标 |
 | **索引型账号池** | Redis ZSET 只保存账号 ID 与非敏感状态；Lua 租约限制 inflight，凭证按 ID 通过进程 LRU 惰性加载 |
@@ -83,6 +87,9 @@ Build 是默认且向后兼容的 Provider。Web 和 Console 默认关闭；启�
 Build/grok-4.5          # 现有 cli-chat-proxy.grok.com/v1
 Web/grok-chat-fast      # grok.com Web 文本通道
 Web/grok-chat-auto
+Web/grok-imagine-image-lite
+Web/grok-imagine-image
+Web/grok-imagine-image-2.0
 Console/grok-4.5        # console.x.ai Responses 通道
 Console/grok-build-0.1
 ```
@@ -91,12 +98,15 @@ Console/grok-build-0.1
 
 启用步骤（建议先单账号、单 Worker 灰度）：
 
-1. 在 `.env` 设置随机的 `GROK2API_SECRET_KEY`，再将 `GROK2API_WEB_ENABLED=1` 或 `GROK2API_CONSOLE_ENABLED=1`。没有密钥时应用会拒绝启动；Build-only 不需要该密钥。
+1. 在 `.env` 设置随机的 `GROK2API_SECRET_KEY`，再将 `GROK2API_WEB_ENABLED=1` 或 `GROK2API_CONSOLE_ENABLED=1`。Web 图片另需 `GROK2API_WEB_IMAGES_ENABLED=1`。没有密钥时应用会拒绝启动；Build-only 不需要该密钥。
 2. 重启应用，让数据库迁移创建 Provider 字段和路由表。
 3. 进入管理台「账号」，选择 Grok Web 或 Grok Console，导入对应 SSO/TXT/JSON。SSO、Cookie 和 Console DPoP 材料只保存为加密凭据，不会写入公开 payload 或日志。
-4. 用带前缀的模型发起请求。Console 文本第一版使用 OpenAI Responses API（`/v1/responses`）；Console 的 `/v1/chat/completions` 会返回明确错误，请改用 Responses。Web 当前支持单轮文本和 SSE/连续 JSON 流；图片、视频、工具和多轮历史附件尚未纳入该第一版。
+4. 用带前缀的模型发起请求。Console 文本使用 OpenAI Responses API（`/v1/responses`）；Console 的 `/v1/chat/completions` 会返回明确错误，请改用 Responses。Web 支持单轮文本、SSE/连续 JSON 流和非流式文生图；图片编辑、视频、工具和多轮历史附件暂未纳入。
 
-功能开关与地址见 [`.env.example`](./.env.example)：`GROK2API_WEB_ENABLED`、`GROK2API_CONSOLE_ENABLED`、`GROK2API_WEB_BASE_URL`、`GROK2API_CONSOLE_BASE_URL` 和 `GROK2API_CONSOLE_SESSION_BASE_URL`。生产环境还应使用 HTTPS、限制管理台访问并定期轮换密钥；不要把 SSO/Cookie/DPoP 粘贴到 issue、日志或聊天记录中。
+Web 文生图调用 `POST /v1/images/generations`，首版支持 `n=1..10`、`size` / `aspect_ratio` 以及 `response_format=url|b64_json`。生成结果会安全保存到 `GROK2API_DATA_DIR/media/images`；`url` 模式返回本应用的内容寻址媒体地址。
+单个请求最多尝试 3 个 Web 账号，避免额度不足时扫完整个大号池；可通过 `GROK2API_WEB_IMAGE_MAX_ATTEMPTS` 在 1–10 之间调整。
+
+功能开关与地址见 [`.env.example`](./.env.example)：`GROK2API_WEB_ENABLED`、`GROK2API_WEB_IMAGES_ENABLED`、`GROK2API_CONSOLE_ENABLED`、`GROK2API_WEB_BASE_URL`、`GROK2API_CONSOLE_BASE_URL` 和 `GROK2API_CONSOLE_SESSION_BASE_URL`。生产环境还应使用 HTTPS、限制管理台访问并定期轮换密钥；不要把 SSO/Cookie/DPoP 粘贴到 issue、日志或聊天记录中。
 
 ## 快速开始
 
@@ -157,6 +167,8 @@ DATABASE_URL=postgresql://grok2api:grok2api@postgres:5432/grok2api
 | `GROK2API_RELOAD` | 开发热更新：`1` 开启（强制单 worker）；生产保持 `0` |
 | `GROK2API_SECRET_KEY` | Web/Console 凭据加密密钥；启用任一浏览器 Provider 时必填，使用高熵随机值 |
 | `GROK2API_WEB_ENABLED` / `GROK2API_CONSOLE_ENABLED` | Web / Console 功能开关，默认 `0`；保持关闭即可继续使用 Build-only |
+| `GROK2API_WEB_IMAGES_ENABLED` | Web Imagine 文生图开关，默认 `0`；启用后公布 Web 图片模型并开放图片接口 |
+| `GROK2API_WEB_IMAGE_MAX_ATTEMPTS` | 单次 Web 生图最多尝试的账号数，默认 `3`，范围 `1–10` |
 
 完整模板见 [`.env.example`](./.env.example)。**生产请修改默认数据库密码。**
 
@@ -406,7 +418,12 @@ docker-compose.yml                       # redis + postgres（内网）+ app
 
 ## 版本
 
-- **v1.9.93**（当前）
+- **v1.9.94**（当前）
+  - 新增 Web `grok-imagine-image-lite`、`grok-imagine-image`、`grok-imagine-image-2.0`
+  - 新增 OpenAI 兼容 `/v1/images/generations` 与内容寻址媒体访问地址
+  - Web 图片 HTTP、WebSocket 与资源下载保持账号级 Resin 出站粘性，单请求账号尝试有界
+  - 图片编辑、图片流式输出、视频及 Console 图片仍保持关闭
+- **v1.9.93**
   - **Redis Streams 独立 writer**：账号统计、状态和用量每 1 秒或 500 条批量写 PG；事务成功后才 ACK
   - **幂等与恢复**：`writer_inbox` 去重、pending 自动重领、失败重试与 DLQ；`state_seq/state_version` 防止旧状态覆盖新状态
   - **索引型账号池**：ready/cooldown ZSET、Lua inflight 租约、Redis fail-closed；完整凭证按 ID 懒加载并使用 2048 条/10 分钟 LRU
@@ -586,7 +603,7 @@ docker-compose.yml                       # redis + postgres（内网）+ app
 - **v1.9.45–1.9.38**：YYDS 域名、任务日志、JSON/SSO 进度、内联 hybrid 等
 - 更早变更见本节历史记录与 Git 提交历史
 
-> 运行时版本来自 `grok2api/app.py` 中的 `APP_VERSION`（当前 **1.9.93**）。
+> 运行时版本来自 `grok2api/app.py` 中的 `APP_VERSION`（当前 **1.9.94**）。
 
 ## License
 

@@ -5,6 +5,7 @@ Endpoints:
   GET  /health
   GET  /v1/models
   POST /v1/chat/completions       (OpenAI)
+  POST /v1/images/generations     (OpenAI Web Imagine images)
   POST /chat/completions          (alias)
   POST /v1/responses              (OpenAI Responses API; used by sub2api)
   POST /responses                 (alias)
@@ -60,7 +61,7 @@ from grok2api.upstream.browser_transport import (
     DEFAULT_BROWSER_IMPERSONATE,
 )
 
-APP_VERSION = "1.9.93"
+APP_VERSION = "1.9.94"
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -4094,6 +4095,7 @@ async def root():
             "GET /health",
             "GET /v1/models",
             "POST /v1/chat/completions",
+            "POST /v1/images/generations",
             "POST /v1/responses",
             "POST /v1/messages",
             "POST /v1/messages/count_tokens",
@@ -4405,6 +4407,137 @@ def _web_citation_annotation(citation: Any) -> dict[str, Any]:
     }
 
 
+def _request_public_origin(request: Request) -> str:
+    """Return the configured/request-visible origin for generated media URLs."""
+
+    configured = str(getattr(_config, "PUBLIC_BASE_URL", "") or "").strip().rstrip("/")
+    if configured:
+        return configured
+    forwarded_proto = (request.headers.get("x-forwarded-proto") or "").split(",", 1)[0].strip()
+    forwarded_host = (request.headers.get("x-forwarded-host") or "").split(",", 1)[0].strip()
+    scheme = forwarded_proto if forwarded_proto in {"http", "https"} else request.url.scheme
+    host = forwarded_host or request.headers.get("host") or request.url.netloc
+    if scheme in {"http", "https"} and host:
+        return f"{scheme}://{host}".rstrip("/")
+    return str(request.base_url).rstrip("/")
+
+
+async def _web_image_generations(
+    req: Any,
+    request: Request,
+) -> Response:
+    """Generate Web images, persist them locally, and never cross providers."""
+
+    from grok2api.media import ImageMediaError, ImageMediaStore
+    from grok2api.providers import create_provider_registry
+    from grok2api.providers.accounts import acquire_provider_sequence
+    from grok2api.providers.types import Capability, ProviderName
+    from grok2api.providers.web import GrokWebGateway
+
+    registry = create_provider_registry()
+    route = registry.resolve(
+        req.model,
+        capability=Capability.IMAGE,
+        provider=ProviderName.WEB,
+    )
+    accounts = await asyncio.to_thread(
+        acquire_provider_sequence,
+        ProviderName.WEB,
+        minimum_tier=route.minimum_tier,
+    )
+    store = ImageMediaStore()
+    body = req.model_dump(exclude_none=True)
+    body["model"] = route.public_model
+    last_error: Exception | None = None
+    try:
+        max_attempts = int(os.getenv("GROK2API_WEB_IMAGE_MAX_ATTEMPTS", "3") or 3)
+    except ValueError:
+        max_attempts = 3
+    max_attempts = max(1, min(10, max_attempts))
+    attempts = accounts[:max_attempts]
+
+    async def _gateway_for(account):
+        from grok2api.upstream.proxy_pool import pick_proxy_for_account
+        from grok2api.upstream.resin_proxy import resin_binding_for_account
+
+        egress_key = (
+            str(getattr(account, "egress_identity", "") or "").strip()
+            or account.account_id
+        )
+        binding = resin_binding_for_account(
+            ProviderName.WEB.value,
+            account.account_id,
+            egress_identity=egress_key,
+        )
+        proxy_url = binding.gateway_url if binding is not None else await asyncio.to_thread(
+            pick_proxy_for_account, egress_key
+        )
+        client = await _get_provider_http_client(
+            ProviderName.WEB.value,
+            account.account_id,
+            proxy=proxy_url,
+            proxy_auth=binding.proxy_auth if binding is not None else None,
+            proxy_identity=binding.cache_key if binding is not None else None,
+            resin_account=binding.account if binding is not None else None,
+        )
+        gateway_key = id(client)
+        gateway = _web_gateways.get(gateway_key)
+        if gateway is None:
+            gateway_kwargs: dict[str, Any] = {
+                "base_url": _config.WEB_PROVIDER_BASE_URL,
+                "proxy": proxy_url,
+            }
+            connector = getattr(client, "websocket_connector", None)
+            if callable(connector):
+                gateway_kwargs["connector"] = connector
+            elif binding is not None:
+                from grok2api.upstream.resin_proxy import ResinConfigError
+
+                raise ResinConfigError("Resin WebSocket transport is unavailable")
+            gateway = GrokWebGateway(client, **gateway_kwargs)
+            _web_gateways[gateway_key] = gateway
+            while len(_web_gateways) > 4:
+                _web_gateways.popitem(last=False)
+        return gateway
+
+    for account in attempts:
+        try:
+            gateway = await _gateway_for(account)
+            images = await gateway.generate_image(body, account.credential)
+            data: list[dict[str, Any]] = []
+            for image in images[: req.n]:
+                raw, content_type = await gateway.download_image(image, account.credential)
+                try:
+                    stored = store.store(raw, declared_content_type=content_type)
+                except ImageMediaError as exc:
+                    raise RuntimeError("generated image failed media validation") from exc
+                data.append(
+                    stored.as_openai(
+                        req.response_format,
+                        base_url=_request_public_origin(request),
+                    )
+                )
+            if len(data) != req.n:
+                raise RuntimeError("Grok Web returned incomplete images")
+            return JSONResponse(
+                {"created": int(time.time()), "data": data},
+                headers={
+                    "X-Grok2API-Provider": ProviderName.WEB.value,
+                    "X-Grok2API-Accounts": str(len(attempts)),
+                },
+            )
+        except Exception as exc:  # account-scoped failover, sanitized below
+            last_error = exc
+            continue
+    del last_error
+    return openai_error(
+        "Grok Web image generation failed",
+        status=502,
+        err_type="upstream_error",
+        code="image_generation_failed",
+    )
+
+
 async def _web_chat_completions(
     req: ChatCompletionRequest,
     request: Request,
@@ -4587,6 +4720,60 @@ async def _web_chat_completions(
         status=502,
         err_type="upstream_error",
     )
+
+
+@app.post("/v1/images/generations")
+@app.post("/images/generations")
+async def image_generations(
+    request: Request,
+    api_key: apikeys.ApiKeyRecord | None = Depends(require_api_key),
+):
+    """OpenAI-compatible, Web-only non-streaming image generation."""
+
+    del api_key
+    if not _config.WEB_PROVIDER_ENABLED or not getattr(
+        _config, "WEB_IMAGES_ENABLED", False
+    ):
+        return openai_error(
+            "Grok Web image generation is disabled",
+            status=400,
+            err_type="invalid_request_error",
+            code="web_images_disabled",
+        )
+    try:
+        payload = await request.json()
+    except Exception:
+        return openai_error(
+            "request body must be valid JSON",
+            status=400,
+            err_type="invalid_request_error",
+        )
+    from grok2api.protocol.image_generation import (
+        ImageGenerationRequest,
+        ImageRequestValidationError,
+    )
+
+    try:
+        req = ImageGenerationRequest.from_payload(payload)
+        return await _web_image_generations(req, request)
+    except ImageRequestValidationError as exc:
+        return openai_error(
+            exc.message,
+            status=400,
+            err_type="invalid_request_error",
+            code=exc.code,
+        )
+    except (ValueError, LookupError) as exc:
+        return openai_error(
+            str(exc), status=400, err_type="invalid_request_error"
+        )
+    except Exception:
+        return openai_error(
+            "Grok Web image generation failed",
+            status=502,
+            err_type="upstream_error",
+            code="image_generation_failed",
+        )
 
 
 @app.post("/v1/chat/completions")
@@ -8377,6 +8564,30 @@ def _static_file_response(rel_path: str):
 @app.get("/static/{file_path:path}", include_in_schema=False)
 async def static_assets(file_path: str):
     return _static_file_response(file_path)
+
+
+@app.get("/v1/media/images/{image_path:path}", include_in_schema=False)
+@app.get("/media/images/{image_path:path}", include_in_schema=False)
+async def generated_image(image_path: str):
+    """Serve one content-addressed generated image without exposing the data dir."""
+
+    from grok2api.media import ImageMediaStore, ImageNotFoundError
+
+    public_path = "/v1/media/images/" + image_path
+    try:
+        stored = ImageMediaStore().resolve_public_path(public_path)
+    except ImageNotFoundError:
+        return JSONResponse({"detail": "not found"}, status_code=404)
+    return FileResponse(
+        stored.path,
+        media_type=stored.content_type,
+        headers={
+            "Cache-Control": "public, max-age=3600, immutable",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Length": str(stored.size),
+            "Accept-Ranges": "none",
+        },
+    )
 
 
 # Mount static assets if present (css/js under /static) — kept as fallback for tools expecting mount

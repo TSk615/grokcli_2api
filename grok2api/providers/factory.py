@@ -45,7 +45,11 @@ def create_provider_registry(
         from .web import GrokWebAdapter
 
         registry.register(
-            GrokWebAdapter(web_client, base_url=config.WEB_PROVIDER_BASE_URL)
+            GrokWebAdapter(
+                web_client,
+                base_url=config.WEB_PROVIDER_BASE_URL,
+                images_enabled=config.WEB_IMAGES_ENABLED,
+            )
         )
     if use_console:
         from .console.adapter import ConsoleProviderAdapter

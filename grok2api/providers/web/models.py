@@ -19,6 +19,7 @@ class WebCapability(str, Enum):
     STREAMING = "streaming"
     CITATIONS = "citations"
     REASONING = "reasoning"
+    IMAGE = "image"
 
 
 _TIER_RANK = {
@@ -37,6 +38,8 @@ class WebModel:
     minimum_tier: WebTier
     capabilities: frozenset[WebCapability]
     description: str
+    protocol_model: str = ""
+    imagine_pro: bool = False
 
     def supports(self, capability: WebCapability | str) -> bool:
         try:
@@ -69,6 +72,8 @@ _BASE_CAPABILITIES = frozenset(
     {WebCapability.CHAT, WebCapability.STREAMING, WebCapability.CITATIONS}
 )
 
+_IMAGE_CAPABILITIES = frozenset({WebCapability.IMAGE})
+
 WEB_MODELS: tuple[WebModel, ...] = (
     WebModel(
         id="grok-chat-fast",
@@ -100,6 +105,31 @@ WEB_MODELS: tuple[WebModel, ...] = (
         minimum_tier=WebTier.HEAVY,
         capabilities=_BASE_CAPABILITIES | {WebCapability.REASONING},
         description="Grok Web Heavy-tier reasoning mode.",
+    ),
+    WebModel(
+        id="grok-imagine-image-lite",
+        upstream_mode="grok-imagine-image",
+        minimum_tier=WebTier.BASIC,
+        capabilities=_IMAGE_CAPABILITIES,
+        description="Fast Grok Web image generation mode.",
+        protocol_model="imagine-lite",
+    ),
+    WebModel(
+        id="grok-imagine-image",
+        upstream_mode="grok-imagine-image-quality",
+        minimum_tier=WebTier.BASIC,
+        capabilities=_IMAGE_CAPABILITIES,
+        description="Grok Web Imagine image generation mode.",
+        protocol_model="imagine",
+    ),
+    WebModel(
+        id="grok-imagine-image-2.0",
+        upstream_mode="grok-imagine-image-2.0",
+        minimum_tier=WebTier.BASIC,
+        capabilities=_IMAGE_CAPABILITIES,
+        description="Grok Web Imagine 2.0 Pro image generation mode.",
+        protocol_model="imagine",
+        imagine_pro=True,
     ),
 )
 

@@ -31,10 +31,12 @@ class GrokWebAdapter:
         *,
         base_url: str = "https://grok.com",
         user_agent: str = DEFAULT_USER_AGENT,
+        images_enabled: bool = True,
     ) -> None:
         self._client = client
         self.base_url = base_url.rstrip("/") + "/"
         self.user_agent = user_agent
+        self.images_enabled = bool(images_enabled)
 
     def url_for(self, path: str) -> str:
         if not path:
@@ -49,7 +51,7 @@ class GrokWebAdapter:
                 public_model=model.id,
                 provider=self.provider,
                 upstream_model=model.upstream_mode,
-                capability=Capability.CHAT,
+                capability=(Capability.IMAGE if model.supports("image") else Capability.CHAT),
                 minimum_tier=model.minimum_tier.value,
                 metadata={
                     "description": model.description,
@@ -59,6 +61,7 @@ class GrokWebAdapter:
                 },
             )
             for model in WEB_MODELS
+            if self.images_enabled or not model.supports("image")
         ]
 
     def classify_status(

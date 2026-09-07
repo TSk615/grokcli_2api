@@ -22,8 +22,24 @@ from grok2api.upstream.browser_transport import is_cloudflare_challenge
 
 from .auth import WebCredential
 from .headers import DEFAULT_USER_AGENT, build_cookie_header, build_web_headers
-from .protocol import WebProtocolError, convert_chat_completion
-from .stream import GrokWebStreamParser, WebDelta, WebStreamError
+from .protocol import WebProtocolError, build_rest_chat_payload, convert_chat_completion
+from .image import (
+    GeneratedImage,
+    IMAGE_TIMEOUT,
+    ImagineCollector,
+    MAX_DOWNLOAD_BYTES,
+    MAX_IMAGES,
+    WebImageError,
+    WebImageProtocolError,
+    decode_blob,
+    extract_lite_images,
+    imagine_request_message,
+    imagine_reset_message,
+    imagine_url,
+    resolve_aspect_ratio,
+    trusted_asset_url,
+)
+from .stream import GrokWebStreamParser, WebDelta, WebDeltaKind, WebStreamError
 
 
 SESSION_PATH = "/api/auth/session"
@@ -366,6 +382,163 @@ class GrokWebGateway:
                     await heartbeat
             with suppress(Exception):
                 await connection.close()
+
+    async def generate_image(
+        self, request: Mapping[str, Any], credential: WebCredential
+    ) -> list[GeneratedImage]:
+        """Generate Web images without falling back to another provider.
+
+        ``grok-imagine-image-lite`` uses the legacy chat stream and the two
+        Imagine models use ``/ws/imagine/listen``.  The returned URLs are
+        upstream asset URLs; callers can use :meth:`download_image` to archive
+        them while preserving the same account cookies and Resin egress.
+        """
+        if not isinstance(request, Mapping):
+            raise WebImageProtocolError("image request must be an object")
+        model_id = str(request.get("model") or "").strip()
+        if model_id.lower().startswith("web/"):
+            model_id = model_id.split("/", 1)[1].strip()
+        from .models import get_web_model
+
+        model = get_web_model(model_id)
+        if model is None or not model.supports("image"):
+            raise WebImageProtocolError("unsupported Grok Web image model")
+        prompt = request.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise WebImageProtocolError("prompt must be a non-empty string")
+        if bool(request.get("stream", False)):
+            raise WebImageProtocolError("Web image streaming is not enabled yet")
+        count = request.get("n", 1)
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            raise WebImageProtocolError("n must be an integer") from None
+        if count < 1 or count > MAX_IMAGES:
+            raise WebImageProtocolError("n must be between 1 and 10")
+        response_format = str(request.get("response_format") or "url").strip().lower()
+        if response_format not in {"url", "b64_json"}:
+            raise WebImageProtocolError("response_format must be url or b64_json")
+        ratio = resolve_aspect_ratio(request.get("aspect_ratio"), request.get("size"))
+        if model.protocol_model == "imagine-lite":
+            return await self._generate_lite_images(prompt.strip(), count, credential)
+        return await self._generate_imagine_images(
+            prompt.strip(), count, ratio, model.imagine_pro, credential
+        )
+
+    async def _generate_lite_images(
+        self, prompt: str, count: int, credential: WebCredential
+    ) -> list[GeneratedImage]:
+        values: list[GeneratedImage] = []
+        # Lite is an image-enabled MGW fast chat, as in the current upstream
+        # implementation. Each turn contributes at most one requested image.
+        for _ in range(count):
+            try:
+                async for delta in self.iter_chat(
+                    {
+                        "model": "grok-chat-fast",
+                        "stream": False,
+                        "messages": [{"role": "user", "content": "Drawing: " + prompt}],
+                    },
+                    credential,
+                ):
+                    if delta.kind is WebDeltaKind.IMAGE and delta.text:
+                        image = GeneratedImage(url=delta.text)
+                        if image.url not in {item.url for item in values}:
+                            values.append(image)
+                            break
+            except Exception:
+                raise WebGatewayError("Grok Web Lite image request failed") from None
+            if len(values) >= count:
+                break
+        if len(values) < count:
+            raise WebGatewayError("Grok Web Lite returned no complete images")
+        return values[:count]
+
+    async def _generate_imagine_images(
+        self, prompt: str, count: int, ratio: str, pro: bool, credential: WebCredential
+    ) -> list[GeneratedImage]:
+        endpoint = imagine_url(self.origin)
+        headers = {
+            "Origin": self.origin,
+            "User-Agent": self.user_agent,
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Cookie": build_cookie_header(credential),
+        }
+        try:
+            connection = await asyncio.wait_for(
+                self._connect(endpoint, headers), timeout=self.handshake_timeout
+            )
+        except Exception:
+            raise WebGatewayError("Grok Web Imagine handshake failed") from None
+        collector = ImagineCollector()
+        deadline = asyncio.get_running_loop().time() + min(self.total_timeout, IMAGE_TIMEOUT)
+        try:
+            await self._send_json(connection, asyncio.Lock(), imagine_reset_message())
+            await self._send_json(
+                connection,
+                asyncio.Lock(),
+                imagine_request_message(prompt, ratio, pro=pro, generations=count),
+            )
+            while not collector.done(count):
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise WebGatewayError("Grok Web Imagine generation timed out")
+                try:
+                    raw = await asyncio.wait_for(connection.recv(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    raise WebGatewayError("Grok Web Imagine generation timed out") from None
+                frame = self._decode_frame(raw)
+                try:
+                    message = json.loads(frame)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(message, Mapping):
+                    continue
+                if str(message.get("type") or "") == "error":
+                    raise WebGatewayError("Grok Web Imagine returned an error")
+                collector.accept(message)
+            images = collector.images()
+            if len(images) < count:
+                raise WebGatewayError("Grok Web Imagine returned incomplete images")
+            return images[:count]
+        finally:
+            with suppress(Exception):
+                await connection.close()
+
+    async def download_image(
+        self, image: GeneratedImage, credential: WebCredential
+    ) -> tuple[bytes, str]:
+        """Download a generated asset using the same credential-bound client."""
+        if image.blob:
+            return decode_blob(image.blob)
+        if not image.url or not trusted_asset_url(image.url):
+            raise WebImageError("image URL host is not trusted")
+        try:
+            response = await self._client.get(
+                image.url,
+                headers=build_web_headers(
+                    credential, user_agent=self.user_agent, extra={"Accept": "image/*"}
+                ),
+                timeout=60.0,
+            )
+            length = int(response.headers.get("content-length", "0") or 0)
+            if length > MAX_DOWNLOAD_BYTES:
+                raise WebImageError("image exceeds safety limit")
+            body = response.content
+        except WebImageError:
+            raise
+        except Exception:
+            raise WebImageError("image download failed") from None
+        if response.status_code < 200 or response.status_code >= 300 or not body:
+            raise WebImageError("image download was rejected")
+        if len(body) > MAX_DOWNLOAD_BYTES:
+            raise WebImageError("image exceeds safety limit")
+        content_type = str(response.headers.get("content-type", "image/jpeg")).split(";", 1)[0].strip().lower()
+        if not content_type.startswith("image/"):
+            content_type = "image/jpeg"
+        return body, content_type
 
     @staticmethod
     def _session(mode: str) -> dict[str, Any]:

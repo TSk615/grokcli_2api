@@ -20,10 +20,12 @@ class WebProviderContractTests(unittest.TestCase):
 
     def test_routes_are_shared_types_and_registry_resolves_web_prefix(self) -> None:
         routes = list(self.adapter.model_routes())
-        self.assertEqual(len(routes), 4)
+        self.assertEqual(len(routes), 7)
         self.assertTrue(all(isinstance(route, ModelRoute) for route in routes))
         self.assertTrue(all(route.provider is ProviderName.WEB for route in routes))
-        self.assertTrue(all(route.capability is Capability.CHAT for route in routes))
+        self.assertEqual(
+            [route.capability for route in routes].count(Capability.IMAGE), 3
+        )
 
         registry = ProviderRegistry([self.adapter])
         route = registry.resolve("Web/grok-chat-expert")

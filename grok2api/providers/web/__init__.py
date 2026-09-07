@@ -6,6 +6,7 @@ can be integrated incrementally without changing the existing Build provider.
 
 from .auth import WebCredential, parse_web_credentials
 from .errors import WebError, WebErrorKind, classify_web_error
+from .image import GeneratedImage, ImagineCollector, WebImageError, WebImageProtocolError
 from .models import WEB_MODELS, WebCapability, WebModel, WebTier, list_web_models
 from .protocol import (
     ConvertedWebChat,
@@ -41,6 +42,10 @@ __all__ = [
     "WebGatewayAuthError",
     "WebGatewayEgressError",
     "WebGatewayError",
+    "GeneratedImage",
+    "ImagineCollector",
+    "WebImageError",
+    "WebImageProtocolError",
     "WebModel",
     "WebProtocolError",
     "WebStreamError",
