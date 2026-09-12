@@ -27,6 +27,23 @@ class ImageGenerationProtocolTests(unittest.TestCase):
         self.assertEqual(request.aspect_ratio, "16:9")
         self.assertEqual(request.response_format, "b64_json")
         self.assertFalse(request.stream)
+        self.assertFalse(request.nsfw)
+        self.assertIsNone(request.enable_nsfw)
+
+    def test_nsfw_and_upstream_alias_are_preserved(self) -> None:
+        short = ImageGenerationRequest.from_payload(
+            {"model": "Web/grok-imagine-image", "prompt": "x", "nsfw": True}
+        )
+        upstream = ImageGenerationRequest.from_payload(
+            {
+                "model": "Web/grok-imagine-image",
+                "prompt": "x",
+                "enable_nsfw": True,
+            }
+        )
+        self.assertTrue(short.nsfw)
+        self.assertIsNone(short.enable_nsfw)
+        self.assertTrue(upstream.enable_nsfw)
 
     def test_n_is_limited_to_one_through_ten(self) -> None:
         for count in (0, 11):

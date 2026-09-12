@@ -419,10 +419,17 @@ class GrokWebGateway:
         if response_format not in {"url", "b64_json"}:
             raise WebImageProtocolError("response_format must be url or b64_json")
         ratio = resolve_aspect_ratio(request.get("aspect_ratio"), request.get("size"))
+        # ``enable_nsfw`` matches the upstream Web Imagine property.  Accept
+        # ``nsfw`` as the public shorthand, with the explicit upstream name
+        # taking precedence when both are supplied.
+        nsfw_value = request.get("enable_nsfw")
+        if nsfw_value is None:
+            nsfw_value = request.get("nsfw", False)
+        nsfw = bool(nsfw_value)
         if model.protocol_model == "imagine-lite":
             return await self._generate_lite_images(prompt.strip(), count, credential)
         return await self._generate_imagine_images(
-            prompt.strip(), count, ratio, model.imagine_pro, credential
+            prompt.strip(), count, ratio, model.imagine_pro, credential, nsfw=nsfw
         )
 
     async def _generate_lite_images(
@@ -455,7 +462,14 @@ class GrokWebGateway:
         return values[:count]
 
     async def _generate_imagine_images(
-        self, prompt: str, count: int, ratio: str, pro: bool, credential: WebCredential
+        self,
+        prompt: str,
+        count: int,
+        ratio: str,
+        pro: bool,
+        credential: WebCredential,
+        *,
+        nsfw: bool = False,
     ) -> list[GeneratedImage]:
         endpoint = imagine_url(self.origin)
         headers = {
@@ -479,7 +493,13 @@ class GrokWebGateway:
             await self._send_json(
                 connection,
                 asyncio.Lock(),
-                imagine_request_message(prompt, ratio, pro=pro, generations=count),
+                imagine_request_message(
+                    prompt,
+                    ratio,
+                    pro=pro,
+                    generations=count,
+                    nsfw=nsfw,
+                ),
             )
             while not collector.done(count):
                 remaining = deadline - asyncio.get_running_loop().time()

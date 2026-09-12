@@ -47,6 +47,16 @@ class WebImageProtocolTests(unittest.TestCase):
         self.assertEqual(props["aspect_ratio"], "1:1")
         self.assertTrue(props["enable_pro"])
         self.assertEqual(props["num_generations"], 2)
+        self.assertFalse(props["enable_nsfw"])
+
+        nsfw_request = imagine_request_message(
+            "a tasteful adult art portrait",
+            "3:2",
+            pro=True,
+            generations=1,
+            nsfw=True,
+        )
+        self.assertTrue(nsfw_request["item"]["content"][0]["properties"]["enable_nsfw"])
 
     def test_collector_discards_preview_and_moderated_and_sorts(self) -> None:
         collector = ImagineCollector()
@@ -77,13 +87,18 @@ class WebImageProtocolTests(unittest.TestCase):
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
                 gateway = GrokWebGateway(client, connector=connector, total_timeout=2)
                 return await gateway.generate_image(
-                    {"model": "Web/grok-imagine-image", "prompt": "a cat"},
+                    {
+                        "model": "Web/grok-imagine-image",
+                        "prompt": "a cat",
+                        "enable_nsfw": True,
+                    },
                     WebCredential(sso="secret", sso_rw="secret"),
                 )
 
         values = asyncio.run(run())
         self.assertEqual([value.url for value in values], ["https://assets.grok.com/generated/final.jpg"])
         self.assertEqual([item["item"]["content"][0].get("type") for item in socket.sent], ["reset", "input_text"])
+        self.assertTrue(socket.sent[1]["item"]["content"][0]["properties"]["enable_nsfw"])
         self.assertTrue(socket.closed)
 
     def test_lite_generation_extracts_legacy_image_url(self) -> None:

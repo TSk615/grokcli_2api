@@ -78,6 +78,10 @@ class ImageGenerationRequest(BaseModel):
     aspect_ratio: str | None = None
     response_format: Literal["url", "b64_json"] = "url"
     stream: bool = False
+    # Web Imagine's upstream switch is named ``enable_nsfw``.  ``nsfw`` is
+    # retained as a short alias for clients that already use the API's naming.
+    nsfw: bool = False
+    enable_nsfw: bool | None = None
 
     @field_validator("model", "prompt")
     @classmethod
