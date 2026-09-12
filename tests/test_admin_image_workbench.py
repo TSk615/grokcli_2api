@@ -52,6 +52,33 @@ class AdminImageWorkbenchTests(unittest.IsolatedAsyncioTestCase):
                 )
         self.assertEqual(response.status_code, 401)
 
+    async def test_origin_5xx_is_normalized_to_json_422(self) -> None:
+        generated = JSONResponse(
+            {
+                "error": {
+                    "message": "Grok Web image generation failed",
+                    "type": "upstream_error",
+                    "code": "image_generation_failed",
+                }
+            },
+            status_code=502,
+        )
+        with patch(
+            "grok2api.admin.admin_routes.verify_session_token", return_value=True
+        ), patch.object(app, "image_generations", AsyncMock(return_value=generated)):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app.app),
+                base_url="https://images.example.test",
+            ) as client:
+                response = await client.post(
+                    "/admin/api/images/generations",
+                    headers={"X-Admin-Token": "admin-session"},
+                    json={"model": "Web/grok-imagine-image", "prompt": "x"},
+                )
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.headers["content-type"].split(";", 1)[0], "application/json")
+        self.assertEqual(response.json()["error"]["code"], "image_generation_failed")
+
 
 if __name__ == "__main__":
     unittest.main()

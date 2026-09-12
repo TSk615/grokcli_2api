@@ -4052,7 +4052,35 @@ async def admin_image_generations(
     require_admin(request, x_admin_token)
     from grok2api.app import image_generations
 
-    return await image_generations(request, api_key=None)
+    response = await image_generations(request, api_key=None)
+    # Cloudflare commonly replaces origin 5xx responses with an HTML error
+    # page.  Keep this same-origin admin API JSON-only so the workbench can
+    # show the actual upstream failure instead of a misleading proxy error.
+    status_code = int(getattr(response, "status_code", 200) or 200)
+    if status_code < 500:
+        return response
+    try:
+        raw = bytes(getattr(response, "body", b"") or b"")
+        payload = json.loads(raw.decode("utf-8")) if raw else {}
+    except Exception:
+        payload = {}
+    error = payload.get("error") if isinstance(payload, dict) else None
+    message = (
+        error.get("message")
+        if isinstance(error, dict)
+        else None
+    ) or "图片上游暂时不可用，请更换提示词或稍后重试"
+    code = error.get("code") if isinstance(error, dict) else "image_generation_failed"
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": {
+                "message": message,
+                "type": "upstream_error",
+                "code": code,
+            }
+        },
+    )
 
 
 @router.post("/models/sync")
