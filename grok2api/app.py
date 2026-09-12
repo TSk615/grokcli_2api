@@ -4044,6 +4044,7 @@ def _admin_page(name: str = "index"):
         "login": "login.html",
         "keys": "keys.html",
         "accounts": "accounts.html",
+        "images": "images.html",
         "models": "models.html",
         "guide": "guide.html",
         "settings": "settings.html",
@@ -4167,6 +4168,12 @@ async def admin_usage_page():
 @app.get("/admin/models/")
 async def admin_models_page():
     return _admin_or_404("models")
+
+
+@app.get("/admin/images")
+@app.get("/admin/images/")
+async def admin_images_page():
+    return _admin_or_404("images")
 
 
 @app.get("/admin/guide")

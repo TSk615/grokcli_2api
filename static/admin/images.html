@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>生图工作台 · grokcli-2api</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" media="print" onload="this.media='all'" />
+  <link rel="stylesheet" href="/static/dist/admin-antd.bb806f857f.css" />
+  <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
+</head>
+<body class="g2a-body" data-page="images">
+  <div id="toast" class="g2a-message"></div>
+  <div class="g2a-layout" id="main-view">
+    <aside class="g2a-sider">
+      <div class="g2a-brand"><div class="g2a-logo">G</div><div><div class="g2a-brand-title">grokcli-2api</div><div class="g2a-brand-sub"><span id="app-version">…</span> · Admin</div></div></div>
+      <nav class="g2a-menu">
+        <a class="g2a-menu-item" href="/admin" data-page="overview"><span class="g2a-menu-ico">◫</span><span>概览</span></a>
+        <a class="g2a-menu-item" href="/admin/keys" data-page="keys"><span class="g2a-menu-ico">🔑</span><span>API Keys</span></a>
+        <a class="g2a-menu-item" href="/admin/accounts" data-page="accounts"><span class="g2a-menu-ico">👥</span><span>账号 / 轮询</span></a>
+        <a class="g2a-menu-item" href="/admin/usage" data-page="usage"><span class="g2a-menu-ico">Σ</span><span>用量</span></a>
+        <a class="g2a-menu-item" href="/admin/logs" data-page="logs"><span class="g2a-menu-ico">📜</span><span>任务日志</span></a>
+        <a class="g2a-menu-item" href="/admin/images" data-page="images"><span class="g2a-menu-ico">🖼</span><span>生图工作台</span></a>
+        <a class="g2a-menu-item" href="/admin/models" data-page="models"><span class="g2a-menu-ico">▣</span><span>模型</span></a>
+        <a class="g2a-menu-item" href="/admin/settings" data-page="settings"><span class="g2a-menu-ico">⚙</span><span>系统设置</span></a>
+        <a class="g2a-menu-item" href="/admin/guide" data-page="guide"><span class="g2a-menu-ico">📘</span><span>接入指南</span></a>
+      </nav>
+      <div class="g2a-sider-foot"><a href="/docs" target="_blank" rel="noopener">Swagger</a><a href="/health" target="_blank" rel="noopener">Health</a><a href="/metrics" target="_blank" rel="noopener">Metrics</a><button type="button" class="g2a-btn g2a-btn-default g2a-btn-block" id="btn-logout">退出登录</button></div>
+    </aside>
+    <div class="g2a-main">
+      <header class="g2a-header"><div><h1 id="page-title">生图工作台</h1><p id="page-sub">使用已登录的 Web 账号池生成图片</p></div><div class="g2a-header-actions"><span id="status-pill" class="g2a-tag">—</span><button type="button" class="g2a-theme-toggle" data-theme-toggle aria-label="切换主题"><span class="ico">☀️</span><span class="label">白天</span></button><button type="button" class="g2a-btn g2a-btn-default" id="btn-refresh">刷新</button></div></header>
+      <div class="g2a-mobile-nav" id="mobile-nav"></div>
+      <div class="g2a-content">
+        <section class="g2a-card">
+          <div class="g2a-card-head"><div><h3>生成参数</h3><p>请求会沿用正常 Web 生图流程、账号粘性和 Resin 出站。</p></div></div>
+          <div class="g2a-form-grid g2a-image-form">
+            <label class="g2a-field g2a-field-span2"><span>提示词</span><textarea id="image-prompt" rows="6" placeholder="描述你想生成的画面…"></textarea></label>
+            <label class="g2a-field"><span>模型</span><select id="image-model"><option value="Web/grok-imagine-image-2.0">Web/grok-imagine-image-2.0（Pro）</option><option value="Web/grok-imagine-image">Web/grok-imagine-image</option><option value="Web/grok-imagine-image-lite">Web/grok-imagine-image-lite（快速）</option></select></label>
+            <label class="g2a-field"><span>比例</span><select id="image-ratio"><option>16:9</option><option>1:1</option><option>3:2</option><option>4:3</option><option>9:16</option><option>2:3</option></select></label>
+            <label class="g2a-field"><span>张数（1–4）</span><input id="image-count" type="number" min="1" max="4" value="1" /></label>
+            <label class="g2a-check-field"><input id="image-nsfw" type="checkbox" /><span>开启成年内容（enable_nsfw）</span></label>
+          </div>
+          <div class="g2a-image-warning">仅限合规的成年内容；禁止未成年人、性暴力和违法内容。开启后仍会遵守上游审核。</div>
+          <div class="g2a-actions" style="margin-top:14px"><button type="button" class="g2a-btn g2a-btn-primary" id="btn-image-generate">生成图片</button><span id="image-status" class="g2a-muted">—</span></div>
+        </section>
+        <section class="g2a-card"><div class="g2a-card-head"><div><h3>生成结果</h3><p>点击图片可打开原图；结果会保存到应用媒体存储。</p></div></div><div id="image-results" class="g2a-image-results"><div class="g2a-empty">还没有生成结果</div></div></section>
+      </div>
+    </div>
+  </div>
+  <script src="/static/dist/utils.c46b9a7ce6.js"></script><script src="/static/dist/api.a4a81c4e29.js"></script><script src="/static/dist/state.5846ce62e4.js"></script><script src="/static/dist/auth.64fa85e43f.js"></script><script src="/static/dist/core.c9b0eb9ef8.js"></script>
+</body>
+</html>

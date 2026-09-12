@@ -103,9 +103,11 @@ Console/grok-build-0.1
 3. 进入管理台「账号」，选择 Grok Web 或 Grok Console，导入对应 SSO/TXT/JSON。SSO、Cookie 和 Console DPoP 材料只保存为加密凭据，不会写入公开 payload 或日志。
 4. 用带前缀的模型发起请求。Console 文本使用 OpenAI Responses API（`/v1/responses`）；Console 的 `/v1/chat/completions` 会返回明确错误，请改用 Responses。Web 支持单轮文本、SSE/连续 JSON 流和非流式文生图；图片编辑、视频、工具和多轮历史附件暂未纳入。
 
+`Console/grok-4.20-0309-reasoning`、`Console/grok-4.20-0309-non-reasoning` 和 `Console/grok-4.20-multi-agent-0309` 默认注入 xAI 服务端 `web_search` 工具；客户端无需显式传入。客户端已有工具会保留，已存在的 `web_search` 不会重复添加。
+
 Console 媒体失败会做脱敏分类：仅当所有候选账号都返回 429 时透传 429（`console_*_quota_or_rate_limit`）；网络/会话类失败保持 502，并在日志中记录媒体类型、阶段、状态码和分类，不记录 SSO、Cookie、DPoP 或账号标识。
 
-Web 文生图调用 `POST /v1/images/generations`，首版支持 `n=1..10`、`size` / `aspect_ratio` 以及 `response_format=url|b64_json`。生成结果会安全保存到 `GROK2API_DATA_DIR/media/images`；`url` 模式返回本应用的内容寻址媒体地址。
+Web 文生图调用 `POST /v1/images/generations`，首版支持 `n=1..10`、`size` / `aspect_ratio`、`response_format=url|b64_json` 以及 `nsfw` / `enable_nsfw`（二者同时传入时以后者为准）。NSFW 开关会原样转发到 Web Imagine 上游；调用方应仅用于合规的成年内容。生成结果会安全保存到 `GROK2API_DATA_DIR/media/images`；`url` 模式返回本应用的内容寻址媒体地址。
 单个请求最多尝试 3 个 Web 账号，避免额度不足时扫完整个大号池；可通过 `GROK2API_WEB_IMAGE_MAX_ATTEMPTS` 在 1–10 之间调整。
 
 功能开关与地址见 [`.env.example`](./.env.example)：`GROK2API_WEB_ENABLED`、`GROK2API_WEB_IMAGES_ENABLED`、`GROK2API_CONSOLE_ENABLED`、`GROK2API_WEB_BASE_URL`、`GROK2API_CONSOLE_BASE_URL` 和 `GROK2API_CONSOLE_SESSION_BASE_URL`。生产环境还应使用 HTTPS、限制管理台访问并定期轮换密钥；不要把 SSO/Cookie/DPoP 粘贴到 issue、日志或聊天记录中。

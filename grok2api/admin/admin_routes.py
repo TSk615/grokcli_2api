@@ -4042,6 +4042,19 @@ async def admin_models(
     }
 
 
+@router.post("/images/generations")
+async def admin_image_generations(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+):
+    """Run the normal image pipeline using the existing admin session."""
+
+    require_admin(request, x_admin_token)
+    from grok2api.app import image_generations
+
+    return await image_generations(request, api_key=None)
+
+
 @router.post("/models/sync")
 async def models_sync(
     request: Request,
