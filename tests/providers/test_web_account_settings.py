@@ -4,6 +4,7 @@ import base64
 import json
 import unittest
 from datetime import date
+from unittest.mock import patch
 
 from grok2api.providers.web.auth import WebCredential
 from grok2api.providers.web.account_settings import (
@@ -72,7 +73,7 @@ class WebAccountSettingsTests(unittest.TestCase):
 
 
 class WebAccountSettingsAsyncTests(unittest.IsolatedAsyncioTestCase):
-    async def test_statsig_signer_uses_bound_client_without_account_secrets(self) -> None:
+    async def test_statsig_signer_uses_direct_client_without_account_secrets(self) -> None:
         signature = base64.b64encode(b"x" * 70).decode()
 
         class Client:
@@ -80,18 +81,82 @@ class WebAccountSettingsAsyncTests(unittest.IsolatedAsyncioTestCase):
                 return _Response(200, b'<meta name="grok-site-verification" content="meta-value">')
 
             async def post(self, url: str, **kwargs):
+                raise AssertionError("signer must not use the account-bound client")
+
+        class DirectResponse:
+            status_code = 200
+            content = json.dumps({"x-statsig-id": signature}).encode()
+
+        class DirectClient:
+            def __init__(self, **kwargs):
+                self.init_kwargs = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def post(self, url: str, **kwargs):
                 self.url = url
                 self.kwargs = kwargs
-                return _Response(200, json.dumps({"x-statsig-id": signature}).encode())
+                return DirectResponse()
 
         client = Client()
-        worker = WebAccountSettingsClient(client)
-        value = await worker._signed_statsig(WebCredential("secret-sso", "secret-rw"), "/rest/test")
+        direct = DirectClient()
+        with patch(
+            "grok2api.providers.web.account_settings.httpx.AsyncClient",
+            return_value=direct,
+        ) as factory:
+            worker = WebAccountSettingsClient(client)
+            value = await worker._signed_statsig(WebCredential("secret-sso", "secret-rw"), "/rest/test")
         self.assertEqual(value, signature)
-        self.assertEqual(client.url, "https://grok.wodf.de/sign")
-        self.assertNotIn("Cookie", client.kwargs["headers"])
-        self.assertNotIn("Authorization", client.kwargs["headers"])
-        self.assertNotIn("secret-sso", repr(client.kwargs))
+        factory.assert_called_once_with(timeout=15.0, trust_env=False, follow_redirects=False)
+        self.assertEqual(direct.url, "https://grok.wodf.de/sign")
+        self.assertNotIn("Cookie", direct.kwargs["headers"])
+        self.assertNotIn("Authorization", direct.kwargs["headers"])
+        self.assertNotIn("secret-sso", repr(direct.kwargs))
+
+    async def test_nsfw_request_continues_without_statsig_when_signer_returns_403(self) -> None:
+        class Client:
+            async def get(self, url: str, **kwargs):
+                return _Response(200, b'<meta name="grok-site-verification" content="meta-value">')
+
+            async def post(self, url: str, **kwargs):
+                self.url = url
+                self.kwargs = kwargs
+                return _Response(200, b"")
+
+        class RejectedSignerResponse:
+            status_code = 403
+            content = b"forbidden"
+
+        class RejectedSigner:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def post(self, url: str, **kwargs):
+                return RejectedSignerResponse()
+
+        client = Client()
+        with patch(
+            "grok2api.providers.web.account_settings.httpx.AsyncClient",
+            return_value=RejectedSigner(),
+        ):
+            result = await WebAccountSettingsClient(client).enable_nsfw(
+                WebCredential("secret-sso", "secret-rw")
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(
+            client.url,
+            "https://grok.com/auth_mgmt.AuthManagement/UpdateUserFeatureControls",
+        )
+        self.assertEqual(client.kwargs["content"], ENABLE_NSFW_FRAME)
+        self.assertNotIn("x-statsig-id", client.kwargs["headers"])
 
 
 if __name__ == "__main__":

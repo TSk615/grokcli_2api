@@ -18,6 +18,8 @@ from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urlsplit
 
+import httpx
+
 from .auth import WebCredential
 from .headers import DEFAULT_USER_AGENT, build_cookie_header
 
@@ -225,17 +227,25 @@ class WebAccountSettingsClient:
         parser.feed(body.decode("utf-8", errors="ignore"))
         if not parser.value:
             raise WebAccountSettingError("statsig_meta", "verification_meta_missing", status)
-        signed = await self._client.post(
-            self.signer_url,
-            json={"method": "POST", "path": path, "environment": {"metaContent": parser.value}},
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
-            timeout=15.0,
-        )
+        # The signer is a separate third-party service, not part of the
+        # account's Grok session.  Sending it through the account-bound Resin
+        # lease causes its WAF to return 403 and unnecessarily couples the
+        # account egress identity to a service that receives no credentials.
         try:
-            signed_body = await signed.aread()
-            signed_status = int(signed.status_code)
-        finally:
-            await signed.aclose()
+            async with httpx.AsyncClient(
+                timeout=15.0,
+                trust_env=False,
+                follow_redirects=False,
+            ) as signer:
+                signed = await signer.post(
+                    self.signer_url,
+                    json={"method": "POST", "path": path, "environment": {"metaContent": parser.value}},
+                    headers={"Accept": "application/json", "Content-Type": "application/json"},
+                )
+                signed_body = signed.content
+                signed_status = int(signed.status_code)
+        except httpx.HTTPError:
+            raise WebAccountSettingError("statsig_signer", "signer_unavailable") from None
         if not 200 <= signed_status < 300:
             raise WebAccountSettingError("statsig_signer", "signer_unavailable", signed_status)
         if len(signed_body) > BODY_LIMIT:
@@ -249,6 +259,19 @@ class WebAccountSettingsClient:
             raise WebAccountSettingError("statsig_signer", "invalid_signature", signed_status) from None
         self._statsig_cache[path] = value
         return value
+
+    async def _optional_signed_statsig(self, credential: WebCredential, path: str) -> str:
+        """Return a signature when available without blocking the real request.
+
+        Grok currently treats ``x-statsig-id`` as an optional verification hint.
+        The external signer is therefore best-effort: its outage or WAF policy
+        must not prevent account settings from reaching Grok itself.
+        """
+
+        try:
+            return await self._signed_statsig(credential, path)
+        except WebAccountSettingError:
+            return ""
 
     async def accept_terms(self, credential: WebCredential) -> list[AccountSettingResult]:
         accounts_origin = ACCOUNTS_BASE_URL
@@ -270,10 +293,7 @@ class WebAccountSettingsClient:
         if not first.success:
             return [first]
         path = "/rest/auth/set-tos-accepted"
-        try:
-            signature = await self._signed_statsig(credential, path)
-        except WebAccountSettingError as exc:
-            return [first, _error_result(exc)]
+        signature = await self._optional_signed_statsig(credential, path)
         response = await self._client.post(
             self.base_url + path,
             json={"tosVersion": CURRENT_TERMS_VERSION},
@@ -290,7 +310,7 @@ class WebAccountSettingsClient:
 
     async def set_birth_date(self, credential: WebCredential, value: date) -> AccountSettingResult:
         path = "/rest/auth/set-birth-date"
-        signature = await self._signed_statsig(credential, path)
+        signature = await self._optional_signed_statsig(credential, path)
         response = await self._client.post(
             self.base_url + path,
             json={"birthDate": value.isoformat() + "T16:00:00.000Z"},
@@ -310,7 +330,7 @@ class WebAccountSettingsClient:
 
     async def enable_nsfw(self, credential: WebCredential) -> AccountSettingResult:
         path = "/auth_mgmt.AuthManagement/UpdateUserFeatureControls"
-        signature = await self._signed_statsig(credential, path)
+        signature = await self._optional_signed_statsig(credential, path)
         response = await self._client.post(
             self.base_url + path,
             content=ENABLE_NSFW_FRAME,
