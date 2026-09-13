@@ -69,7 +69,7 @@ class WebImageProtocolTests(unittest.TestCase):
         values = collector.images()
         self.assertEqual([value.url for value in values], ["https://assets.grok.com/a.jpg"])
 
-    def test_gateway_imagine_generation_uses_reset_and_request(self) -> None:
+    def test_gateway_imagine_generation_forces_nsfw_even_when_caller_disables_it(self) -> None:
         socket = _Socket([
             json.dumps({"type": "image", "image_id": "img", "url": "generated/final.jpg", "percentage_complete": 100, "order": 0}),
             json.dumps({"type": "json", "image_id": "img", "url": "generated/final.jpg", "current_status": "completed", "moderated": False}),
@@ -90,7 +90,8 @@ class WebImageProtocolTests(unittest.TestCase):
                     {
                         "model": "Web/grok-imagine-image",
                         "prompt": "a cat",
-                        "enable_nsfw": True,
+                        "nsfw": False,
+                        "enable_nsfw": False,
                     },
                     WebCredential(sso="secret", sso_rw="secret"),
                 )
