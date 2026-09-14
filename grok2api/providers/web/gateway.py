@@ -785,7 +785,7 @@ class GrokWebGateway:
         request: Mapping[str, Any],
         credential: WebCredential,
     ) -> str:
-        """Generate from text or an uploaded image on one account-bound session."""
+        """Generate Web video using text, frame pins, loops, or references."""
 
         prompt = str(request.get("prompt") or "").strip()
         if not prompt:
@@ -794,15 +794,50 @@ class GrokWebGateway:
         resolution = str(request.get("resolution") or "480p").strip().lower()
         ratio = str(request.get("aspect_ratio") or "1:1").strip()
         video_input = {"prompt": prompt, "aspectRatio": ratio, "duration": duration, "resolutionName": resolution}
+        requested_mode = str(request.get("video_mode") or "").strip().lower()
+        image_inputs = request.get("image_inputs")
+        if not isinstance(image_inputs, list):
+            image_inputs = []
+            if request.get("image_bytes") is not None:
+                image_inputs.append({
+                    "bytes": request["image_bytes"],
+                    "filename": str(request.get("filename") or "input.png"),
+                    "content_type": str(request.get("content_type") or "image/png"),
+                })
+        asset_ids = []
+        for image in image_inputs:
+            if not isinstance(image, Mapping):
+                raise WebGatewayError("invalid video image input")
+            asset_ids.append(await self._upload_media_image(
+                credential,
+                image_bytes=image.get("bytes"),
+                filename=str(image.get("filename") or "input.png"),
+                content_type=str(image.get("content_type") or "image/png"),
+            ))
         mode = "textToVideo"
-        if request.get("image_bytes") is not None:
-            asset_id = await self._upload_media_image(
-                credential, image_bytes=request["image_bytes"],
-                filename=str(request.get("filename") or "input.png"),
-                content_type=str(request.get("content_type") or "image/png"),
-            )
+        if requested_mode in {"first", "frames"} and asset_ids:
+            if requested_mode == "frames" and len(asset_ids) == 2:
+                mode = "referenceToVideo"
+                video_input.update({"inputAssets": [], "firstFrameAsset": asset_ids[0], "lastFrameAsset": asset_ids[1]})
+            else:
+                mode = "imageToVideo"
+                video_input["inputAssets"] = [asset_ids[0]]
+        elif requested_mode == "last" and asset_ids:
+            mode = "referenceToVideo"
+            video_input.update({"inputAssets": [], "lastFrameAsset": asset_ids[0]})
+        elif requested_mode == "loop" and asset_ids:
+            mode = "referenceToVideo"
+            video_input.update({"inputAssets": [], "firstFrameAsset": asset_ids[0], "lastFrameAsset": asset_ids[-1]})
+        elif requested_mode == "reference" and asset_ids:
+            if len(asset_ids) == 1:
+                mode = "imageToVideo"
+                video_input.update({"inputAssets": asset_ids, "useFirstFrame": False})
+            else:
+                mode = "referenceToVideo"
+                video_input["inputAssets"] = asset_ids
+        elif asset_ids:
             mode = "imageToVideo"
-            video_input["inputAssets"] = [asset_id]
+            video_input["inputAssets"] = [asset_ids[0]]
         payload = {
             "modelName": "imagine-video-gen",
             "message": prompt + " --mode=custom",

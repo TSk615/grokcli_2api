@@ -4788,14 +4788,14 @@ async def _web_gateway_for_account(account: Any):
 
 
 def _normalize_web_video_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Accept one uploaded image or data URL; never fetch caller-supplied URLs."""
+    """Normalize text, frame-pin, loop, and reference video inputs."""
     import base64
     import binascii
     from grok2api.media.image_store import DEFAULT_IMAGE_MAX_BYTES, _sniff_image_mime
 
     result = dict(payload)
-    if "images" in result or "image_url" in result:
-        raise ValueError("use image or input_reference for one input image")
+    if "image_url" in result:
+        raise ValueError("remote image URLs are not supported")
     prompt = result.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("prompt must be a non-empty string")
@@ -4803,32 +4803,130 @@ def _normalize_web_video_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     if ratio not in {"1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"}:
         raise ValueError("aspect_ratio must be 1:1, 16:9, 9:16, 4:3, 3:4, 3:2 or 2:3")
     result["aspect_ratio"] = ratio
-    aliases = [name for name in ("image", "input_reference", "image_reference") if name in result]
-    if len(aliases) + int("image_bytes" in result) > 1:
-        raise ValueError("provide exactly one input image")
-    raw = result.get("image_bytes")
-    if aliases:
-        value = result.pop(aliases[0])
+
+    mode_aliases = {
+        "": "",
+        "text": "text",
+        "frames": "frames",
+        "first": "first",
+        "first_frame": "first",
+        "last": "last",
+        "last_frame": "last",
+        "loop": "loop",
+        "reference": "reference",
+    }
+    requested_mode = str(result.get("mode") or "").strip().lower()
+    if requested_mode not in mode_aliases:
+        raise ValueError("mode must be first_frame, last_frame, loop or reference")
+    requested_mode = mode_aliases[requested_mode]
+
+    def decode_data_url(value: Any, label: str) -> dict[str, Any]:
         if isinstance(value, dict):
             value = value.get("url") or value.get("image_url")
         if not isinstance(value, str) or not value.startswith("data:image/") or ";base64," not in value:
-            raise ValueError("image must be a base64 data URL or multipart file; remote image URLs are not supported")
+            raise ValueError(f"{label} must be a PNG/JPEG/WebP data URL or multipart file")
         encoded = value.split(";base64,", 1)[1]
         if len(encoded) > ((DEFAULT_IMAGE_MAX_BYTES + 2) // 3) * 4:
-            raise ValueError("image exceeds 20 MiB limit")
+            raise ValueError(f"{label} exceeds 20 MiB limit")
         try:
             raw = base64.b64decode(encoded, validate=True)
         except (ValueError, binascii.Error):
-            raise ValueError("invalid base64 image") from None
-    if raw is not None:
+            raise ValueError(f"{label} contains invalid base64") from None
+        return normalize_image(raw, label=label)
+
+    def normalize_image(raw: Any, *, label: str, filename: str = "") -> dict[str, Any]:
         if not isinstance(raw, bytes) or not raw or len(raw) > DEFAULT_IMAGE_MAX_BYTES:
-            raise ValueError("image must contain 1 byte to 20 MiB")
+            raise ValueError(f"{label} must contain 1 byte to 20 MiB")
         mime = _sniff_image_mime(raw)
         if mime not in {"image/png", "image/jpeg", "image/webp"}:
-            raise ValueError("image must be PNG, JPEG or WebP")
-        result["image_bytes"] = raw
-        result["content_type"] = mime
-        result["filename"] = "input." + {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}[mime]
+            raise ValueError(f"{label} must be PNG, JPEG or WebP")
+        extension = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}[mime]
+        return {"bytes": raw, "content_type": mime, "filename": filename or f"{label}.{extension}"}
+
+    groups: dict[str, list[dict[str, Any]]] = {"generic": [], "first": [], "last": [], "reference": []}
+    aliases = [name for name in ("image", "input_reference", "image_reference") if name in result]
+    if len(aliases) > 1:
+        raise ValueError("provide only one image alias")
+    for alias in aliases:
+        groups["generic"].append(decode_data_url(result.pop(alias), alias))
+    for field, group in (("first_frame", "first"), ("last_frame", "last")):
+        if field in result:
+            groups[group].append(decode_data_url(result.pop(field), field))
+    if "images" in result:
+        values = result.pop("images")
+        if not isinstance(values, list):
+            raise ValueError("images must be an array")
+        if not values:
+            raise ValueError("images must not be empty")
+        groups["reference"].extend(decode_data_url(value, f"images[{index}]") for index, value in enumerate(values))
+
+    uploads = result.pop("_video_uploads", [])
+    if not isinstance(uploads, list):
+        raise ValueError("invalid multipart video uploads")
+    upload_groups = {
+        "image": "generic", "input_reference": "generic", "image_reference": "generic",
+        "first_frame": "first", "last_frame": "last", "image[]": "reference",
+    }
+    for upload in uploads:
+        if not isinstance(upload, Mapping) or upload.get("field") not in upload_groups:
+            raise ValueError("unsupported video file field")
+        group = upload_groups[str(upload["field"])]
+        groups[group].append(normalize_image(
+            upload.get("bytes"), label=str(upload["field"]), filename=str(upload.get("filename") or ""),
+        ))
+
+    if len(groups["generic"]) > 1 or len(groups["first"]) > 1 or len(groups["last"]) > 1:
+        raise ValueError("first, last and generic image fields may be provided only once")
+    total = sum(len(values) for values in groups.values())
+    if total > 9:
+        raise ValueError("video supports at most 9 input images")
+    if not total:
+        result["video_mode"] = "text"
+        result["image_inputs"] = []
+        return result
+
+    if groups["reference"]:
+        if groups["generic"] or groups["first"] or groups["last"]:
+            raise ValueError("reference images cannot be mixed with frame fields")
+        if requested_mode not in {"", "reference"}:
+            raise ValueError("image[] requires reference mode")
+        video_mode = "reference"
+        image_inputs = groups["reference"]
+    elif groups["first"] or groups["last"]:
+        if groups["generic"]:
+            raise ValueError("generic image cannot be mixed with frame fields")
+        if groups["first"] and groups["last"]:
+            if requested_mode not in {"", "frames", "loop"}:
+                raise ValueError("first_frame plus last_frame requires loop mode")
+            video_mode = "loop"
+            image_inputs = groups["first"] + groups["last"]
+        elif groups["first"]:
+            if requested_mode not in {"", "frames", "first", "loop"}:
+                raise ValueError("first_frame conflicts with mode")
+            video_mode = "loop" if requested_mode == "loop" else "first"
+            image_inputs = groups["first"]
+        else:
+            if requested_mode not in {"", "frames", "last"}:
+                raise ValueError("last_frame conflicts with mode")
+            video_mode = "last"
+            image_inputs = groups["last"]
+    else:
+        if requested_mode == "text":
+            raise ValueError("text mode cannot include images")
+        if requested_mode in {"last", "loop", "reference"}:
+            video_mode = requested_mode
+        else:
+            video_mode = "first"
+        image_inputs = groups["generic"]
+
+    if video_mode in {"first", "last"} and len(image_inputs) != 1:
+        raise ValueError(f"{video_mode}_frame mode requires exactly one image")
+    if video_mode == "loop" and not 1 <= len(image_inputs) <= 2:
+        raise ValueError("loop mode requires one or two images")
+    if video_mode == "reference" and not 1 <= len(image_inputs) <= 9:
+        raise ValueError("reference mode requires one to nine images")
+    result["video_mode"] = video_mode
+    result["image_inputs"] = image_inputs
     return result
 
 
@@ -4861,7 +4959,7 @@ async def _web_video_generations(payload: Mapping[str, Any], request: Request) -
             raw, content_type = await gateway.download_video(asset_url, account.credential)
             filename, size = VideoMediaStore().store(raw, content_type=content_type)
             public_url = f"{_request_public_origin(request)}/v1/media/videos/{filename}"
-            return JSONResponse({"id": uuid.uuid4().hex, "object": "video", "status": "completed", "model": route.qualified_model, "url": public_url, "bytes": size, "content_type": content_type, "resolution": resolution, "duration": duration, "aspect_ratio": payload.get("aspect_ratio", "1:1"), "mode": "image_to_video" if payload.get("image_bytes") else "text_to_video"}, headers={"X-Grok2API-Provider": ProviderName.WEB.value, "X-Grok2API-Resolution": resolution, "X-Grok2API-Duration": str(duration)})
+            return JSONResponse({"id": uuid.uuid4().hex, "object": "video", "status": "completed", "model": route.qualified_model, "url": public_url, "bytes": size, "content_type": content_type, "resolution": resolution, "duration": duration, "aspect_ratio": payload.get("aspect_ratio", "1:1"), "mode": str(payload.get("video_mode") or "text")}, headers={"X-Grok2API-Provider": ProviderName.WEB.value, "X-Grok2API-Resolution": resolution, "X-Grok2API-Duration": str(duration)})
         except Exception as exc:
             account_fingerprint = hashlib.sha256(
                 str(account.account_id).encode("utf-8")
@@ -5245,26 +5343,36 @@ async def video_generations(
         if "multipart/form-data" in request.headers.get("content-type", "").lower():
             from grok2api.media.image_store import DEFAULT_IMAGE_MAX_BYTES
             payload = {}
-            async with request.form(max_files=1, max_fields=16) as form:
+            uploads = []
+            async with request.form(max_files=9, max_fields=16) as form:
                 for key in form:
                     values = form.getlist(key)
-                    if len(values) != 1:
+                    if len(values) != 1 and key != "image[]":
                         raise ValueError("each video field must be provided once")
-                    value = values[0]
-                    if hasattr(value, "read"):
-                        if key not in {"image", "input_reference", "image_reference"}:
-                            raise ValueError("unsupported video file field")
-                        payload["image_bytes"] = await value.read(DEFAULT_IMAGE_MAX_BYTES + 1)
-                    else:
-                        if key == "image_bytes":
-                            raise ValueError("image_bytes is not a public parameter")
-                        payload[key] = value
+                    for value in values:
+                        if hasattr(value, "read"):
+                            if key not in {"image", "input_reference", "image_reference", "first_frame", "last_frame", "image[]"}:
+                                raise ValueError("unsupported video file field")
+                            uploads.append({
+                                "field": key,
+                                "bytes": await value.read(DEFAULT_IMAGE_MAX_BYTES + 1),
+                                "filename": str(getattr(value, "filename", "") or ""),
+                            })
+                        else:
+                            if key in {"image_bytes", "image_inputs", "_video_uploads"}:
+                                raise ValueError(f"{key} is not a public parameter")
+                            if key == "image[]":
+                                raise ValueError("image[] must contain uploaded files")
+                            payload[key] = value
+            payload["_video_uploads"] = uploads
             if not str(payload.get("model") or "").lower().startswith("web/"):
                 raise ValueError("multipart video input requires a Web model")
         else:
             payload = await request.json()
-            if isinstance(payload, dict) and "image_bytes" in payload:
-                raise ValueError("image_bytes is not a public parameter")
+            if isinstance(payload, dict):
+                private_fields = {"image_bytes", "image_inputs", "_video_uploads"}.intersection(payload)
+                if private_fields:
+                    raise ValueError(f"{sorted(private_fields)[0]} is not a public parameter")
     except ValueError as exc:
         # JSON parser messages can contain request contents; do not echo them.
         if isinstance(exc, json.JSONDecodeError):

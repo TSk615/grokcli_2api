@@ -1,4 +1,4 @@
-# Web text-to-video and image-to-video
+# Web text, frame, loop, and reference video
 
 Use `POST /v1/videos/generations` with a Grok gateway API key:
 
@@ -28,21 +28,33 @@ Allow several minutes for generation. This is a custom video endpoint, not a
 chat-completions request. NewAPI requires separate compatible video routing;
 listing a model alone does not ensure this endpoint is forwarded.
 
-Without an image the route uses `textToVideo`. With one image it uploads the
-image, takes its file metadata ID and sends `imageToVideo.inputAssets` on the
-same account-bound session. Upload errors never fall back to text-to-video.
+Without an image the route uses `textToVideo`. Image modes use the current Grok
+Web protocol on the same account-bound session:
+
+- `mode=first_frame`: one `first_frame`; uses `imageToVideo.inputAssets`.
+- `mode=last_frame`: one `last_frame`; uses `referenceToVideo.lastFrameAsset`.
+- `mode=loop`: one or two images; pins the first and last asset, reusing one
+  image for both pins when only one is supplied.
+- `mode=reference`: one to nine repeated `image[]` files; one image uses
+  `imageToVideo.useFirstFrame=false`, while multiple images use
+  `referenceToVideo.inputAssets`.
+
+Upload errors never fall back to text-to-video.
 
 Use a PNG, JPEG or WebP image (maximum 20 MiB):
 
-- Multipart file field: `image`, `input_reference` or `image_reference`.
+- Multipart file fields: `first_frame`, `last_frame`, repeated `image[]`, or the
+  legacy single-image aliases `image`, `input_reference`, and `image_reference`.
 - JSON: one of those fields containing a `data:image/...;base64,...` URL;
   `{ "url": "data:..." }` is also accepted.
-- Multiple images and remote HTTP image URLs are rejected. URLs are not fetched
-  from the server's network, avoiding SSRF and credential forwarding risks.
+- Reference mode accepts at most 9 images. Remote HTTP image URLs are rejected;
+  URLs are not fetched from the server's network, avoiding SSRF and credential
+  forwarding risks.
 
 `aspect_ratio` selects `1:1` (default), `16:9`, `9:16`, `4:3`, `3:4`, `3:2` or
-`2:3`. The default does not infer the uploaded image's ratio. Only the 1:1
-text-to-video and 16:9 image-to-video presets have been live-verified so far.
+`2:3`. The default does not infer the uploaded image's ratio. The text,
+first-frame, last-frame, loop, single-reference, and two-reference modes have
+been live-verified at 480p/6s.
 Quality and ratio are upstream presets, not promises of exact pixels: a 480p,
 16:9 image-to-video test returned 736x400; the earlier 1:1 test returned 560x560.
 

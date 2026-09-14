@@ -79,11 +79,12 @@ class AppVideoGenerationTests(unittest.IsolatedAsyncioTestCase):
         png = b"\x89PNG\r\n\x1a\n" + b"fixture"
         response = await self.request(image="data:image/png;base64," + base64.b64encode(png).decode(), aspect_ratio="16:9")
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["mode"], "image_to_video")
+        self.assertEqual(response.json()["mode"], "first")
         self.assertEqual(response.json()["aspect_ratio"], "16:9")
         body = self.gateway.generate_video.await_args.args[0]
-        self.assertEqual(body["image_bytes"], png)
-        self.assertEqual(body["content_type"], "image/png")
+        self.assertEqual(body["video_mode"], "first")
+        self.assertEqual(body["image_inputs"][0]["bytes"], png)
+        self.assertEqual(body["image_inputs"][0]["content_type"], "image/png")
         self.assertNotIn("image", body)
 
     async def test_multipart_reference(self):
@@ -91,13 +92,55 @@ class AppVideoGenerationTests(unittest.IsolatedAsyncioTestCase):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app.app), base_url="https://video.example.test") as client:
             response = await client.post("/v1/videos/generations", data={"model": "Web/grok-imagine-video", "prompt": "animate", "aspect_ratio": "9:16"}, files={"input_reference": ("source.png", png, "image/png")})
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(self.gateway.generate_video.await_args.args[0]["image_bytes"], png)
+        body = self.gateway.generate_video.await_args.args[0]
+        self.assertEqual(body["video_mode"], "first")
+        self.assertEqual(body["image_inputs"][0]["bytes"], png)
+
+    async def test_json_frame_loop_and_reference_modes_are_normalized(self):
+        png = b"\x89PNG\r\n\x1a\n" + b"fixture"
+        image = "data:image/png;base64," + base64.b64encode(png).decode()
+        cases = [
+            ({"mode": "first_frame", "first_frame": image}, "first", 1),
+            ({"mode": "last_frame", "last_frame": image}, "last", 1),
+            ({"mode": "loop", "first_frame": image}, "loop", 1),
+            ({"mode": "loop", "first_frame": image, "last_frame": image}, "loop", 2),
+            ({"mode": "reference", "images": [image]}, "reference", 1),
+            ({"mode": "reference", "images": [image, image]}, "reference", 2),
+        ]
+        for fields, expected_mode, expected_count in cases:
+            with self.subTest(mode=expected_mode, count=expected_count):
+                self.gateway.generate_video.reset_mock()
+                response = await self.request(**fields)
+                self.assertEqual(response.status_code, 200, response.text)
+                body = self.gateway.generate_video.await_args.args[0]
+                self.assertEqual(body["video_mode"], expected_mode)
+                self.assertEqual(len(body["image_inputs"]), expected_count)
+
+    async def test_multipart_canvas_fields_preserve_all_modes(self):
+        png = b"\x89PNG\r\n\x1a\n" + b"fixture"
+        cases = [
+            ("first_frame", [("first_frame", ("first.png", png, "image/png"))], "first", 1),
+            ("last_frame", [("last_frame", ("last.png", png, "image/png"))], "last", 1),
+            ("loop", [("first_frame", ("first.png", png, "image/png")), ("last_frame", ("last.png", png, "image/png"))], "loop", 2),
+            ("reference", [("image[]", ("one.png", png, "image/png")), ("image[]", ("two.png", png, "image/png"))], "reference", 2),
+        ]
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app.app), base_url="https://video.example.test") as client:
+            for mode, files, expected_mode, expected_count in cases:
+                with self.subTest(mode=mode):
+                    self.gateway.generate_video.reset_mock()
+                    response = await client.post("/v1/videos/generations", data={"model": "Web/grok-imagine-video", "prompt": "animate", "mode": mode}, files=files)
+                    self.assertEqual(response.status_code, 200, response.text)
+                    body = self.gateway.generate_video.await_args.args[0]
+                    self.assertEqual(body["video_mode"], expected_mode)
+                    self.assertEqual(len(body["image_inputs"]), expected_count)
 
     async def test_invalid_images_never_fall_back_to_text(self):
         for fields in ({"image": "https://127.0.0.1/private"}, {"image": "data:image/png;base64,??"},
                        {"image": "data:image/png;base64,"}, {"image": None},
                        {"image": "data:image/png;base64,aGVsbG8="}, {"image": "x", "input_reference": "y"},
-                       {"images": ["x"]}, {"image_url": "x"}, {"image_bytes": "x"}, {"aspect_ratio": "invalid"}):
+                       {"images": ["x"]}, {"image_url": "x"}, {"image_bytes": "x"}, {"aspect_ratio": "invalid"},
+                       {"mode": "invalid"}, {"mode": "first_frame", "images": ["data:image/png;base64,iVBORw0KGgo="]},
+                       {"mode": "reference", "images": ["data:image/png;base64,iVBORw0KGgo="] * 10}):
             response = await self.request(**fields)
             self.assertEqual(response.status_code, 400, response.text)
         self.gateway.generate_video.assert_not_awaited()

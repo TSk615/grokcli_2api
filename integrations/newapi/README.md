@@ -1,6 +1,6 @@
 # Grok Web Video 插件
 
-上传文件：`grok-web-video.js`（当前版本 1.0.1；单个文件，不需要上传本说明）。
+上传文件：`grok-web-video.js`（当前版本 1.1.0；单个文件，不需要上传本说明）。
 
 针对现有 NewAPI `v1.0.0-rc.33`（构建 `eb99ab1`）的 Task Plugin API v1，
 只声明 `openai_video`，不覆盖 Sora、不占用 OpenAI 渠道类型。
@@ -30,8 +30,11 @@
 - `size`：可用任意有效的 `WIDTHxHEIGHT`，例如画布常见的 `854x480`。
   明确传入 `aspect_ratio` 时以它为准；否则将尺寸映射到最接近的受支持比例。
   `size` 只参与比例转换，不保证输出像素。
-- 图片：上传单个 `input_reference` 或 `image` 文件，或 JSON 中传图片 Data URL。
-  支持 PNG/JPEG/WebP，最大 20 MiB；不支持远程图片 URL、多图、视频延长和 remix。
+- `mode=first_frame`：上传一个 `first_frame`。
+- `mode=last_frame`：上传一个 `last_frame`。
+- `mode=loop`：上传一个 `first_frame`，或同时上传 `first_frame` 与 `last_frame`。
+- `mode=reference`：用重复的 `image[]` 上传 1–9 张参考图。
+- 图片支持 PNG/JPEG/WebP，每张最大 20 MiB；不支持远程图片 URL、视频延长和 remix。
 
 ```powershell
 curl.exe "https://newapi.rainflow.foo/v1/videos" -H "Authorization: Bearer YOUR_NEWAPI_TOKEN" -F "model=Web/grok-imagine-video" -F "prompt=让图中物体轻轻运动" -F "input_reference=@C:\Pictures\source.png" -F "resolution=480p" -F "seconds=6" -F "aspect_ratio=16:9"

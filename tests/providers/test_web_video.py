@@ -41,6 +41,39 @@ class WebVideoTests(unittest.IsolatedAsyncioTestCase):
                     await GrokWebGateway(client).generate_video({"prompt": "animate", "image_bytes": b"fixture"}, WebCredential(sso="fixture", sso_rw="fixture"))
         self.assertEqual(len(calls), 1)
 
+    async def test_frame_loop_and_reference_payloads_match_web_protocol(self):
+        cases = [
+            ("first", 1, "imageToVideo", {"inputAssets": ["asset-1"]}),
+            ("last", 1, "referenceToVideo", {"inputAssets": [], "lastFrameAsset": "asset-1"}),
+            ("loop", 1, "referenceToVideo", {"inputAssets": [], "firstFrameAsset": "asset-1", "lastFrameAsset": "asset-1"}),
+            ("loop", 2, "referenceToVideo", {"inputAssets": [], "firstFrameAsset": "asset-1", "lastFrameAsset": "asset-2"}),
+            ("reference", 1, "imageToVideo", {"inputAssets": ["asset-1"], "useFirstFrame": False}),
+            ("reference", 2, "referenceToVideo", {"inputAssets": ["asset-1", "asset-2"]}),
+        ]
+        for video_mode, count, upstream_mode, expected in cases:
+            with self.subTest(video_mode=video_mode, count=count):
+                upload_count = 0
+
+                def handle(request):
+                    nonlocal upload_count
+                    if request.url.path.endswith("/direct"):
+                        upload_count += 1
+                        return httpx.Response(200, json={"fileMetadata": {"fileMetadataId": f"asset-{upload_count}"}})
+                    body = json.loads(request.content)["mediaGenInput"]
+                    self.assertEqual(set(body), {upstream_mode})
+                    for key, value in expected.items():
+                        self.assertEqual(body[upstream_mode][key], value)
+                    return httpx.Response(200, json={"result": {"videoUrl": "clip.mp4"}})
+
+                images = [{"bytes": b"fixture", "filename": f"{index}.png", "content_type": "image/png"} for index in range(count)]
+                with patch("grok2api.providers.web.statsig.generate", return_value="proof"):
+                    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+                        await GrokWebGateway(client).generate_video(
+                            {"prompt": "x", "video_mode": video_mode, "image_inputs": images},
+                            WebCredential(sso="fixture", sso_rw="fixture"),
+                        )
+                self.assertEqual(upload_count, count)
+
     async def test_default_480p_six_seconds_uses_local_signature(self):
         calls = []
 

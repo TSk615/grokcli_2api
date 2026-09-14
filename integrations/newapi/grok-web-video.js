@@ -7,19 +7,19 @@
  * POST /v1/videos waits for upstream generation; allow >=300s where possible.
  * GET /v1/videos/:id and /:id/content are owned/authenticated by NewAPI.
  * Default 480p/6s/1:1. size selects aspect ratio, NOT guaranteed pixels.
- * File upload or image data URL supported; remote image URLs intentionally
- * rejected. Existing backend must include imageToVideo support.
+ * First frame, last frame, loop, and 1-9 image reference modes are supported.
+ * File upload or image data URL supported; remote image URLs are rejected.
  */
 export const meta = {
   apiVersion: 1,
   key: "grok_web_video",
   name: "Grok Web Video",
   icon: "text:GW",
-  version: "1.0.1",
+  version: "1.1.0",
   author: {name: "Rainflow"},
   description: {
-    en: "Grok Web text-to-video and image-to-video",
-    zh: "Grok Web 文生视频与图生视频",
+    en: "Grok Web text, frame, loop, and reference video generation",
+    zh: "Grok Web 文生、首末帧、循环与参考视频生成",
   },
   models: ["Web/grok-imagine-video"],
   protocols: ["openai_video"],
@@ -32,7 +32,9 @@ export const meta = {
 
 const RATIOS = ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"];
 const IMAGE_FIELDS = ["image", "input_reference", "image_reference"];
+const FILE_FIELDS = IMAGE_FIELDS.concat(["first_frame", "last_frame", "image[]"]);
 const MAX_IMAGE = 20 * 1024 * 1024;
+const MAX_IMAGES = 9;
 function text(value) { return typeof value === "string" ? value.trim() : ""; }
 function object(value) { return !!value && typeof value === "object" && !Array.isArray(value); }
 function nearestRatio(width, height) {
@@ -54,6 +56,24 @@ function authorization(ctx) {
   const value = ctx.apiKey ? "Bearer " + ctx.apiKey : "";
   if (typeof value !== "string" || !value || /[\r\n]/.test(value)) throw new Error("Channel API key is not configured");
   return value;
+}
+function mode(value) {
+  const current = text(value).toLowerCase();
+  const aliases = {text: "text", frames: "frames", first: "first", first_frame: "first", last: "last", last_frame: "last", loop: "loop", reference: "reference"};
+  if (!current) return "";
+  if (!aliases[current]) throw new Error("mode must be first_frame, last_frame, loop or reference");
+  return aliases[current];
+}
+function dataImage(value, label) {
+  if (object(value)) value = value.url || value.image_url;
+  if (typeof value !== "string" || !/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/]+={0,2}$/.test(value)) throw new Error(label + " must be a PNG/JPEG/WebP data URL or upload");
+  if (value.length > Math.ceil(MAX_IMAGE / 3) * 4 + 64) throw new Error(label + " exceeds 20 MiB");
+  return value;
+}
+function fileImage(file) {
+  if (FILE_FIELDS.indexOf(file.field) < 0) throw new Error("Unsupported image upload field");
+  if (file.size <= 0 || file.size > MAX_IMAGE) throw new Error("Image must contain 1 byte to 20 MiB");
+  return {__fileRef: file.ref, encoding: "dataUrl", maxBytes: MAX_IMAGE};
 }
 function normalize(ctx) {
   const body = ctx.body || {};
@@ -77,7 +97,8 @@ function normalize(ctx) {
   const requested = req.seconds === undefined ? (req.duration === undefined ? 6 : req.duration) : req.seconds;
   const seconds = Number(requested);
   if (!Number.isInteger(seconds) || seconds < 1 || seconds > 15) throw new Error("seconds must be an integer between 1 and 15; Basic accounts are capped at 6");
-  let resolution = text(req.resolution).toLowerCase();
+  if (req.resolution !== undefined && req.resolution_name !== undefined && text(req.resolution).toLowerCase() !== text(req.resolution_name).toLowerCase()) throw new Error("resolution and resolution_name conflict");
+  let resolution = text(req.resolution === undefined ? req.resolution_name : req.resolution).toLowerCase();
   const quality = text(req.quality).toLowerCase();
   if (quality && quality !== "standard" && quality !== "high") throw new Error("quality must be standard or high");
   const qualityResolution = quality === "high" ? "720p" : "480p";
@@ -98,30 +119,71 @@ function normalize(ctx) {
   }
   ratio = ratio || "1:1";
   const normalized = {prompt, duration: Math.min(seconds, 6), resolution, aspect_ratio: ratio};
+  const selectedMode = mode(req.mode);
+  const groups = {generic: [], first: [], last: [], reference: []};
   const supplied = IMAGE_FIELDS.filter(function (key) { return req[key] !== undefined; });
-  const files = body.files || [];
-  if (supplied.length + files.length > 1) throw new Error("Provide only one input image");
-  if (req.images !== undefined || req.image_url !== undefined || req.image_bytes !== undefined) throw new Error("Use image or input_reference for one input image");
-  if (files.length) {
-    const file = files[0];
-    if (IMAGE_FIELDS.indexOf(file.field) < 0) throw new Error("Unsupported image upload field");
-    if (file.size <= 0 || file.size > MAX_IMAGE) throw new Error("Image must contain 1 byte to 20 MiB");
-    // Opaque upload reference resolved by NewAPI, not by JavaScript.
-    normalized.image = {__fileRef: file.ref, encoding: "dataUrl", maxBytes: MAX_IMAGE};
-  } else if (supplied.length) {
-    let image = req[supplied[0]];
-    if (object(image)) image = image.url || image.image_url;
-    if (typeof image !== "string" || !/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/]+={0,2}$/.test(image)) throw new Error("Use a PNG/JPEG/WebP data URL or upload a file; remote image URLs are not supported");
-    if (image.length > Math.ceil(MAX_IMAGE / 3) * 4 + 64) throw new Error("Image exceeds 20 MiB");
-    normalized.image = image;
+  if (supplied.length > 1) throw new Error("Provide only one image alias");
+  if (supplied.length) groups.generic.push(dataImage(req[supplied[0]], supplied[0]));
+  if (req.first_frame !== undefined) groups.first.push(dataImage(req.first_frame, "first_frame"));
+  if (req.last_frame !== undefined) groups.last.push(dataImage(req.last_frame, "last_frame"));
+  if (req.images !== undefined) {
+    if (!Array.isArray(req.images)) throw new Error("images must be an array");
+    if (!req.images.length) throw new Error("images must not be empty");
+    for (let index = 0; index < req.images.length; index += 1) groups.reference.push(dataImage(req.images[index], "images[" + index + "]"));
   }
-  return {kind: "submit", model: ctx.model, action: normalized.image ? "image_to_video" : "text_to_video", requestBody: normalized};
+  if (req.image_url !== undefined || req.image_bytes !== undefined) throw new Error("Remote image URLs and image_bytes are not supported");
+  const files = body.files || [];
+  for (const file of files) {
+    const image = fileImage(file);
+    if (IMAGE_FIELDS.indexOf(file.field) >= 0) groups.generic.push(image);
+    else if (file.field === "first_frame") groups.first.push(image);
+    else if (file.field === "last_frame") groups.last.push(image);
+    else groups.reference.push(image);
+  }
+  if (groups.generic.length > 1 || groups.first.length > 1 || groups.last.length > 1) throw new Error("First, last and generic image fields may be provided only once");
+  const total = groups.generic.length + groups.first.length + groups.last.length + groups.reference.length;
+  if (total > MAX_IMAGES) throw new Error("Video supports at most 9 input images");
+  if (!total) return {kind: "submit", model: ctx.model, action: "text_to_video", requestBody: normalized};
+  if (groups.reference.length) {
+    if (groups.generic.length || groups.first.length || groups.last.length) throw new Error("Reference images cannot be mixed with frame fields");
+    if (selectedMode && selectedMode !== "reference") throw new Error("image[] requires reference mode");
+    normalized.mode = "reference";
+    normalized.images = groups.reference;
+  } else if (groups.first.length || groups.last.length) {
+    if (groups.generic.length) throw new Error("Generic image cannot be mixed with frame fields");
+    if (groups.first.length && groups.last.length) {
+      if (selectedMode && selectedMode !== "frames" && selectedMode !== "loop") throw new Error("First plus last frame requires loop mode");
+      normalized.mode = "loop";
+      normalized.first_frame = groups.first[0];
+      normalized.last_frame = groups.last[0];
+    } else if (groups.first.length) {
+      if (selectedMode && selectedMode !== "frames" && selectedMode !== "first" && selectedMode !== "loop") throw new Error("first_frame conflicts with mode");
+      normalized.mode = selectedMode === "loop" ? "loop" : "first_frame";
+      normalized.first_frame = groups.first[0];
+    } else {
+      if (selectedMode && selectedMode !== "frames" && selectedMode !== "last") throw new Error("last_frame conflicts with mode");
+      normalized.mode = "last_frame";
+      normalized.last_frame = groups.last[0];
+    }
+  } else {
+    if (selectedMode === "text") throw new Error("text mode cannot include images");
+    normalized.mode = selectedMode === "last" ? "last_frame" : selectedMode === "loop" ? "loop" : selectedMode === "reference" ? "reference" : "first_frame";
+    if (normalized.mode === "last_frame") normalized.last_frame = groups.generic[0];
+    else if (normalized.mode === "reference") normalized.images = groups.generic;
+    else normalized.first_frame = groups.generic[0];
+  }
+  const count = (normalized.images || []).length + (normalized.first_frame ? 1 : 0) + (normalized.last_frame ? 1 : 0);
+  if ((normalized.mode === "first_frame" || normalized.mode === "last_frame") && count !== 1) throw new Error(normalized.mode + " requires exactly one image");
+  if (normalized.mode === "loop" && (count < 1 || count > 2)) throw new Error("loop requires one or two images");
+  if (normalized.mode === "reference" && (count < 1 || count > MAX_IMAGES)) throw new Error("reference requires one to nine images");
+  const actions = {first_frame: "first_frame_to_video", last_frame: "last_frame_to_video", loop: "loop_video", reference: "reference_to_video"};
+  return {kind: "submit", model: ctx.model, action: actions[normalized.mode], requestBody: normalized};
 }
 
 export function buildSubmitRequest(ctx) {
   const req = ctx.requestBody || {};
   const body = {model: ctx.upstreamModel || ctx.model, prompt: req.prompt, duration: req.duration, resolution: req.resolution, aspect_ratio: req.aspect_ratio};
-  if (req.image !== undefined) body.image = req.image;
+  for (const key of ["mode", "first_frame", "last_frame", "images"]) if (req[key] !== undefined) body[key] = req[key];
   return {url: base(ctx) + "/v1/videos/generations", method: "POST", headers: {Authorization: authorization(ctx), "Content-Type": "application/json"}, body};
 }
 function mediaPath(value) {

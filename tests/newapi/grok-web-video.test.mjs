@@ -33,21 +33,41 @@ test('size chooses ratio, not quality; portrait and landscape', () => {
   assert.equal(decode({prompt: 'x', size: '1280x720'}).requestBody.resolution, '480p');
   assert.equal(decode({prompt: 'x', seconds: 12}).requestBody.duration, 6);
   assert.equal(decode({prompt: 'x', quality: 'high'}).requestBody.resolution, '720p');
+  assert.equal(decode({prompt: 'x', resolution_name: '720p'}).requestBody.resolution, '720p');
 });
 test('data URL is passed as image; no silent text fallback', () => {
   const image = 'data:image/png;base64,aGVsbG8=';
   const intent = decode({prompt: 'x', input_reference: image});
-  assert.equal(intent.action, 'image_to_video');
-  assert.equal(plugin.buildSubmitRequest(context(intent)).body.image, image);
+  assert.equal(intent.action, 'first_frame_to_video');
+  assert.equal(plugin.buildSubmitRequest(context(intent)).body.first_frame, image);
   for (const input of [null, '', 'https://127.0.0.1/', {__fileRef: 'request_file:x'}]) assert.throws(() => decode({prompt: 'x', image: input}));
 });
 test('multipart uses the host-owned upload reference', () => {
   const intent = plugin.protocols.openai_video.decodeRequest({model: MODEL, body: {kind: 'multipart', fields: {prompt: ['animate'], aspect_ratio: ['9:16']}, files: [{ref: 'request_file:input_reference', field: 'input_reference', size: 100, mimeType: 'image/png'}]}});
-  assert.equal(intent.action, 'image_to_video');
-  assert.deepEqual(intent.requestBody.image, {__fileRef: 'request_file:input_reference', encoding: 'dataUrl', maxBytes: 20971520});
+  assert.equal(intent.action, 'first_frame_to_video');
+  assert.deepEqual(intent.requestBody.first_frame, {__fileRef: 'request_file:input_reference', encoding: 'dataUrl', maxBytes: 20971520});
+});
+test('canvas multipart frame, loop, and multi-reference fields are preserved', () => {
+  const file = (field, index) => ({ref: `request_file:${field}:${index}`, field, size: 100, mimeType: 'image/png'});
+  const decodeFiles = (mode, files) => plugin.protocols.openai_video.decodeRequest({model: MODEL, body: {kind: 'multipart', fields: {prompt: ['animate'], mode: [mode]}, files}});
+  const first = decodeFiles('first', [file('first_frame', 0)]);
+  assert.equal(first.action, 'first_frame_to_video');
+  assert.ok(plugin.buildSubmitRequest(context(first)).body.first_frame.__fileRef);
+  const last = decodeFiles('last', [file('last_frame', 0)]);
+  assert.equal(last.action, 'last_frame_to_video');
+  assert.ok(plugin.buildSubmitRequest(context(last)).body.last_frame.__fileRef);
+  const loop = decodeFiles('loop', [file('first_frame', 0), file('last_frame', 1)]);
+  assert.equal(loop.action, 'loop_video');
+  assert.ok(loop.requestBody.first_frame.__fileRef);
+  assert.ok(loop.requestBody.last_frame.__fileRef);
+  const reference = decodeFiles('reference', [file('image[]', 0), file('image[]', 1)]);
+  assert.equal(reference.action, 'reference_to_video');
+  assert.equal(reference.requestBody.images.length, 2);
+  assert.equal(plugin.buildSubmitRequest(context(reference)).body.images.length, 2);
 });
 test('invalid parameters and conflicting inputs are rejected', () => {
-  for (const extra of [{seconds: 0}, {seconds: 1.5}, {seconds: 16}, {seconds: 6, duration: 4}, {resolution: '1080p'}, {resolution: '480p', quality: 'high'}, {aspect_ratio: 'auto'}, {size: 'landscape'}, {size: '0x720'}, {image: 'x', input_reference: 'y'}, {image_url: 'x'}, {images: []}]) assert.throws(() => decode({prompt: 'x', ...extra}));
+  const image = 'data:image/png;base64,aGVsbG8=';
+  for (const extra of [{seconds: 0}, {seconds: 1.5}, {seconds: 16}, {seconds: 6, duration: 4}, {resolution: '1080p'}, {resolution: '480p', quality: 'high'}, {aspect_ratio: 'auto'}, {size: 'landscape'}, {size: '0x720'}, {image: 'x', input_reference: 'y'}, {image_url: 'x'}, {images: []}, {mode: 'reference', images: Array(10).fill(image)}]) assert.throws(() => decode({prompt: 'x', ...extra}));
 });
 test('synchronous success is persisted as terminal; no re-submission polling', () => {
   const ctx = context(decode({prompt: 'x'}));
