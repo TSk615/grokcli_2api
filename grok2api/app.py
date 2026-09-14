@@ -4802,21 +4802,14 @@ async def _web_video_generations(payload: Mapping[str, Any], request: Request) -
     if requested_duration < 1 or requested_duration > 15:
         return openai_error("duration must be between 1 and 15 seconds", status=400, err_type="invalid_request_error")
     resolution = str(payload.get("resolution") or "").strip().lower()
-    if resolution not in {"", "480p", "720p"}:
+    resolution = resolution or "480p"
+    if resolution not in {"480p", "720p"}:
         return openai_error("resolution must be 480p or 720p", status=400, err_type="invalid_request_error")
-    if resolution == "480p" and accounts and all(str(getattr(a, "web_tier", "basic") or "basic").lower() == "basic" for a in accounts):
-        return openai_error("Web Basic accounts support 720p only; 480p requires Super", status=400, err_type="invalid_request_error")
     for account in accounts[: max(1, min(5, int(os.getenv("GROK2API_WEB_IMAGE_MAX_ATTEMPTS", "3") or 3)))]:
         try:
             tier = str(getattr(account, "web_tier", "basic") or "basic").lower()
-            # The Web upstream exposes 720p to Basic/free accounts; 480p is
-            # reserved for Super-tier accounts.  Keep the API selectable but
-            # fail clearly instead of making an upstream request that is
-            # guaranteed to be rejected.
-            if not resolution:
-                resolution = "720p"
-            if tier == "basic" and resolution == "480p":
-                raise ValueError("Web Basic accounts support 720p only")
+            # Basic accounts can generate 480p clips. Keep 720p selectable;
+            # availability and quota are determined by the upstream account.
             duration = min(requested_duration, 6) if tier == "basic" else requested_duration
             gateway = await _web_gateway_for_account(account)
             asset_url = await gateway.generate_video({**dict(payload), "model": route.public_model, "duration": duration, "resolution": resolution}, account.credential)
@@ -5203,8 +5196,6 @@ async def video_generations(
     api_key: apikeys.ApiKeyRecord | None = Depends(require_api_key),
 ):
     del api_key
-    if not _config.CONSOLE_PROVIDER_ENABLED or not getattr(_config, "CONSOLE_MEDIA_ENABLED", False):
-        return openai_error("Grok Console video generation is disabled", status=400, err_type="invalid_request_error", code="console_media_disabled")
     try:
         payload = await request.json()
     except Exception:
@@ -5223,6 +5214,8 @@ async def video_generations(
             return openai_error("Grok Web video generation failed", status=502, err_type="upstream_error")
     if not model.lower().startswith("console/"):
         return openai_error("video generation requires a Web/ or Console/ model", status=400, err_type="invalid_request_error")
+    if not _config.CONSOLE_PROVIDER_ENABLED or not getattr(_config, "CONSOLE_MEDIA_ENABLED", False):
+        return openai_error("Grok Console video generation is disabled", status=400, err_type="invalid_request_error", code="console_media_disabled")
     return await _console_video_generations(payload, request)
 
 

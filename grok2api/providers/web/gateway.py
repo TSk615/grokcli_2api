@@ -792,10 +792,11 @@ class GrokWebGateway:
         }
         response = await self._client.post(
             f"{self.origin}/rest/app-chat/conversations/new",
-            headers=build_web_headers(
+            headers=await self._media_headers(
                 credential,
-                user_agent=self.user_agent,
-                extra={"Accept": "text/event-stream, application/json", "Referer": f"{self.origin}/imagine"},
+                path="/rest/app-chat/conversations/new",
+                referer=f"{self.origin}/imagine",
+                accept="*/*",
             ),
             json=payload,
             timeout=self.total_timeout,

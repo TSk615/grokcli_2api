@@ -23,7 +23,7 @@ then packs the seed and truncated SHA-256 digest into the 70-byte wire format.
 The pair can be reused, but signatures are generated afresh. A future Grok
 frontend change may require a new pair.
 
-Only the image-edit REST header builder uses this signer. The Imagine
+Image-edit and Web video REST requests use this signer. The Imagine
 WebSocket text-to-image protocol is unchanged. Existing Resin account binding
 continues to handle upload, generation and asset download.
 

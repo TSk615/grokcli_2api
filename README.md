@@ -101,7 +101,7 @@ Console/grok-build-0.1
 1. 在 `.env` 设置随机的 `GROK2API_SECRET_KEY`，再将 `GROK2API_WEB_ENABLED=1` 或 `GROK2API_CONSOLE_ENABLED=1`。Web 图片另需 `GROK2API_WEB_IMAGES_ENABLED=1`；Console 图片/视频另需 `GROK2API_CONSOLE_MEDIA_ENABLED=1`。没有密钥时应用会拒绝启动；Build-only 不需要该密钥。
 2. 重启应用，让数据库迁移创建 Provider 字段和路由表。
 3. 进入管理台「账号」，选择 Grok Web 或 Grok Console，导入对应 SSO/TXT/JSON。SSO、Cookie 和 Console DPoP 材料只保存为加密凭据，不会写入公开 payload 或日志。
-4. 用带前缀的模型发起请求。Console 文本使用 OpenAI Responses API（`/v1/responses`）；Console 的 `/v1/chat/completions` 会返回明确错误，请改用 Responses。Web 支持单轮文本、SSE/连续 JSON 流和非流式文生图；图片编辑、视频、工具和多轮历史附件暂未纳入。
+4. 用带前缀的模型发起请求。Console 文本使用 OpenAI Responses API（`/v1/responses`）；Console 的 `/v1/chat/completions` 会返回明确错误，请改用 Responses。Web 支持单轮文本、SSE/连续 JSON 流、非流式文生图、图片编辑与文生视频。REST 媒体请求需配置[签名](docs/web-image-edit-statsig.md)；[Web 视频](docs/web-video.md)默认 480P、6 秒。图生视频、工具和多轮历史附件暂未纳入。
 
 `Console/grok-4.20-0309-reasoning`、`Console/grok-4.20-0309-non-reasoning` 和 `Console/grok-4.20-multi-agent-0309` 默认注入 xAI 服务端 `web_search` 工具；客户端无需显式传入。客户端已有工具会保留，已存在的 `web_search` 不会重复添加。
 
@@ -426,7 +426,7 @@ docker-compose.yml                       # redis + postgres（内网）+ app
   - 新增 Web `grok-imagine-image-lite`、`grok-imagine-image`、`grok-imagine-image-2.0`
   - 新增 OpenAI 兼容 `/v1/images/generations` 与内容寻址媒体访问地址
   - Web 图片 HTTP、WebSocket 与资源下载保持账号级 Resin 出站粘性，单请求账号尝试有界
-  - 图片编辑、图片流式输出、视频及 Console 图片仍保持关闭
+  - 后续媒体扩展：Web 图片编辑与默认 480P/6 秒文生视频已接入；视频接口说明见 [Web 视频](docs/web-video.md)
 - **v1.9.93**
   - **Redis Streams 独立 writer**：账号统计、状态和用量每 1 秒或 500 条批量写 PG；事务成功后才 ACK
   - **幂等与恢复**：`writer_inbox` 去重、pending 自动重领、失败重试与 DLQ；`state_seq/state_version` 防止旧状态覆盖新状态
