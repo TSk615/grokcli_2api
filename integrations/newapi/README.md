@@ -1,6 +1,6 @@
 # Grok Web Video 插件
 
-上传文件：`grok-web-video.js`（单个文件，不需要上传本说明）。
+上传文件：`grok-web-video.js`（当前版本 1.0.1；单个文件，不需要上传本说明）。
 
 针对现有 NewAPI `v1.0.0-rc.33`（构建 `eb99ab1`）的 Task Plugin API v1，
 只声明 `openai_video`，不覆盖 Sora、不占用 OpenAI 渠道类型。
@@ -27,7 +27,9 @@
 - `resolution`：默认 `480p`，也可传 `720p`（上游是否可用取决于账号和额度）。
 - `quality`：可用 `standard`/`high`，分别对应 480p/720p；与 resolution 冲突会报错。
 - `aspect_ratio`：默认 `1:1`，支持 `16:9`、`9:16`、`4:3`、`3:4`、`3:2`、`2:3`。
-- `size`：可用对应比例的尺寸，例如 `1280x720`、`720x1280`；只转换比例，不保证输出像素。
+- `size`：可用任意有效的 `WIDTHxHEIGHT`，例如画布常见的 `854x480`。
+  明确传入 `aspect_ratio` 时以它为准；否则将尺寸映射到最接近的受支持比例。
+  `size` 只参与比例转换，不保证输出像素。
 - 图片：上传单个 `input_reference` 或 `image` 文件，或 JSON 中传图片 Data URL。
   支持 PNG/JPEG/WebP，最大 20 MiB；不支持远程图片 URL、多图、视频延长和 remix。
 

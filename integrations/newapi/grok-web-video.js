@@ -15,7 +15,7 @@ export const meta = {
   key: "grok_web_video",
   name: "Grok Web Video",
   icon: "text:GW",
-  version: "1.0.0",
+  version: "1.0.1",
   author: {name: "Rainflow"},
   description: {
     en: "Grok Web text-to-video and image-to-video",
@@ -35,6 +35,16 @@ const IMAGE_FIELDS = ["image", "input_reference", "image_reference"];
 const MAX_IMAGE = 20 * 1024 * 1024;
 function text(value) { return typeof value === "string" ? value.trim() : ""; }
 function object(value) { return !!value && typeof value === "object" && !Array.isArray(value); }
+function nearestRatio(width, height) {
+  const value = width / height;
+  let best = RATIOS[0], distance = Infinity;
+  for (const candidate of RATIOS) {
+    const parts = candidate.split(":");
+    const current = Math.abs(Math.log(value / (Number(parts[0]) / Number(parts[1]))));
+    if (current < distance) { best = candidate; distance = current; }
+  }
+  return best;
+}
 function base(ctx) {
   const value = text(ctx.baseUrl).replace(/\/+$/, "").replace(/\/v1$/, "");
   if (!/^https?:\/\/[^\s/?#@]+(?::\d+)?$/.test(value)) throw new Error("Channel Base URL must be the Grok gateway origin without a path");
@@ -75,22 +85,18 @@ function normalize(ctx) {
   resolution = resolution || qualityResolution;
   if (resolution !== "480p" && resolution !== "720p") throw new Error("resolution must be 480p or 720p");
   let ratio = text(req.aspect_ratio);
+  if (ratio && RATIOS.indexOf(ratio) < 0) throw new Error("Unsupported aspect_ratio");
   const size = text(req.size).toLowerCase();
   if (size) {
     const match = /^(\d{1,5})x(\d{1,5})$/.exec(size);
     if (!match || Number(match[1]) < 1 || Number(match[2]) < 1) throw new Error("size must be WIDTHxHEIGHT");
     const w = Number(match[1]), h = Number(match[2]);
-    let derived = "";
-    for (const candidate of RATIOS) {
-      const parts = candidate.split(":");
-      if (w * Number(parts[1]) === h * Number(parts[0])) derived = candidate;
-    }
-    if (!derived) throw new Error("size must use a supported aspect ratio; specify aspect_ratio instead");
-    if (ratio && ratio !== derived) throw new Error("size and aspect_ratio conflict");
-    ratio = derived;
+    // Canvas clients often send rounded dimensions (for example 854x480)
+    // alongside an explicit ratio. The explicit ratio is authoritative. If it
+    // is absent, map the dimensions to the nearest upstream-supported preset.
+    if (!ratio) ratio = nearestRatio(w, h);
   }
   ratio = ratio || "1:1";
-  if (RATIOS.indexOf(ratio) < 0) throw new Error("Unsupported aspect_ratio");
   const normalized = {prompt, duration: Math.min(seconds, 6), resolution, aspect_ratio: ratio};
   const supplied = IMAGE_FIELDS.filter(function (key) { return req[key] !== undefined; });
   const files = body.files || [];

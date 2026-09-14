@@ -26,6 +26,10 @@ test('default parameters and correct upstream path', () => {
 test('size chooses ratio, not quality; portrait and landscape', () => {
   assert.equal(decode({prompt: 'x', size: '1280x720'}).requestBody.aspect_ratio, '16:9');
   assert.equal(decode({prompt: 'x', size: '720x1280'}).requestBody.aspect_ratio, '9:16');
+  assert.equal(decode({prompt: 'x', size: '854x480'}).requestBody.aspect_ratio, '16:9');
+  assert.equal(decode({prompt: 'x', size: '1280x768'}).requestBody.aspect_ratio, '16:9');
+  assert.equal(decode({prompt: 'x', size: '853x480', aspect_ratio: '16:9'}).requestBody.aspect_ratio, '16:9');
+  assert.equal(decode({prompt: 'x', size: '720x1280', aspect_ratio: '16:9'}).requestBody.aspect_ratio, '16:9');
   assert.equal(decode({prompt: 'x', size: '1280x720'}).requestBody.resolution, '480p');
   assert.equal(decode({prompt: 'x', seconds: 12}).requestBody.duration, 6);
   assert.equal(decode({prompt: 'x', quality: 'high'}).requestBody.resolution, '720p');
@@ -43,7 +47,7 @@ test('multipart uses the host-owned upload reference', () => {
   assert.deepEqual(intent.requestBody.image, {__fileRef: 'request_file:input_reference', encoding: 'dataUrl', maxBytes: 20971520});
 });
 test('invalid parameters and conflicting inputs are rejected', () => {
-  for (const extra of [{seconds: 0}, {seconds: 1.5}, {seconds: 16}, {seconds: 6, duration: 4}, {resolution: '1080p'}, {resolution: '480p', quality: 'high'}, {aspect_ratio: 'auto'}, {size: '720x1280', aspect_ratio: '16:9'}, {image: 'x', input_reference: 'y'}, {image_url: 'x'}, {images: []}]) assert.throws(() => decode({prompt: 'x', ...extra}));
+  for (const extra of [{seconds: 0}, {seconds: 1.5}, {seconds: 16}, {seconds: 6, duration: 4}, {resolution: '1080p'}, {resolution: '480p', quality: 'high'}, {aspect_ratio: 'auto'}, {size: 'landscape'}, {size: '0x720'}, {image: 'x', input_reference: 'y'}, {image_url: 'x'}, {images: []}]) assert.throws(() => decode({prompt: 'x', ...extra}));
 });
 test('synchronous success is persisted as terminal; no re-submission polling', () => {
   const ctx = context(decode({prompt: 'x'}));
