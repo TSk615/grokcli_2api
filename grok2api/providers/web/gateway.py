@@ -350,12 +350,19 @@ class GrokWebGateway:
             extra={
                 "Accept": accept,
                 "Referer": referer,
+                "x-xai-request-id": str(uuid.uuid4()),
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
             },
         )
-        try:
+        from .statsig import generate
+
+        signature = generate(path)
+        if not signature:
             signature = await self._statsig._optional_signed_statsig(credential, path)
-        except Exception:
-            signature = ""
         if signature:
             headers["x-statsig-id"] = signature
         return headers

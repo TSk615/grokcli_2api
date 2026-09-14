@@ -2,7 +2,7 @@ import json
 import unittest
 from email import policy
 from email.parser import BytesParser
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
@@ -13,6 +13,11 @@ from grok2api.providers.web.gateway import (
 
 
 class WebImageEditTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        signer = patch('grok2api.providers.web.statsig.generate', return_value=None)
+        signer.start()
+        self.addCleanup(signer.stop)
+
     async def test_upload_bytes_and_final_image(self):
         calls = []
 

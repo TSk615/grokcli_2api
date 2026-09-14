@@ -20,7 +20,7 @@ class WebProviderContractTests(unittest.TestCase):
 
     def test_routes_are_shared_types_and_registry_resolves_web_prefix(self) -> None:
         routes = list(self.adapter.model_routes())
-        self.assertEqual(len(routes), 7)
+        self.assertEqual(len(routes), 9)
         self.assertTrue(all(isinstance(route, ModelRoute) for route in routes))
         self.assertTrue(all(route.provider is ProviderName.WEB for route in routes))
         self.assertEqual(

@@ -15,9 +15,10 @@ class WebModelsAndErrorsTests(unittest.TestCase):
             [
                 "grok-chat-fast", "grok-chat-auto", "grok-imagine-image-lite",
                 "grok-imagine-image", "grok-imagine-image-2.0",
+                "grok-imagine-image-edit", "grok-imagine-video",
             ],
         )
-        self.assertEqual(len(heavy), 7)
+        self.assertEqual(len(heavy), 9)
         self.assertIn(WebCapability.STREAMING.value, heavy[0]["capabilities"])
         self.assertTrue(all(item["provider"] == "grok_web" for item in heavy))
 
