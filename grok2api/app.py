@@ -18,6 +18,7 @@ Endpoints:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -26,7 +27,7 @@ import uuid
 from collections import OrderedDict
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, AsyncIterator, Literal
+from typing import Any, AsyncIterator, Literal, Mapping
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -4459,13 +4460,19 @@ async def _web_image_generations(
     store = ImageMediaStore()
     body = req.model_dump(exclude_none=True)
     body["model"] = route.public_model
-    last_error: Exception | None = None
     try:
         max_attempts = int(os.getenv("GROK2API_WEB_IMAGE_MAX_ATTEMPTS", "3") or 3)
     except ValueError:
         max_attempts = 3
     max_attempts = max(1, min(10, max_attempts))
-    attempts = accounts[:max_attempts]
+    slot_count = req.n
+    image_request_id = uuid.uuid4().hex[:16]
+    total_attempts = 0
+    used_accounts: set[str] = set()
+
+    def _account_fingerprint(account: Any) -> str:
+        raw = str(getattr(account, "account_id", "") or "").encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()[:12] if raw else "unknown"
 
     async def _gateway_for(account):
         from grok2api.upstream.proxy_pool import pick_proxy_for_account
@@ -4511,41 +4518,99 @@ async def _web_image_generations(
                 _web_gateways.popitem(last=False)
         return gateway
 
-    for attempt_index, account in enumerate(attempts, 1):
-        try:
-            gateway = await _gateway_for(account)
-            images = await gateway.generate_image(body, account.credential)
-            data: list[dict[str, Any]] = []
-            for image in images[: req.n]:
-                raw, content_type = await gateway.download_image(image, account.credential)
+    async def _generate_slot(slot_index: int) -> dict[str, Any]:
+        nonlocal total_attempts
+
+        # Interleave accounts by slot so every slot gets a distinct account on
+        # every round: slot 0 uses 0/n/2n, slot 1 uses 1/n+1/2n+1, etc.
+        slot_accounts = accounts[
+            slot_index : slot_index + (slot_count * max_attempts) : slot_count
+        ]
+        if not slot_accounts:
+            raise RuntimeError("not enough Grok Web accounts for image slots")
+
+        slot_body = dict(body)
+        slot_body["n"] = 1
+        last_error: Exception | None = None
+        for attempt_index, account in enumerate(slot_accounts, 1):
+            account_fingerprint = _account_fingerprint(account)
+            total_attempts += 1
+            used_accounts.add(account_fingerprint)
+            _logger.warning(
+                "web_image_attempt_start request_id=%s slot=%d/%d attempt=%d/%d "
+                "account=%s model=%s n=1",
+                image_request_id,
+                slot_index + 1,
+                slot_count,
+                attempt_index,
+                len(slot_accounts),
+                account_fingerprint,
+                route.public_model,
+            )
+            try:
+                gateway = await _gateway_for(account)
+                images = await gateway.generate_image(slot_body, account.credential)
+                if not images:
+                    raise RuntimeError("Grok Web returned no image")
+                raw, content_type = await gateway.download_image(
+                    images[0], account.credential
+                )
                 try:
                     stored = store.store(raw, declared_content_type=content_type)
                 except ImageMediaError as exc:
                     raise RuntimeError("generated image failed media validation") from exc
-                data.append(
-                    stored.as_openai(
-                        req.response_format,
-                        base_url=_request_public_origin(request),
-                    )
+                data = stored.as_openai(
+                    req.response_format,
+                    base_url=_request_public_origin(request),
                 )
-            if len(data) != req.n:
-                raise RuntimeError("Grok Web returned incomplete images")
-            return JSONResponse(
-                {"created": int(time.time()), "data": data},
-                headers={
-                    "X-Grok2API-Provider": ProviderName.WEB.value,
-                    "X-Grok2API-Accounts": str(len(attempts)),
-                },
-            )
-        except Exception as exc:  # account-scoped failover, sanitized below
-            last_error = exc
-            continue
-    del last_error
-    return openai_error(
-        "Grok Web image generation failed",
-        status=502,
-        err_type="upstream_error",
-        code="image_generation_failed",
+                _logger.warning(
+                    "web_image_attempt_succeeded request_id=%s slot=%d/%d "
+                    "attempt=%d/%d account=%s images=1",
+                    image_request_id,
+                    slot_index + 1,
+                    slot_count,
+                    attempt_index,
+                    len(slot_accounts),
+                    account_fingerprint,
+                )
+                return data
+            except Exception as exc:  # account-scoped failover, sanitized below
+                _logger.warning(
+                    "web_image_attempt_failed request_id=%s slot=%d/%d "
+                    "attempt=%d/%d account=%s error=%s",
+                    image_request_id,
+                    slot_index + 1,
+                    slot_count,
+                    attempt_index,
+                    len(slot_accounts),
+                    account_fingerprint,
+                    type(exc).__name__,
+                )
+                last_error = exc
+
+        raise RuntimeError("Grok Web image slot failed") from last_error
+
+    results = await asyncio.gather(
+        *(_generate_slot(slot_index) for slot_index in range(slot_count)),
+        return_exceptions=True,
+    )
+    successful_results = [
+        result for result in results if not isinstance(result, BaseException)
+    ]
+    if not successful_results:
+        return openai_error(
+            "Grok Web image generation failed",
+            status=502,
+            err_type="upstream_error",
+            code="image_generation_failed",
+        )
+    return JSONResponse(
+        {"created": int(time.time()), "data": successful_results},
+        headers={
+            "X-Grok2API-Provider": ProviderName.WEB.value,
+            "X-Grok2API-Accounts": str(len(used_accounts)),
+            "X-Grok2API-Attempts": str(total_attempts),
+        },
     )
 
 
@@ -4645,6 +4710,131 @@ async def _console_image_generations(req: Any, request: Request) -> Response:
         return openai_error("Console image quota or rate limit reached", status=429, err_type="rate_limit_error", code="console_image_quota_or_rate_limit")
     dominant = max(failures, key=failures.get) if failures else "unknown"
     return openai_error(f"Grok Console image generation failed ({dominant})", status=502, err_type="upstream_error", code=f"console_image_{dominant}")
+
+
+async def _web_image_edits(payload: Mapping[str, Any], request: Request) -> Response:
+    """Run Web image-to-image editing using the current upload + REST flow."""
+    from grok2api.media import ImageMediaError, ImageMediaStore
+    from grok2api.providers import create_provider_registry
+    from grok2api.providers.accounts import acquire_provider_sequence
+    from grok2api.providers.types import Capability, ProviderName
+    from grok2api.providers.web import GrokWebGateway
+
+    model = str(payload.get("model") or "Web/grok-imagine-image-edit")
+    route = create_provider_registry().resolve(model, capability=Capability.IMAGE_EDIT, provider=ProviderName.WEB)
+    accounts = await asyncio.to_thread(acquire_provider_sequence, ProviderName.WEB, minimum_tier=route.minimum_tier)
+    image_bytes = payload.get("image_bytes")
+    if not isinstance(image_bytes, bytes) or not image_bytes:
+        return openai_error("image is required", status=400, err_type="invalid_request_error")
+    store = ImageMediaStore()
+    for account in accounts[: max(1, min(5, int(os.getenv("GROK2API_WEB_IMAGE_MAX_ATTEMPTS", "3") or 3)))]:
+        try:
+            gateway = await _web_gateway_for_account(account)
+            images = await gateway.edit_image(
+                {**dict(payload), "model": route.public_model, "n": 1},
+                account.credential,
+                image_bytes=image_bytes,
+                filename=str(payload.get("filename") or "input.png"),
+                content_type=str(payload.get("content_type") or "image/png"),
+            )
+            result: list[dict[str, Any]] = []
+            for image in images[:1]:
+                raw, content_type = await gateway.download_image(image, account.credential)
+                try:
+                    stored = store.store(raw, declared_content_type=content_type)
+                except ImageMediaError:
+                    raise RuntimeError("generated image failed media validation")
+                result.append(stored.as_openai(str(payload.get("response_format") or "url"), base_url=_request_public_origin(request)))
+            if result:
+                return JSONResponse({"created": int(time.time()), "data": result}, headers={"X-Grok2API-Provider": ProviderName.WEB.value})
+        except Exception as exc:
+            account_fingerprint = hashlib.sha256(
+                str(account.account_id).encode("utf-8")
+            ).hexdigest()[:12]
+            _logger.warning(
+                "web_image_edit_attempt_failed account=%s error=%s",
+                account_fingerprint,
+                type(exc).__name__,
+            )
+            continue
+    return openai_error("Grok Web image edit failed", status=502, err_type="upstream_error", code="image_edit_failed")
+
+
+async def _web_gateway_for_account(account: Any):
+    from grok2api.providers.types import ProviderName
+    from grok2api.providers.web import GrokWebGateway
+    from grok2api.upstream.proxy_pool import pick_proxy_for_account
+    from grok2api.upstream.resin_proxy import resin_binding_for_account
+
+    egress_key = str(getattr(account, "egress_identity", "") or "").strip() or account.account_id
+    binding = resin_binding_for_account(ProviderName.WEB.value, account.account_id, egress_identity=egress_key)
+    proxy_url = binding.gateway_url if binding is not None else await asyncio.to_thread(pick_proxy_for_account, egress_key)
+    client = await _get_provider_http_client(
+        ProviderName.WEB.value,
+        account.account_id,
+        proxy=proxy_url,
+        proxy_auth=binding.proxy_auth if binding is not None else None,
+        proxy_identity=binding.cache_key if binding is not None else None,
+        resin_account=binding.account if binding is not None else None,
+    )
+    key = id(client)
+    gateway = _web_gateways.get(key)
+    if gateway is None:
+        gateway = GrokWebGateway(client, base_url=_config.WEB_PROVIDER_BASE_URL, proxy=proxy_url, connector=getattr(client, "websocket_connector", None))
+        _web_gateways[key] = gateway
+        while len(_web_gateways) > 4:
+            _web_gateways.popitem(last=False)
+    return gateway
+
+
+async def _web_video_generations(payload: Mapping[str, Any], request: Request) -> Response:
+    from grok2api.media.video_store import VideoMediaStore
+    from grok2api.providers import create_provider_registry
+    from grok2api.providers.accounts import acquire_provider_sequence
+    from grok2api.providers.types import Capability, ProviderName
+
+    route = create_provider_registry().resolve(str(payload.get("model") or "Web/grok-imagine-video"), capability=Capability.VIDEO, provider=ProviderName.WEB)
+    accounts = await asyncio.to_thread(acquire_provider_sequence, ProviderName.WEB, minimum_tier=route.minimum_tier)
+    try:
+        requested_duration = int(payload.get("duration") or 6)
+    except (TypeError, ValueError):
+        return openai_error("duration must be an integer", status=400, err_type="invalid_request_error")
+    if requested_duration < 1 or requested_duration > 15:
+        return openai_error("duration must be between 1 and 15 seconds", status=400, err_type="invalid_request_error")
+    resolution = str(payload.get("resolution") or "").strip().lower()
+    if resolution not in {"", "480p", "720p"}:
+        return openai_error("resolution must be 480p or 720p", status=400, err_type="invalid_request_error")
+    if resolution == "480p" and accounts and all(str(getattr(a, "web_tier", "basic") or "basic").lower() == "basic" for a in accounts):
+        return openai_error("Web Basic accounts support 720p only; 480p requires Super", status=400, err_type="invalid_request_error")
+    for account in accounts[: max(1, min(5, int(os.getenv("GROK2API_WEB_IMAGE_MAX_ATTEMPTS", "3") or 3)))]:
+        try:
+            tier = str(getattr(account, "web_tier", "basic") or "basic").lower()
+            # The Web upstream exposes 720p to Basic/free accounts; 480p is
+            # reserved for Super-tier accounts.  Keep the API selectable but
+            # fail clearly instead of making an upstream request that is
+            # guaranteed to be rejected.
+            if not resolution:
+                resolution = "720p"
+            if tier == "basic" and resolution == "480p":
+                raise ValueError("Web Basic accounts support 720p only")
+            duration = min(requested_duration, 6) if tier == "basic" else requested_duration
+            gateway = await _web_gateway_for_account(account)
+            asset_url = await gateway.generate_video({**dict(payload), "model": route.public_model, "duration": duration, "resolution": resolution}, account.credential)
+            raw, content_type = await gateway.download_video(asset_url, account.credential)
+            filename, size = VideoMediaStore().store(raw, content_type=content_type)
+            public_url = f"{_request_public_origin(request)}/v1/media/videos/{filename}"
+            return JSONResponse({"id": uuid.uuid4().hex, "object": "video", "status": "completed", "model": route.qualified_model, "url": public_url, "bytes": size, "content_type": content_type}, headers={"X-Grok2API-Provider": ProviderName.WEB.value, "X-Grok2API-Resolution": resolution, "X-Grok2API-Duration": str(duration)})
+        except Exception as exc:
+            account_fingerprint = hashlib.sha256(
+                str(account.account_id).encode("utf-8")
+            ).hexdigest()[:12]
+            _logger.warning(
+                "web_video_attempt_failed account=%s error=%s",
+                account_fingerprint,
+                type(exc).__name__,
+            )
+            continue
+    return openai_error("Grok Web video generation failed", status=502, err_type="upstream_error", code="web_video_generation_failed")
 
 
 async def _console_video_generations(payload: dict[str, Any], request: Request) -> Response:
@@ -4950,7 +5140,60 @@ async def image_generations(
             status=502,
             err_type="upstream_error",
             code="image_generation_failed",
-        )
+    )
+
+
+@app.post("/v1/images/edits")
+@app.post("/images/edits")
+async def image_edits(
+    request: Request,
+    api_key: apikeys.ApiKeyRecord | None = Depends(require_api_key),
+):
+    del api_key
+    if not _config.WEB_PROVIDER_ENABLED or not getattr(_config, "WEB_IMAGES_ENABLED", False):
+        return openai_error("Grok Web image editing is disabled", status=400, err_type="invalid_request_error", code="web_images_disabled")
+    content_type = str(request.headers.get("content-type") or "").lower()
+    payload: dict[str, Any] = {}
+    if "multipart/form-data" in content_type:
+        try:
+            form = await request.form()
+        except Exception:
+            return openai_error("invalid multipart image edit request", status=400, err_type="invalid_request_error")
+        payload["model"] = str(form.get("model") or "Web/grok-imagine-image-edit")
+        payload["prompt"] = str(form.get("prompt") or "")
+        payload["response_format"] = str(form.get("response_format") or "url")
+        payload["aspect_ratio"] = str(form.get("aspect_ratio") or "")
+        payload["n"] = int(form.get("n") or 1)
+        upload = form.get("image")
+        if upload is None:
+            uploads = form.getlist("image") if hasattr(form, "getlist") else []
+            upload = uploads[0] if uploads else None
+        if upload is None or not hasattr(upload, "read"):
+            return openai_error("image is required", status=400, err_type="invalid_request_error")
+        payload["image_bytes"] = await upload.read()
+        payload["filename"] = getattr(upload, "filename", "input.png")
+        payload["content_type"] = getattr(upload, "content_type", "image/png")
+    else:
+        try:
+            body = await request.json()
+        except Exception:
+            return openai_error("request body must be valid JSON or multipart/form-data", status=400, err_type="invalid_request_error")
+        payload.update(body if isinstance(body, dict) else {})
+        raw_image = payload.get("image")
+        if isinstance(raw_image, dict):
+            raw_image = raw_image.get("url")
+        if isinstance(raw_image, str) and raw_image.startswith("data:") and ";base64," in raw_image:
+            import base64
+            payload["image_bytes"] = base64.b64decode(raw_image.split(",", 1)[1], validate=False)
+            payload["content_type"] = raw_image.split(";", 1)[0][5:] or "image/png"
+        else:
+            return openai_error("JSON image edits require a data URL; multipart image upload is recommended", status=400, err_type="invalid_request_error")
+    try:
+        return await _web_image_edits(payload, request)
+    except (ValueError, LookupError) as exc:
+        return openai_error(str(exc), status=400, err_type="invalid_request_error")
+    except Exception:
+        return openai_error("Grok Web image edit failed", status=502, err_type="upstream_error", code="image_edit_failed")
 
 
 @app.post("/v1/videos/generations")
@@ -4969,8 +5212,17 @@ async def video_generations(
     if not isinstance(payload, dict):
         return openai_error("request body must be a JSON object", status=400, err_type="invalid_request_error")
     model = str(payload.get("model") or "")
+    if model.lower().startswith("web/"):
+        if not _config.WEB_PROVIDER_ENABLED:
+            return openai_error("grok_web provider is disabled", status=400, err_type="invalid_request_error")
+        try:
+            return await _web_video_generations(payload, request)
+        except (ValueError, LookupError) as exc:
+            return openai_error(str(exc), status=400, err_type="invalid_request_error")
+        except Exception:
+            return openai_error("Grok Web video generation failed", status=502, err_type="upstream_error")
     if not model.lower().startswith("console/"):
-        return openai_error("video generation requires a Console/ model", status=400, err_type="invalid_request_error")
+        return openai_error("video generation requires a Web/ or Console/ model", status=400, err_type="invalid_request_error")
     return await _console_video_generations(payload, request)
 
 

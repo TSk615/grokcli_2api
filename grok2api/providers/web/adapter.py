@@ -51,7 +51,15 @@ class GrokWebAdapter:
                 public_model=model.id,
                 provider=self.provider,
                 upstream_model=model.upstream_mode,
-                capability=(Capability.IMAGE if model.supports("image") else Capability.CHAT),
+                capability=(
+                    Capability.IMAGE_EDIT
+                    if model.supports("image_edit")
+                    else Capability.VIDEO
+                    if model.supports("video")
+                    else Capability.IMAGE
+                    if model.supports("image")
+                    else Capability.CHAT
+                ),
                 minimum_tier=model.minimum_tier.value,
                 metadata={
                     "description": model.description,

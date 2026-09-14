@@ -14,6 +14,33 @@ from .auth import ConsoleCredential
 from .client import ConsoleDPoPClient
 from .errors import ConsoleTokenError
 from .headers import DEFAULT_USER_AGENT
+from .models import DEFAULT_WEB_SEARCH_MODELS
+
+
+def _with_default_web_search(body: Mapping[str, Any], upstream_model: str) -> dict[str, Any]:
+    """Copy a Responses payload and enable web search for opted-in models."""
+
+    payload = dict(body)
+    payload["model"] = upstream_model
+    if upstream_model.strip().lower() not in DEFAULT_WEB_SEARCH_MODELS:
+        return payload
+
+    tools = payload.get("tools")
+    if tools is None:
+        payload["tools"] = [{"type": "web_search"}]
+        return payload
+    if not isinstance(tools, list):
+        # Preserve malformed caller input so the upstream API can report the
+        # normal validation error instead of silently changing its meaning.
+        return payload
+    if any(
+        isinstance(tool, Mapping)
+        and str(tool.get("type") or "").strip().lower() == "web_search"
+        for tool in tools
+    ):
+        return payload
+    payload["tools"] = [*tools, {"type": "web_search"}]
+    return payload
 
 
 class ConsoleResponsesError(RuntimeError):
@@ -58,10 +85,9 @@ class ConsoleResponsesTransport:
         if not isinstance(body, Mapping):
             raise ConsoleResponsesError("OpenAI Responses body must be an object")
 
-        payload = dict(body)
         # The selected route is authoritative. In particular, never allow the
         # client's model field to cross provider/model boundaries.
-        payload["model"] = route.upstream_model
+        payload = _with_default_web_search(body, route.upstream_model)
         failed = False
         try:
             response = await self._client.request_stream(

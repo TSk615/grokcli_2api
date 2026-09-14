@@ -10,7 +10,11 @@ import httpx
 from grok2api.providers.console.auth import ConsoleCredential
 from grok2api.providers.console.client import ConsoleDPoPClient
 from grok2api.providers.console.dpop import jwk_thumbprint
-from grok2api.providers.console.responses import ConsoleResponsesError, ConsoleResponsesTransport
+from grok2api.providers.console.responses import (
+    ConsoleResponsesError,
+    ConsoleResponsesTransport,
+    _with_default_web_search,
+)
 from grok2api.providers.types import Capability, ModelRoute, ProviderName
 
 
@@ -68,6 +72,34 @@ class ConsoleResponsesTransportTests(unittest.IsolatedAsyncioTestCase):
                 "expires_in": 600,
             },
         )
+
+    def test_default_web_search_policy_targets_only_grok_420_variants(self) -> None:
+        models = (
+            "grok-4.20-0309-reasoning",
+            "grok-4.20-0309-non-reasoning",
+            "grok-4.20-multi-agent-0309",
+        )
+        for model in models:
+            with self.subTest(model=model):
+                original = {"input": "latest news"}
+                payload = _with_default_web_search(original, model)
+                self.assertEqual(payload["tools"], [{"type": "web_search"}])
+                self.assertNotIn("tools", original)
+
+        unaffected = _with_default_web_search({"input": "hello"}, "grok-4.5")
+        self.assertNotIn("tools", unaffected)
+
+    def test_default_web_search_preserves_tools_and_avoids_duplicates(self) -> None:
+        model = "grok-4.20-0309-reasoning"
+        function_tool = {"type": "function", "name": "lookup"}
+        original = {"tools": [function_tool]}
+        payload = _with_default_web_search(original, model)
+        self.assertEqual(payload["tools"], [function_tool, {"type": "web_search"}])
+        self.assertEqual(original["tools"], [function_tool])
+
+        existing = {"tools": [{"type": "WEB_SEARCH", "filters": {"allowed_domains": ["x.ai"]}}]}
+        payload = _with_default_web_search(existing, model)
+        self.assertEqual(payload["tools"], existing["tools"])
 
     async def test_overrides_model_preserves_stream_and_returns_unconsumed_response(self) -> None:
         final_stream = TrackingStream(b'data: {"type":"response.completed"}\n\n')

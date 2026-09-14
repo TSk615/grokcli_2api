@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import uuid
 
 from grok2api.upstream.browser_transport import DEFAULT_BROWSER_USER_AGENT
 
@@ -31,13 +32,21 @@ def build_web_headers(
     if any(char in user_agent for char in ("\r", "\n", "\x00")):
         raise ValueError("user_agent contains unsafe characters")
     headers = {
-        "Accept": "application/json, text/event-stream",
-        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "*/*",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         "Content-Type": "application/json",
         "Origin": "https://grok.com",
         "Referer": "https://grok.com/",
         "User-Agent": user_agent,
         "Cookie": build_cookie_header(credential),
+        "x-xai-request-id": str(uuid.uuid4()),
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Priority": "u=1, i",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
     }
     for name, value in (extra or {}).items():
         if name.lower() in _PROTECTED_HEADERS:

@@ -74,6 +74,18 @@ CATALOG: tuple[ModelSpec, ...] = (
     ModelSpec("grok-stt", "grok-stt", (STT,)),
 )
 
+# These agentic Grok 4.20 variants should have access to current web data when
+# they are used through the Console Responses transport.  The transport uses
+# this catalog-level policy to add xAI's server-side ``web_search`` tool unless
+# the caller already supplied it.
+DEFAULT_WEB_SEARCH_MODELS = frozenset(
+    {
+        "grok-4.20-0309-reasoning",
+        "grok-4.20-0309-non-reasoning",
+        "grok-4.20-multi-agent-0309",
+    }
+)
+
 _BY_UPSTREAM = {item.upstream_model: item for item in CATALOG}
 
 

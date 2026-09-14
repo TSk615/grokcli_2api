@@ -76,6 +76,60 @@ WebSocketConnector = Callable[
 ]
 
 
+def _extract_media_urls(raw: bytes, *, media: str) -> list[str]:
+    """Extract final image/video URLs from JSON or SSE media responses."""
+
+    values: list[str] = []
+    decoder = json.JSONDecoder()
+    text = raw.decode("utf-8", errors="replace")
+    candidates: list[Any] = []
+    for line in text.splitlines():
+        value = line.strip()
+        if value.startswith("data:"):
+            value = value[5:].strip()
+        if value and value != "[DONE]" and value.startswith("{"):
+            try:
+                candidates.append(json.loads(value))
+            except ValueError:
+                pass
+    if not candidates:
+        pos = 0
+        while pos < len(text):
+            start = text.find("{", pos)
+            if start < 0:
+                break
+            try:
+                value, end = decoder.raw_decode(text[start:])
+            except ValueError:
+                pos = start + 1
+                continue
+            candidates.append(value)
+            pos = start + end
+
+    wanted = ("videoUrl", "contentUrl", "contentURL", "assetUrl", "assetURL", "fileUrl", "fileUri", "fileURL", "url") if media == "video" else ("imageUrl", "generatedImageUrl", "url")
+
+    def walk(value: Any) -> None:
+        if isinstance(value, Mapping):
+            moderated = value.get("moderated") is True
+            for key in wanted:
+                item = value.get(key)
+                if isinstance(item, str) and item.strip() and not moderated:
+                    candidate = item.strip()
+                    if not candidate.startswith(("http://", "https://")):
+                        candidate = "https://assets.grok.com/" + candidate.lstrip("/")
+                    if candidate not in values:
+                        values.append(candidate)
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    for candidate in candidates:
+        walk(candidate)
+    return values
+
+
 async def _default_websocket_connector(
     url: str,
     headers: Mapping[str, str],
@@ -524,6 +578,130 @@ class GrokWebGateway:
             with suppress(Exception):
                 await connection.close()
 
+    async def edit_image(
+        self,
+        request: Mapping[str, Any],
+        credential: WebCredential,
+        *,
+        image_bytes: bytes,
+        filename: str = "input.png",
+        content_type: str = "image/png",
+    ) -> list[GeneratedImage]:
+        """Edit an uploaded image through Grok Web's current REST media flow."""
+
+        prompt = str(request.get("prompt") or "").strip()
+        if not prompt:
+            raise WebImageProtocolError("prompt must be a non-empty string")
+        if not image_bytes:
+            raise WebImageProtocolError("image must not be empty")
+        headers = build_web_headers(
+            credential,
+            user_agent=self.user_agent,
+            extra={"Accept": "application/json", "Referer": f"{self.origin}/imagine"},
+        )
+        headers.pop("Content-Type", None)
+        response = await self._client.post(
+            f"{self.origin}/http/upload-file-v2/direct",
+            headers=headers,
+            files={
+                "file": (filename or "input.png", image_bytes, content_type or "image/png"),
+                "file_source": (None, "IMAGINE_SELF_UPLOAD_FILE_SOURCE"),
+            },
+            timeout=60,
+        )
+        try:
+            upload_raw = await response.aread()
+            upload_status = response.status_code
+        finally:
+            await response.aclose()
+        if upload_status < 200 or upload_status >= 300:
+            raise WebGatewayError("Grok Web image upload failed")
+        try:
+            uploaded = json.loads(upload_raw)
+        except (ValueError, TypeError):
+            raise WebGatewayError("Grok Web image upload response is invalid") from None
+        metadata = uploaded.get("fileMetadata") if isinstance(uploaded, Mapping) else {}
+        asset_id = str((metadata or {}).get("fileMetadataId") or (metadata or {}).get("fileId") or uploaded.get("uploadId") or "").strip()
+        if not asset_id:
+            raise WebGatewayError("Grok Web image upload returned no asset")
+        payload = {
+            "modelName": "imagine-image-edit",
+            "message": prompt,
+            "enableImageStreaming": True,
+            "enableSideBySide": True,
+            "sendFinalMetadata": True,
+            "mediaGenInput": {"imageToImage": {"prompt": prompt, "inputAssets": [asset_id]}},
+        }
+        ratio = str(request.get("aspect_ratio") or "").strip()
+        if ratio:
+            payload["mediaGenInput"]["imageToImage"]["aspectRatio"] = ratio
+        response = await self._client.post(
+            f"{self.origin}/rest/app-chat/conversations/new",
+            headers=build_web_headers(
+                credential,
+                user_agent=self.user_agent,
+                extra={"Accept": "text/event-stream, application/json", "Referer": f"{self.origin}/imagine"},
+            ),
+            json=payload,
+            timeout=self.total_timeout,
+        )
+        try:
+            raw = await response.aread()
+            status = response.status_code
+        finally:
+            await response.aclose()
+        if status < 200 or status >= 300:
+            raise WebGatewayError("Grok Web image edit failed")
+        urls = _extract_media_urls(raw, media="image")
+        if not urls:
+            raise WebGatewayError("Grok Web image edit returned no image")
+        return [GeneratedImage(url=url) for url in urls[: int(request.get("n") or 1)]]
+
+    async def generate_video(
+        self,
+        request: Mapping[str, Any],
+        credential: WebCredential,
+    ) -> str:
+        """Create a Web text-to-video job and return its authenticated asset URL."""
+
+        prompt = str(request.get("prompt") or "").strip()
+        if not prompt:
+            raise WebGatewayError("video prompt must be non-empty")
+        duration = int(request.get("duration") or 6)
+        resolution = str(request.get("resolution") or "480p").strip().lower()
+        ratio = str(request.get("aspect_ratio") or "1:1").strip()
+        payload = {
+            "modelName": "imagine-video-gen",
+            "message": prompt + " --mode=custom",
+            "enableImageStreaming": True,
+            "enableSideBySide": True,
+            "sendFinalMetadata": True,
+            "responseMetadata": {"experiments": [], "modelConfigOverride": {"modelMap": {}}},
+            "mediaGenInput": {"textToVideo": {"prompt": prompt, "aspectRatio": ratio, "duration": duration, "resolutionName": resolution}},
+            "kind": "CONVERSATION_KIND_IMAGINE",
+        }
+        response = await self._client.post(
+            f"{self.origin}/rest/app-chat/conversations/new",
+            headers=build_web_headers(
+                credential,
+                user_agent=self.user_agent,
+                extra={"Accept": "text/event-stream, application/json", "Referer": f"{self.origin}/imagine"},
+            ),
+            json=payload,
+            timeout=self.total_timeout,
+        )
+        try:
+            raw = await response.aread()
+            status = response.status_code
+        finally:
+            await response.aclose()
+        if status < 200 or status >= 300:
+            raise WebGatewayError(f"Grok Web video generation failed ({status})")
+        urls = _extract_media_urls(raw, media="video")
+        if not urls:
+            raise WebGatewayError("Grok Web video generation returned no asset")
+        return urls[0]
+
     async def download_image(
         self, image: GeneratedImage, credential: WebCredential
     ) -> tuple[bytes, str]:
@@ -555,6 +733,28 @@ class GrokWebGateway:
         content_type = str(response.headers.get("content-type", "image/jpeg")).split(";", 1)[0].strip().lower()
         if not content_type.startswith("image/"):
             content_type = "image/jpeg"
+        return body, content_type
+
+    async def download_video(self, url: str, credential: WebCredential) -> tuple[bytes, str]:
+        """Download a generated Web video through the same credential session."""
+        if not url or not trusted_asset_url(url):
+            raise WebGatewayError("video URL host is not trusted")
+        try:
+            response = await self._client.get(
+                url,
+                headers=build_web_headers(
+                    credential, user_agent=self.user_agent, extra={"Accept": "video/*, application/octet-stream"}
+                ),
+                timeout=self.total_timeout,
+            )
+            body = response.content
+            content_type = str(response.headers.get("content-type", "video/mp4")).split(";", 1)[0].strip().lower()
+        except Exception:
+            raise WebGatewayError("video download failed") from None
+        if response.status_code < 200 or response.status_code >= 300 or not body:
+            raise WebGatewayError("video download was rejected")
+        if not content_type.startswith("video/"):
+            content_type = "video/mp4"
         return body, content_type
 
     @staticmethod

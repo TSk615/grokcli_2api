@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -159,6 +161,168 @@ class AppImageGenerationTests(unittest.IsolatedAsyncioTestCase):
     async def test_web_gateway_success_returns_b64_json(self) -> None:
         body = await self._run_success("b64_json")
         self.assertEqual(body["data"][0]["b64_json"], base64.b64encode(PNG).decode("ascii"))
+
+    async def test_n_four_runs_four_distinct_accounts_in_parallel_with_upstream_n_one(self) -> None:
+        accounts = [
+            SimpleNamespace(
+                account_id=f"web-account-{index}",
+                credential=object(),
+                egress_identity=f"resin-edge-{index}",
+            )
+            for index in range(12)
+        ]
+        route = SimpleNamespace(public_model="grok-imagine-image", minimum_tier=None)
+        started: list[str] = []
+        release = asyncio.Event()
+
+        class _Gateway:
+            def __init__(self, account_id: str) -> None:
+                self.account_id = account_id
+
+            async def generate_image(self, body, credential):
+                self.body = body
+                started.append(self.account_id)
+                if len(started) == 4:
+                    release.set()
+                await asyncio.wait_for(release.wait(), timeout=1)
+                return [f"https://upstream.example/{self.account_id}.png"]
+
+            async def download_image(self, image, credential):
+                return PNG + self.account_id.encode(), "image/png"
+
+        async def _get_client(_provider, account_id, **_kwargs):
+            return SimpleNamespace(account_id=account_id)
+
+        with patch.object(app._config, "WEB_PROVIDER_ENABLED", True), patch.object(
+            app._config, "WEB_IMAGES_ENABLED", True
+        ), patch.object(app.apikeys, "auth_required", return_value=False), patch(
+            "grok2api.providers.create_provider_registry",
+            return_value=SimpleNamespace(resolve=lambda *_args, **_kwargs: route),
+        ), patch(
+            "grok2api.providers.accounts.acquire_provider_sequence",
+            return_value=accounts,
+        ), patch(
+            "grok2api.upstream.resin_proxy.resin_binding_for_account",
+            return_value=None,
+        ), patch(
+            "grok2api.upstream.proxy_pool.pick_proxy_for_account",
+            return_value=None,
+        ), patch.object(
+            app, "_get_provider_http_client", side_effect=_get_client
+        ), patch(
+            "grok2api.providers.web.GrokWebGateway",
+            side_effect=lambda client, **_kwargs: _Gateway(client.account_id),
+        ), patch(
+            "grok2api.media.image_store.DATA_DIR", Path(self.tempdir.name)
+        ), patch.dict(
+            os.environ, {"GROK2API_WEB_IMAGE_MAX_ATTEMPTS": "3"}
+        ):
+            async with self._client() as http_client:
+                response = await http_client.post(
+                    "/v1/images/generations",
+                    json={
+                        "model": "Web/grok-imagine-image",
+                        "prompt": "four parallel images",
+                        "n": 4,
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(len(response.json()["data"]), 4)
+        self.assertCountEqual(started, [f"web-account-{index}" for index in range(4)])
+        self.assertEqual(response.headers["x-grok2api-accounts"], "4")
+        self.assertEqual(response.headers["x-grok2api-attempts"], "4")
+        for gateway in app._web_gateways.values():
+            self.assertEqual(gateway.body["n"], 1)
+
+    async def test_n_four_all_failed_and_partial_success_behavior(self) -> None:
+        accounts = [
+            SimpleNamespace(
+                account_id=f"web-account-{index}",
+                credential=object(),
+                egress_identity=f"resin-edge-{index}",
+            )
+            for index in range(20)
+        ]
+        route = SimpleNamespace(public_model="grok-imagine-image", minimum_tier=None)
+        attempted: list[str] = []
+        succeed_accounts: set[str] = set()
+
+        class _Gateway:
+            def __init__(self, account_id: str) -> None:
+                self.account_id = account_id
+
+            async def generate_image(self, body, credential):
+                attempted.append(self.account_id)
+                if self.account_id not in succeed_accounts:
+                    raise RuntimeError("synthetic upstream failure")
+                return [f"https://upstream.example/{self.account_id}.png"]
+
+            async def download_image(self, image, credential):
+                return PNG + self.account_id.encode(), "image/png"
+
+        async def _get_client(_provider, account_id, **_kwargs):
+            return SimpleNamespace(account_id=account_id)
+
+        with patch.object(app._config, "WEB_PROVIDER_ENABLED", True), patch.object(
+            app._config, "WEB_IMAGES_ENABLED", True
+        ), patch.object(app.apikeys, "auth_required", return_value=False), patch(
+            "grok2api.providers.create_provider_registry",
+            return_value=SimpleNamespace(resolve=lambda *_args, **_kwargs: route),
+        ), patch(
+            "grok2api.providers.accounts.acquire_provider_sequence",
+            return_value=accounts,
+        ), patch(
+            "grok2api.upstream.resin_proxy.resin_binding_for_account",
+            return_value=None,
+        ), patch(
+            "grok2api.upstream.proxy_pool.pick_proxy_for_account",
+            return_value=None,
+        ), patch.object(
+            app, "_get_provider_http_client", side_effect=_get_client
+        ), patch(
+            "grok2api.providers.web.GrokWebGateway",
+            side_effect=lambda client, **_kwargs: _Gateway(client.account_id),
+        ), patch(
+            "grok2api.media.image_store.DATA_DIR", Path(self.tempdir.name)
+        ), patch.dict(
+            os.environ, {"GROK2API_WEB_IMAGE_MAX_ATTEMPTS": "3"}
+        ):
+            async with self._client() as http_client:
+                all_failed_response = await http_client.post(
+                    "/v1/images/generations",
+                    json={
+                        "model": "Web/grok-imagine-image",
+                        "prompt": "four failed images",
+                        "n": 4,
+                    },
+                )
+                all_failed_attempted = list(attempted)
+                attempted.clear()
+                app._web_gateways.clear()
+                succeed_accounts.add("web-account-11")
+                partial_response = await http_client.post(
+                    "/v1/images/generations",
+                    json={
+                        "model": "Web/grok-imagine-image",
+                        "prompt": "one successful image",
+                        "n": 4,
+                    },
+                )
+
+        self.assertEqual(all_failed_response.status_code, 502)
+        self.assertEqual(
+            all_failed_response.json()["error"]["code"], "image_generation_failed"
+        )
+        self.assertEqual(len(all_failed_attempted), 12)
+        self.assertEqual(
+            set(all_failed_attempted),
+            {f"web-account-{index}" for index in range(12)},
+        )
+        self.assertEqual(partial_response.status_code, 200, partial_response.content)
+        self.assertEqual(len(partial_response.json()["data"]), 1)
+        self.assertEqual(len(attempted), 12)
+        self.assertEqual(partial_response.headers["x-grok2api-attempts"], "12")
 
     async def test_media_get_and_path_traversal(self) -> None:
         from grok2api.media import ImageMediaStore

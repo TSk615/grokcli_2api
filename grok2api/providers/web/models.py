@@ -20,6 +20,8 @@ class WebCapability(str, Enum):
     CITATIONS = "citations"
     REASONING = "reasoning"
     IMAGE = "image"
+    IMAGE_EDIT = "image_edit"
+    VIDEO = "video"
 
 
 _TIER_RANK = {
@@ -130,6 +132,22 @@ WEB_MODELS: tuple[WebModel, ...] = (
         description="Grok Web Imagine 2.0 Pro image generation mode.",
         protocol_model="imagine",
         imagine_pro=True,
+    ),
+    WebModel(
+        id="grok-imagine-image-edit",
+        upstream_mode="imagine-image-edit",
+        minimum_tier=WebTier.BASIC,
+        capabilities=frozenset({WebCapability.IMAGE_EDIT}),
+        description="Grok Web image-to-image editing mode.",
+        protocol_model="imagine-image-edit",
+    ),
+    WebModel(
+        id="grok-imagine-video",
+        upstream_mode="grok-imagine-video",
+        minimum_tier=WebTier.BASIC,
+        capabilities=frozenset({WebCapability.VIDEO}),
+        description="Grok Web text-to-video mode.",
+        protocol_model="imagine-video-gen",
     ),
 )
 
