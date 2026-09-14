@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -21,6 +22,7 @@ import httpx
 from grok2api.upstream.browser_transport import is_cloudflare_challenge
 
 from .auth import WebCredential
+from .account_settings import WebAccountSettingsClient
 from .headers import DEFAULT_USER_AGENT, build_cookie_header, build_web_headers
 from .protocol import WebProtocolError, build_rest_chat_payload, convert_chat_completion
 from .image import (
@@ -53,6 +55,65 @@ SESSION_BODY_LIMIT = 64 << 10
 
 class WebGatewayError(RuntimeError):
     """A sanitized Gateway failure with no upstream body or auth context."""
+
+
+class WebImageEditError(WebGatewayError):
+    def __init__(self, stage: str, status: int | None = None):
+        self.stage = stage
+        self.status = status
+        logging.getLogger(__name__).warning("web_image_edit_failure stage=%s status=%s", stage, status)
+        super().__init__(f"Grok Web image edit failed: {stage} (HTTP {status})")
+
+
+def _extract_final_edit_urls(raw: bytes) -> list[str]:
+    """Ignore partial images and consume concatenated JSON or SSE frames."""
+    decoder = json.JSONDecoder()
+    text = raw.decode("utf-8", errors="replace")
+    pos = 0
+    urls: list[str] = []
+    while pos < len(text):
+        start = text.find("{", pos)
+        if start < 0:
+            break
+        try:
+            frame, end = decoder.raw_decode(text[start:])
+        except ValueError:
+            raise WebImageEditError("invalid_response") from None
+        pos = start + end
+        if not isinstance(frame, Mapping):
+            continue
+        result = frame.get("result", {})
+        if not isinstance(result, Mapping):
+            continue
+        result = result.get("response", result)
+        if not isinstance(result, Mapping):
+            continue
+        if frame.get("error") or result.get("error"):
+            raise WebImageEditError("upstream_error_event")
+        event = result.get("streamingImageGenerationResponse", {})
+        model = result.get("modelResponse", {})
+        if isinstance(event, Mapping) and event:
+            if event.get("moderated") is True:
+                raise WebImageEditError("moderated")
+            if event.get("progress") == 100 and not event.get("partial"):
+                candidates = [event.get("imageUrl")]
+            else:
+                candidates = []
+        else:
+            candidates = []
+        if isinstance(model, Mapping):
+            final_urls = model.get("generatedImageUrls")
+            if isinstance(final_urls, list):
+                candidates.extend(final_urls)
+        for candidate in candidates:
+            if not isinstance(candidate, str) or not candidate.strip():
+                continue
+            url = candidate.strip()
+            if not url.startswith(("https://", "http://")):
+                url = "https://assets.grok.com/" + url.lstrip("/")
+            if trusted_asset_url(url) and url not in urls:
+                urls.append(url)
+    return urls
 
 
 class WebGatewayAuthError(WebGatewayError):
@@ -267,6 +328,37 @@ class GrokWebGateway:
         self.heartbeat_interval = max(0.001, float(heartbeat_interval))
         self.max_frame_bytes = max(1024, int(max_frame_bytes))
         self.proxy = str(proxy or "").strip() or None
+        self._statsig = WebAccountSettingsClient(
+            client,
+            base_url=self.origin,
+            user_agent=self.user_agent,
+        )
+
+    async def _media_headers(
+        self,
+        credential: WebCredential,
+        *,
+        path: str,
+        referer: str,
+        accept: str,
+    ) -> dict[str, str]:
+        """Build browser media headers, including the optional Statsig proof."""
+
+        headers = build_web_headers(
+            credential,
+            user_agent=self.user_agent,
+            extra={
+                "Accept": accept,
+                "Referer": referer,
+            },
+        )
+        try:
+            signature = await self._statsig._optional_signed_statsig(credential, path)
+        except Exception:
+            signature = ""
+        if signature:
+            headers["x-statsig-id"] = signature
+        return headers
 
     async def _connect(self, endpoint: str, headers: Mapping[str, str]) -> WebSocketConnection:
         if self._connector is _default_websocket_connector:
@@ -594,19 +686,25 @@ class GrokWebGateway:
             raise WebImageProtocolError("prompt must be a non-empty string")
         if not image_bytes:
             raise WebImageProtocolError("image must not be empty")
-        headers = build_web_headers(
+        headers = await self._media_headers(
             credential,
-            user_agent=self.user_agent,
-            extra={"Accept": "application/json", "Referer": f"{self.origin}/imagine"},
+            path="/http/upload-file-v2/direct",
+            referer=f"{self.origin}/imagine",
+            accept="*/*",
         )
-        headers.pop("Content-Type", None)
+        # Encode with httpx, send raw bytes through the existing account-bound
+        # client. curl_cffi rejects the httpx-style files= argument.
+        upload_request = httpx.Request(
+            "POST", f"{self.origin}/http/upload-file-v2/direct",
+            files={"file": (filename or "input.png", image_bytes, content_type or "image/png")},
+            data={"file_source": "IMAGINE_SELF_UPLOAD_FILE_SOURCE"},
+        )
+        upload_body = upload_request.read()
+        headers["Content-Type"] = upload_request.headers["Content-Type"]
         response = await self._client.post(
             f"{self.origin}/http/upload-file-v2/direct",
             headers=headers,
-            files={
-                "file": (filename or "input.png", image_bytes, content_type or "image/png"),
-                "file_source": (None, "IMAGINE_SELF_UPLOAD_FILE_SOURCE"),
-            },
+            content=upload_body,
             timeout=60,
         )
         try:
@@ -615,13 +713,17 @@ class GrokWebGateway:
         finally:
             await response.aclose()
         if upload_status < 200 or upload_status >= 300:
-            raise WebGatewayError("Grok Web image upload failed")
+            raise WebImageEditError("upload", upload_status)
         try:
             uploaded = json.loads(upload_raw)
         except (ValueError, TypeError):
             raise WebGatewayError("Grok Web image upload response is invalid") from None
-        metadata = uploaded.get("fileMetadata") if isinstance(uploaded, Mapping) else {}
-        asset_id = str((metadata or {}).get("fileMetadataId") or (metadata or {}).get("fileId") or uploaded.get("uploadId") or "").strip()
+        if not isinstance(uploaded, Mapping):
+            raise WebImageEditError("upload_metadata")
+        if uploaded.get("terminalError"):
+            raise WebImageEditError("upload_terminal_error", upload_status)
+        metadata = uploaded.get("fileMetadata")
+        asset_id = str(metadata.get("fileMetadataId") or "").strip() if isinstance(metadata, Mapping) else ""
         if not asset_id:
             raise WebGatewayError("Grok Web image upload returned no asset")
         payload = {
@@ -637,10 +739,11 @@ class GrokWebGateway:
             payload["mediaGenInput"]["imageToImage"]["aspectRatio"] = ratio
         response = await self._client.post(
             f"{self.origin}/rest/app-chat/conversations/new",
-            headers=build_web_headers(
+            headers=await self._media_headers(
                 credential,
-                user_agent=self.user_agent,
-                extra={"Accept": "text/event-stream, application/json", "Referer": f"{self.origin}/imagine"},
+                path="/rest/app-chat/conversations/new",
+                referer=f"{self.origin}/imagine",
+                accept="*/*",
             ),
             json=payload,
             timeout=self.total_timeout,
@@ -651,8 +754,8 @@ class GrokWebGateway:
         finally:
             await response.aclose()
         if status < 200 or status >= 300:
-            raise WebGatewayError("Grok Web image edit failed")
-        urls = _extract_media_urls(raw, media="image")
+            raise WebImageEditError("generate", status)
+        urls = _extract_final_edit_urls(raw)
         if not urls:
             raise WebGatewayError("Grok Web image edit returned no image")
         return [GeneratedImage(url=url) for url in urls[: int(request.get("n") or 1)]]
