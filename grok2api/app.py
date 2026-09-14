@@ -4787,6 +4787,51 @@ async def _web_gateway_for_account(account: Any):
     return gateway
 
 
+def _normalize_web_video_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Accept one uploaded image or data URL; never fetch caller-supplied URLs."""
+    import base64
+    import binascii
+    from grok2api.media.image_store import DEFAULT_IMAGE_MAX_BYTES, _sniff_image_mime
+
+    result = dict(payload)
+    if "images" in result or "image_url" in result:
+        raise ValueError("use image or input_reference for one input image")
+    prompt = result.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("prompt must be a non-empty string")
+    ratio = str(result.get("aspect_ratio") or "1:1").strip()
+    if ratio not in {"1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"}:
+        raise ValueError("aspect_ratio must be 1:1, 16:9, 9:16, 4:3, 3:4, 3:2 or 2:3")
+    result["aspect_ratio"] = ratio
+    aliases = [name for name in ("image", "input_reference", "image_reference") if name in result]
+    if len(aliases) + int("image_bytes" in result) > 1:
+        raise ValueError("provide exactly one input image")
+    raw = result.get("image_bytes")
+    if aliases:
+        value = result.pop(aliases[0])
+        if isinstance(value, dict):
+            value = value.get("url") or value.get("image_url")
+        if not isinstance(value, str) or not value.startswith("data:image/") or ";base64," not in value:
+            raise ValueError("image must be a base64 data URL or multipart file; remote image URLs are not supported")
+        encoded = value.split(";base64,", 1)[1]
+        if len(encoded) > ((DEFAULT_IMAGE_MAX_BYTES + 2) // 3) * 4:
+            raise ValueError("image exceeds 20 MiB limit")
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error):
+            raise ValueError("invalid base64 image") from None
+    if raw is not None:
+        if not isinstance(raw, bytes) or not raw or len(raw) > DEFAULT_IMAGE_MAX_BYTES:
+            raise ValueError("image must contain 1 byte to 20 MiB")
+        mime = _sniff_image_mime(raw)
+        if mime not in {"image/png", "image/jpeg", "image/webp"}:
+            raise ValueError("image must be PNG, JPEG or WebP")
+        result["image_bytes"] = raw
+        result["content_type"] = mime
+        result["filename"] = "input." + {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp"}[mime]
+    return result
+
+
 async def _web_video_generations(payload: Mapping[str, Any], request: Request) -> Response:
     from grok2api.media.video_store import VideoMediaStore
     from grok2api.providers import create_provider_registry
@@ -4816,7 +4861,7 @@ async def _web_video_generations(payload: Mapping[str, Any], request: Request) -
             raw, content_type = await gateway.download_video(asset_url, account.credential)
             filename, size = VideoMediaStore().store(raw, content_type=content_type)
             public_url = f"{_request_public_origin(request)}/v1/media/videos/{filename}"
-            return JSONResponse({"id": uuid.uuid4().hex, "object": "video", "status": "completed", "model": route.qualified_model, "url": public_url, "bytes": size, "content_type": content_type}, headers={"X-Grok2API-Provider": ProviderName.WEB.value, "X-Grok2API-Resolution": resolution, "X-Grok2API-Duration": str(duration)})
+            return JSONResponse({"id": uuid.uuid4().hex, "object": "video", "status": "completed", "model": route.qualified_model, "url": public_url, "bytes": size, "content_type": content_type, "resolution": resolution, "duration": duration, "aspect_ratio": payload.get("aspect_ratio", "1:1"), "mode": "image_to_video" if payload.get("image_bytes") else "text_to_video"}, headers={"X-Grok2API-Provider": ProviderName.WEB.value, "X-Grok2API-Resolution": resolution, "X-Grok2API-Duration": str(duration)})
         except Exception as exc:
             account_fingerprint = hashlib.sha256(
                 str(account.account_id).encode("utf-8")
@@ -5197,9 +5242,36 @@ async def video_generations(
 ):
     del api_key
     try:
-        payload = await request.json()
+        if "multipart/form-data" in request.headers.get("content-type", "").lower():
+            from grok2api.media.image_store import DEFAULT_IMAGE_MAX_BYTES
+            payload = {}
+            async with request.form(max_files=1, max_fields=16) as form:
+                for key in form:
+                    values = form.getlist(key)
+                    if len(values) != 1:
+                        raise ValueError("each video field must be provided once")
+                    value = values[0]
+                    if hasattr(value, "read"):
+                        if key not in {"image", "input_reference", "image_reference"}:
+                            raise ValueError("unsupported video file field")
+                        payload["image_bytes"] = await value.read(DEFAULT_IMAGE_MAX_BYTES + 1)
+                    else:
+                        if key == "image_bytes":
+                            raise ValueError("image_bytes is not a public parameter")
+                        payload[key] = value
+            if not str(payload.get("model") or "").lower().startswith("web/"):
+                raise ValueError("multipart video input requires a Web model")
+        else:
+            payload = await request.json()
+            if isinstance(payload, dict) and "image_bytes" in payload:
+                raise ValueError("image_bytes is not a public parameter")
+    except ValueError as exc:
+        # JSON parser messages can contain request contents; do not echo them.
+        if isinstance(exc, json.JSONDecodeError):
+            return openai_error("request body must be valid JSON", status=400, err_type="invalid_request_error")
+        return openai_error(str(exc), status=400, err_type="invalid_request_error")
     except Exception:
-        return openai_error("request body must be valid JSON", status=400, err_type="invalid_request_error")
+        return openai_error("invalid JSON or multipart video request", status=400, err_type="invalid_request_error")
     if not isinstance(payload, dict):
         return openai_error("request body must be a JSON object", status=400, err_type="invalid_request_error")
     model = str(payload.get("model") or "")
@@ -5207,6 +5279,7 @@ async def video_generations(
         if not _config.WEB_PROVIDER_ENABLED:
             return openai_error("grok_web provider is disabled", status=400, err_type="invalid_request_error")
         try:
+            payload = _normalize_web_video_payload(payload)
             return await _web_video_generations(payload, request)
         except (ValueError, LookupError) as exc:
             return openai_error(str(exc), status=400, err_type="invalid_request_error")

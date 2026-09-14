@@ -9,6 +9,38 @@ from grok2api.providers.web.gateway import GrokWebGateway, WebGatewayError
 
 
 class WebVideoTests(unittest.IsolatedAsyncioTestCase):
+    async def test_image_upload_and_generation_share_client_and_signature(self):
+        calls = []
+        def handle(request):
+            calls.append(request)
+            if request.url.path.endswith("/direct"):
+                self.assertIn(b"image-fixture", request.content)
+                self.assertIn(b"IMAGINE_SELF_UPLOAD_FILE_SOURCE", request.content)
+                return httpx.Response(200, json={"fileMetadata": {"fileMetadataId": "fixture-asset"}})
+            body = json.loads(request.content)
+            self.assertNotIn("textToVideo", body["mediaGenInput"])
+            self.assertEqual(body["mediaGenInput"]["imageToVideo"]["inputAssets"], ["fixture-asset"])
+            self.assertEqual(body["mediaGenInput"]["imageToVideo"]["aspectRatio"], "16:9")
+            return httpx.Response(200, json={"result": {"streamingVideoGenerationResponse": {"progress": 100, "videoUrl": "users/fixture/final.mp4"}}})
+        with patch("grok2api.providers.web.statsig.generate", return_value="test-proof"):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+                url = await GrokWebGateway(client).generate_video({"prompt": "animate", "image_bytes": b"image-fixture", "aspect_ratio": "16:9"}, WebCredential(sso="fixture", sso_rw="fixture"))
+        self.assertEqual(url, "https://assets.grok.com/users/fixture/final.mp4")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0].headers["cookie"], calls[1].headers["cookie"])
+        self.assertTrue(all(r.headers["x-statsig-id"] == "test-proof" for r in calls))
+
+    async def test_upload_failure_does_not_start_text_generation(self):
+        calls = []
+        def handle(request):
+            calls.append(request)
+            return httpx.Response(200, json={"terminalError": {"message": "private-detail"}})
+        with patch("grok2api.providers.web.statsig.generate", return_value="proof"):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+                with self.assertRaises(WebGatewayError):
+                    await GrokWebGateway(client).generate_video({"prompt": "animate", "image_bytes": b"fixture"}, WebCredential(sso="fixture", sso_rw="fixture"))
+        self.assertEqual(len(calls), 1)
+
     async def test_default_480p_six_seconds_uses_local_signature(self):
         calls = []
 

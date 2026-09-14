@@ -677,20 +677,15 @@ class GrokWebGateway:
             with suppress(Exception):
                 await connection.close()
 
-    async def edit_image(
+    async def _upload_media_image(
         self,
-        request: Mapping[str, Any],
         credential: WebCredential,
         *,
         image_bytes: bytes,
         filename: str = "input.png",
         content_type: str = "image/png",
-    ) -> list[GeneratedImage]:
-        """Edit an uploaded image through Grok Web's current REST media flow."""
-
-        prompt = str(request.get("prompt") or "").strip()
-        if not prompt:
-            raise WebImageProtocolError("prompt must be a non-empty string")
+    ) -> str:
+        """Upload with the account-bound client and return a file metadata ID."""
         if not image_bytes:
             raise WebImageProtocolError("image must not be empty")
         headers = await self._media_headers(
@@ -733,6 +728,24 @@ class GrokWebGateway:
         asset_id = str(metadata.get("fileMetadataId") or "").strip() if isinstance(metadata, Mapping) else ""
         if not asset_id:
             raise WebGatewayError("Grok Web image upload returned no asset")
+        return asset_id
+
+    async def edit_image(
+        self,
+        request: Mapping[str, Any],
+        credential: WebCredential,
+        *,
+        image_bytes: bytes,
+        filename: str = "input.png",
+        content_type: str = "image/png",
+    ) -> list[GeneratedImage]:
+        """Edit an uploaded image through Grok Web's current REST media flow."""
+        prompt = str(request.get("prompt") or "").strip()
+        if not prompt:
+            raise WebImageProtocolError("prompt must be a non-empty string")
+        asset_id = await self._upload_media_image(
+            credential, image_bytes=image_bytes, filename=filename, content_type=content_type,
+        )
         payload = {
             "modelName": "imagine-image-edit",
             "message": prompt,
@@ -772,7 +785,7 @@ class GrokWebGateway:
         request: Mapping[str, Any],
         credential: WebCredential,
     ) -> str:
-        """Create a Web text-to-video job and return its authenticated asset URL."""
+        """Generate from text or an uploaded image on one account-bound session."""
 
         prompt = str(request.get("prompt") or "").strip()
         if not prompt:
@@ -780,6 +793,16 @@ class GrokWebGateway:
         duration = int(request.get("duration") or 6)
         resolution = str(request.get("resolution") or "480p").strip().lower()
         ratio = str(request.get("aspect_ratio") or "1:1").strip()
+        video_input = {"prompt": prompt, "aspectRatio": ratio, "duration": duration, "resolutionName": resolution}
+        mode = "textToVideo"
+        if request.get("image_bytes") is not None:
+            asset_id = await self._upload_media_image(
+                credential, image_bytes=request["image_bytes"],
+                filename=str(request.get("filename") or "input.png"),
+                content_type=str(request.get("content_type") or "image/png"),
+            )
+            mode = "imageToVideo"
+            video_input["inputAssets"] = [asset_id]
         payload = {
             "modelName": "imagine-video-gen",
             "message": prompt + " --mode=custom",
@@ -787,7 +810,7 @@ class GrokWebGateway:
             "enableSideBySide": True,
             "sendFinalMetadata": True,
             "responseMetadata": {"experiments": [], "modelConfigOverride": {"modelMap": {}}},
-            "mediaGenInput": {"textToVideo": {"prompt": prompt, "aspectRatio": ratio, "duration": duration, "resolutionName": resolution}},
+            "mediaGenInput": {mode: video_input},
             "kind": "CONVERSATION_KIND_IMAGINE",
         }
         response = await self._client.post(
